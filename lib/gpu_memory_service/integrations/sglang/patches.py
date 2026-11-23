@@ -1,0 +1,312 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""SGLang-specific patches for GPU Memory Service integration.
+
+- patch_torch_memory_saver: Routes weights and kv_cache to GMS
+- patch_xpu_kv_cache_sizing_for_gms: Makes the XPU KV sizing probe see GMS weights
+- patch_static_state_for_gms: No-ops named-buffer export/import (GMS preserves them)
+"""
+
+from __future__ import annotations
+
+import importlib
+import logging
+import sys
+from contextlib import contextmanager
+from typing import Optional
+
+import gpu_memory_service.integrations.sglang as gms_sglang
+from gpu_memory_service.integrations.sglang.memory_saver import (
+    GMSMemorySaverImpl,
+    get_gms_memory_saver_impl,
+)
+
+logger = logging.getLogger(__name__)
+
+_torch_memory_saver_patched = False
+_xpu_kv_cache_sizing_patched = False
+_static_state_patched = False
+
+
+def patch_torch_memory_saver() -> None:
+    """Patch torch_memory_saver to use GPU Memory Service implementation.
+
+    This function is idempotent - calling it multiple times has no effect.
+    This patch is only applied when GMSModelLoader is imported (load_format="gms").
+    """
+    global _torch_memory_saver_patched
+    if _torch_memory_saver_patched:
+        return
+
+    try:
+        import torch_memory_saver
+        import torch_memory_saver.entrypoint as entrypoint_module
+    except ImportError:
+        logger.debug("[GMS] torch_memory_saver not installed, skipping patch")
+        return
+
+    # Store reference to original method
+    original_ensure_initialized = entrypoint_module.TorchMemorySaver._ensure_initialized
+    original_configure_subprocess = torch_memory_saver.configure_subprocess
+
+    def patched_ensure_initialized(self):
+        """Patched _ensure_initialized that uses GPU Memory Service implementation."""
+        # Check if already initialized
+        if self._impl is not None:
+            logger.debug("[GMS] TorchMemorySaver already initialized, skipping")
+            return
+
+        # Check hook_mode - use GMS for None or explicit "gms"
+        hook_mode = self._impl_ctor_kwargs.get("hook_mode")
+        logger.info(f"[GMS] TorchMemorySaver initializing with hook_mode={hook_mode}")
+
+        if hook_mode == "torch":
+            # SGLang forces hook_mode="torch" at import time on Intel XPU
+            # (srt/utils/torch_memory_saver_adapter.py) because the LD_PRELOAD
+            # preload mode is CUDA/HIP-only. That leaves no way to request
+            # "gms" on XPU, so claim the saver here rather than falling through
+            # to upstream, which would leave GMSModelLoader with no impl and
+            # fail the load. On CUDA an explicit "torch" stays a real opt-out.
+            from gpu_memory_service.common.vmm import VMMDeviceType, get_vmm_device_type
+
+            use_gms = get_vmm_device_type() == VMMDeviceType.XPU
+        else:
+            use_gms = hook_mode is None or hook_mode == "gms"
+
+        if use_gms:
+            # In GMS mode we install only the strict GMS implementation:
+            # weights + kv_cache go through GMS, generic unsupported tags stay
+            # no-ops/warnings, and cuda_graph remains unsupported.
+            # Get device from the active VMM device module (already set by SGLang)
+            from gpu_memory_service.integrations.common.utils import torch_device
+
+            device_index = torch_device().current_device()
+
+            # Read lock mode set by setup_gms() (defaults to RW_OR_RO)
+            gms_impl = GMSMemorySaverImpl(
+                device_index=device_index,
+                mode=gms_sglang._gms_lock_mode,
+                ro_connect_timeout_ms=gms_sglang._gms_ro_connect_timeout_ms,
+            )
+
+            # Set _impl directly (accessible via gms_impl property)
+            self._impl = gms_impl
+            logger.info(
+                "[GMS] Using GMS mode (device=%d, mode=%s)",
+                device_index,
+                gms_impl.allocators["weights"].granted_lock_type.name,
+            )
+            del self._impl_ctor_kwargs
+        else:
+            # Fall back to original implementation
+            logger.info("[GMS] Using default torch_memory_saver hook mode")
+            original_ensure_initialized(self)
+
+    entrypoint_module.TorchMemorySaver._ensure_initialized = patched_ensure_initialized
+
+    @contextmanager
+    def patched_configure_subprocess():
+        """Avoid LD_PRELOAD in GMS mode; keep upstream behavior otherwise."""
+        singleton = torch_memory_saver.torch_memory_saver
+        ctor_kwargs = getattr(singleton, "_impl_ctor_kwargs", None) or {}
+        hook_mode = ctor_kwargs.get("hook_mode")
+
+        if hook_mode is None or hook_mode == "gms":
+            logger.info("[GMS] torch_memory_saver.configure_subprocess is a no-op")
+            yield
+            return
+
+        with original_configure_subprocess():
+            yield
+
+    torch_memory_saver.configure_subprocess = patched_configure_subprocess
+
+    # Add property to access GMS impl directly from the singleton
+    @property
+    def gms_impl(self) -> Optional[GMSMemorySaverImpl]:
+        """Get the GMS impl if installed, None otherwise."""
+        if isinstance(self._impl, GMSMemorySaverImpl):
+            return self._impl
+        return None
+
+    entrypoint_module.TorchMemorySaver.gms_impl = gms_impl
+
+    # If the singleton was already initialized before this patch ran (e.g.,
+    # due to import ordering in multiprocessing spawn), reset _impl so the
+    # next call to _ensure_initialized goes through the patched version and
+    # creates GMSMemorySaverImpl instead of the default _TorchMemorySaverImpl.
+    import torch_memory_saver
+
+    singleton = torch_memory_saver.torch_memory_saver
+    if singleton._impl is not None:
+        logger.debug(
+            "[GMS] TorchMemorySaver singleton already initialized, "
+            "resetting to force GMS re-init on next use"
+        )
+        singleton._impl = None
+        # The original _ensure_initialized deletes _impl_ctor_kwargs after
+        # creating _impl.  Restore it so the patched version can read it.
+        if not hasattr(singleton, "_impl_ctor_kwargs"):
+            singleton._impl_ctor_kwargs = {}
+
+    _torch_memory_saver_patched = True
+    logger.debug("[GMS] Patched torch_memory_saver")
+
+
+def patch_xpu_kv_cache_sizing_for_gms() -> None:
+    """Make the XPU KV sizing probe account for GMS-resident weights.
+
+    On CUDA sglang's ``get_available_gpu_memory()`` calls ``torch.cuda.mem_get_info()``,
+    which is device-wide, so GMS-resident weights are visible to writer and reader
+    alike and no adjustment is needed.
+
+    On XPU it returns ``total_memory - torch.xpu.memory_allocated(gpu_id)``,
+    which only sees allocations made through this process's torch caching
+    allocator.  A writer allocates weights through the GMS mempool and is
+    therefore charged for them; a reader materialises them as VMM mappings
+    outside the allocator and is not.  memory_allocated() also cannot see
+    another process's allocations at all, so once the writer exits the GMS
+    server still holds W bytes resident on the card.
+
+    GMSModelLoader reports preloaded_weights_bytes = 0 on XPU: sglang's
+    add-back exists to undo a depressed *pre-load* reading,
+    and on XPU that reading was never depressed in the first place.
+
+    SGLang binds the helper with ``from ... import get_available_gpu_memory``
+    in many modules, so patching by module name would miss new call sites.
+    Instead, wrap it at its definition (sglang.srt.utils.common), which late
+    importers resolve through, and rebind every already-loaded module
+    attribute that *is* the original function object. The wrapper is a no-op
+    until a reader sets impl.preloaded_weights_bytes during load_model(), so
+    the pre-load baseline sampled by distributed.bootstrap is unaffected.
+    """
+    global _xpu_kv_cache_sizing_patched
+
+    if _xpu_kv_cache_sizing_patched:
+        return
+
+    from gpu_memory_service.common.vmm import VMMDeviceType, get_vmm_device_type
+
+    if get_vmm_device_type() != VMMDeviceType.XPU:
+        # CUDA's probe is device-wide; nothing to correct.
+        _xpu_kv_cache_sizing_patched = True
+        return
+
+    def make_gms_aware_probe(original):
+        def patched_get_available_gpu_memory(*args, **kwargs):
+            available_gb = original(*args, **kwargs)
+
+            impl = get_gms_memory_saver_impl()
+            if impl is None:
+                return available_gb
+
+            # Non-zero only on the import path: _finalize_pending_write()
+            # resets this to 0 after a writer commits, so a writer (which
+            # reconnects as RO and is already charged for its weights) is
+            # never adjusted.
+            preloaded_bytes = getattr(impl, "preloaded_weights_bytes", 0)
+            if preloaded_bytes <= 0:
+                return available_gb
+
+            adjusted_gb = available_gb - preloaded_bytes / (1 << 30)
+            logger.info(
+                "[GMS] Adjusted avail-mem probe for GMS-resident weights: "
+                "%.2f GiB - %.2f GiB = %.2f GiB",
+                available_gb,
+                preloaded_bytes / (1 << 30),
+                adjusted_gb,
+            )
+            return adjusted_gb
+
+        return patched_get_available_gpu_memory
+
+    try:
+        common = importlib.import_module("sglang.srt.utils.common")
+    except ImportError:
+        logger.warning(
+            "[GMS] Could not import sglang.srt.utils.common, KV pool sizing "
+            "will not account for GMS-resident weights"
+        )
+        return
+
+    original = getattr(common, "get_available_gpu_memory", None)
+    if original is None:
+        logger.warning(
+            "[GMS] sglang.srt.utils.common has no get_available_gpu_memory, "
+            "KV pool sizing will not account for GMS-resident weights"
+        )
+        return
+
+    wrapped = make_gms_aware_probe(original)
+
+    # Read module __dict__ directly so lazy module __getattr__ hooks are not
+    # triggered. The definition site is included, so late importers resolve
+    # to the wrapper too.
+    rebound = []
+    for name, module in list(sys.modules.items()):
+        namespace = getattr(module, "__dict__", None)
+        if namespace and namespace.get("get_available_gpu_memory") is original:
+            module.get_available_gpu_memory = wrapped
+            rebound.append(name)
+
+    logger.info(
+        "[GMS] Patched get_available_gpu_memory in %d modules: %s",
+        len(rebound),
+        ", ".join(sorted(rebound)),
+    )
+
+    _xpu_kv_cache_sizing_patched = True
+
+
+def patch_static_state_for_gms() -> None:
+    """No-op SGLang's _export/_import_static_state when using GMS.
+
+    SGLang's release_memory_occupation clones every named buffer via
+    buffer.detach().clone() through the default CUDA allocator, then restores
+    them during resume_memory_occupation.
+    This patch must run inside the scheduler child process (which uses
+    multiprocessing spawn).  It is triggered by the GMSModelLoader import
+    in model_loader.py, which executes at module level in the child.
+    """
+    import os
+
+    global _static_state_patched
+    logger.info(
+        "[GMS] patch_static_state_for_gms called (pid=%d, already_patched=%s)",
+        os.getpid(),
+        _static_state_patched,
+    )
+    if _static_state_patched:
+        return
+
+    try:
+        try:
+            # SGLang >=0.5.21.
+            from sglang.srt.managers.scheduler_components import weight_updater
+        except ImportError:
+            # SGLang <0.5.21 kept these on the scheduler mixin module.
+            from sglang.srt.managers import (
+                scheduler_update_weights_mixin as weight_updater,  # type: ignore[no-redef]
+            )
+
+        def _export_noop(model):
+            """NO-OP: GMS preserves buffers via VA-stable unmap/remap."""
+            return dict(buffers=[])
+
+        def _import_noop(model, static_params):
+            """NO-OP: GMS preserves buffers via VA-stable unmap/remap."""
+            pass
+
+        weight_updater._export_static_state = _export_noop
+        weight_updater._import_static_state = _import_noop
+        _static_state_patched = True
+        logger.info(
+            "[GMS] Patched _export/_import_static_state -> no-op (pid=%d)",
+            os.getpid(),
+        )
+    except Exception:
+        logger.warning(
+            "[GMS] Could not patch SGLang weight_updater static state: ",
+            exc_info=True,
+        )

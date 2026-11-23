@@ -1,0 +1,247 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package validation
+
+import (
+	"context"
+	"fmt"
+	"strings"
+
+	nvidiacomv1beta1 "github.com/ai-dynamo/dynamo/deploy/operator/api/v1beta1"
+	"github.com/ai-dynamo/dynamo/deploy/operator/internal/dynamo"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/validation/field"
+	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
+)
+
+// DynamoComponentDeploymentValidator validates v1beta1 DynamoComponentDeployment resources.
+type DynamoComponentDeploymentValidator struct{}
+
+// NewDynamoComponentDeploymentValidator creates a validator for v1beta1 DynamoComponentDeployment.
+func NewDynamoComponentDeploymentValidator() *DynamoComponentDeploymentValidator {
+	return &DynamoComponentDeploymentValidator{}
+}
+
+// dynamoComponentDeploymentValidation carries DCD-specific request state.
+// API values and derived traversal state remain explicit validator arguments.
+type dynamoComponentDeploymentValidation struct {
+	sharedValidation
+}
+
+// Validate performs stateless validation on the v1beta1 DynamoComponentDeployment.
+// ctx and dcd must not be nil.
+func (v *DynamoComponentDeploymentValidator) Validate(
+	ctx context.Context,
+	dcd *nvidiacomv1beta1.DynamoComponentDeployment,
+) (admission.Warnings, error) {
+	return v.validate(ctx, dcd, runtimeVersionSourceV1Beta1)
+}
+
+func (v *DynamoComponentDeploymentValidator) validate(
+	ctx context.Context,
+	dcd *nvidiacomv1beta1.DynamoComponentDeployment,
+	runtimeVersionSource runtimeVersionValidationSource,
+) (admission.Warnings, error) {
+	validation := &dynamoComponentDeploymentValidation{
+		ctx:                                ctx,
+		runtimeVersionSource:               runtimeVersionSource,
+		allowMissingRuntimeVersionOverride: true,
+	}
+
+	allErrs := validation.validateDynamoComponentDeployment(dcd, nil)
+	allErrs = append(allErrs, validation.validateWorkerClassCheckpointRefOwnership(dcd)...)
+	alpha, err := alphaDynamoComponentDeploymentForValidation(dcd)
+	if err != nil {
+		return nil, fmt.Errorf("cannot validate preserved v1alpha1 DynamoComponentDeployment fields: %w", err)
+	}
+	allErrs = append(allErrs, validation.validateDynamoComponentDeploymentV1alpha1(alpha)...)
+
+	return validation.warnings, invalidDynamoComponentDeploymentError(dcd, allErrs)
+}
+
+// ValidateUpdate performs complete validation of an updated v1beta1 DCD and
+// compares its state with the previous object.
+// ctx, oldDCD, and newDCD must not be nil. runtimeVersionSource identifies the request's source API.
+func (v *DynamoComponentDeploymentValidator) ValidateUpdate(
+	ctx context.Context,
+	oldDCD *nvidiacomv1beta1.DynamoComponentDeployment,
+	newDCD *nvidiacomv1beta1.DynamoComponentDeployment,
+	runtimeVersionSource runtimeVersionValidationSource,
+) (admission.Warnings, error) {
+	validation := &dynamoComponentDeploymentValidation{
+		ctx:                                ctx,
+		runtimeVersionSource:               runtimeVersionSource,
+		ratchetRuntimeVersion:              true,
+		allowMissingRuntimeVersionOverride: true,
+	}
+
+	allErrs := validation.validateDynamoComponentDeployment(newDCD, oldDCD)
+	allErrs = append(allErrs, validation.validateWorkerClassCheckpointRefOwnership(newDCD)...)
+	newAlpha, err := alphaDynamoComponentDeploymentForValidation(newDCD)
+	if err != nil {
+		return nil, fmt.Errorf("cannot validate preserved v1alpha1 DynamoComponentDeployment fields: %w", err)
+	}
+	allErrs = append(allErrs, validation.validateDynamoComponentDeploymentV1alpha1(newAlpha)...)
+
+	// Run the source-version old/new ratchet after the stateless traversal.
+	if validation.hasRuntimeVersionSource(runtimeVersionSourceV1Alpha1) {
+		oldAlpha, err := alphaDynamoComponentDeploymentForValidation(oldDCD)
+		if err != nil {
+			return nil, fmt.Errorf("cannot validate old preserved v1alpha1 DynamoComponentDeployment fields: %w", err)
+		}
+		allErrs = append(allErrs, validation.validateDynamoComponentDeploymentSharedSpecUpdateV1alpha1(
+			&newAlpha.Spec.DynamoComponentDeploymentSharedSpec,
+			&oldAlpha.Spec.DynamoComponentDeploymentSharedSpec,
+			field.NewPath("spec"),
+		)...)
+	}
+
+	allErrs = append(allErrs, validation.validateDynamoComponentDeploymentUpdate(newDCD, oldDCD)...)
+	return validation.warnings, invalidDynamoComponentDeploymentError(newDCD, allErrs)
+}
+
+// validateWorkerClassCheckpointRefOwnership limits worker checkpointRef to
+// DCDs marked as DGD-controller-owned, the supported source for worker
+// compatibility. The owner reference selects behavior; it is not an
+// authorization boundary for Snapshot access.
+func (v *dynamoComponentDeploymentValidation) validateWorkerClassCheckpointRefOwnership(
+	dcd *nvidiacomv1beta1.DynamoComponentDeployment,
+) field.ErrorList {
+	switch dcd.Spec.ComponentType {
+	case nvidiacomv1beta1.ComponentTypeWorker,
+		nvidiacomv1beta1.ComponentTypePrefill,
+		nvidiacomv1beta1.ComponentTypeDecode:
+	default:
+		return nil
+	}
+	if dcd.Spec.Experimental == nil ||
+		dcd.Spec.Experimental.Checkpoint == nil ||
+		dcd.Spec.Experimental.Checkpoint.CheckpointRef == nil ||
+		strings.TrimSpace(*dcd.Spec.Experimental.Checkpoint.CheckpointRef) == "" {
+		return nil
+	}
+
+	controller := metav1.GetControllerOf(dcd)
+	if controller != nil && controller.Kind == nvidiacomv1beta1.DynamoGraphDeploymentGVK.Kind {
+		groupVersion, err := schema.ParseGroupVersion(controller.APIVersion)
+		if err == nil && groupVersion.Group == nvidiacomv1beta1.GroupVersion.Group {
+			return nil
+		}
+	}
+
+	checkpointRefPath := field.NewPath("spec", "experimental", "checkpoint", "checkpointRef")
+	if v.hasRuntimeVersionSource(runtimeVersionSourceV1Alpha1) {
+		checkpointRefPath = field.NewPath("spec", "checkpoint", "checkpointRef")
+	}
+	return field.ErrorList{field.Forbidden(
+		checkpointRefPath,
+		"worker-class checkpointRef is supported only on DynamoGraphDeployment-managed components",
+	)}
+}
+
+// validateDynamoComponentDeployment validates dcd. dcd must not be nil.
+func (v *dynamoComponentDeploymentValidation) validateDynamoComponentDeployment(
+	dcd *nvidiacomv1beta1.DynamoComponentDeployment,
+	oldDCD *nvidiacomv1beta1.DynamoComponentDeployment,
+) field.ErrorList {
+	var oldSpec *nvidiacomv1beta1.DynamoComponentDeploymentSpec
+	var oldMeta *metav1.ObjectMeta
+	if oldDCD != nil {
+		oldSpec = &oldDCD.Spec
+		oldMeta = &oldDCD.ObjectMeta
+	}
+	allErrs := v.validateObjectMeta(&dcd.ObjectMeta, oldMeta, field.NewPath("metadata"))
+	return append(allErrs, v.validateDynamoComponentDeploymentSpec(&dcd.Spec, oldSpec, field.NewPath("spec"))...)
+}
+
+// validateDynamoComponentDeploymentSpec validates spec. spec and fldPath must not be nil.
+func (v *dynamoComponentDeploymentValidation) validateDynamoComponentDeploymentSpec(
+	spec *nvidiacomv1beta1.DynamoComponentDeploymentSpec,
+	oldSpec *nvidiacomv1beta1.DynamoComponentDeploymentSpec,
+	fldPath *field.Path,
+) field.ErrorList {
+	// Standalone DCDs use neither Grove nor live InferencePool discovery.
+	const (
+		grovePathway                      = false
+		validateInferencePoolAvailability = false
+	)
+	var oldSharedSpec *nvidiacomv1beta1.DynamoComponentDeploymentSharedSpec
+	if oldSpec != nil {
+		oldSharedSpec = &oldSpec.DynamoComponentDeploymentSharedSpec
+	}
+	allErrs := validateElasticEPRequiresCommand(spec.BackendFramework, &spec.DynamoComponentDeploymentSharedSpec, fldPath)
+	allErrs = append(allErrs, dynamo.ValidateSnapshotFailover(&spec.DynamoComponentDeploymentSharedSpec, fldPath, spec.BackendFramework)...)
+	allErrs = append(allErrs, v.validateDynamoComponentDeploymentSharedSpec(
+		&spec.DynamoComponentDeploymentSharedSpec,
+		fldPath,
+		dynamoComponentDeploymentSharedSpecValidationOptions{
+			grovePathway:                      grovePathway,
+			validateInferencePoolAvailability: validateInferencePoolAvailability,
+			oldComponent:                      oldSharedSpec,
+		},
+	)...)
+	return allErrs
+}
+
+// validateDynamoComponentDeploymentUpdate validates an update. newDCD and oldDCD must not be nil.
+func (v *dynamoComponentDeploymentValidation) validateDynamoComponentDeploymentUpdate(
+	newDCD *nvidiacomv1beta1.DynamoComponentDeployment,
+	oldDCD *nvidiacomv1beta1.DynamoComponentDeployment,
+) field.ErrorList {
+	allErrs := v.validateObjectMetaUpdate(&newDCD.ObjectMeta, &oldDCD.ObjectMeta, field.NewPath("metadata"))
+	return append(allErrs, v.validateDynamoComponentDeploymentSpecUpdate(
+		&newDCD.Spec,
+		&oldDCD.Spec,
+		field.NewPath("spec"),
+	)...)
+}
+
+// validateDynamoComponentDeploymentSpecUpdate validates a spec update.
+// newSpec, oldSpec, and fldPath must not be nil.
+func (v *dynamoComponentDeploymentValidation) validateDynamoComponentDeploymentSpecUpdate(
+	newSpec *nvidiacomv1beta1.DynamoComponentDeploymentSpec,
+	oldSpec *nvidiacomv1beta1.DynamoComponentDeploymentSpec,
+	fldPath *field.Path,
+) field.ErrorList {
+	// Standalone DCD updates preserve direct replica modification.
+	const (
+		canModifyReplicas                = true
+		validateGPUMemoryServiceNewState = false // ValidateUpdate already runs the stateless new-state traversal.
+	)
+
+	allErrs := field.ErrorList{}
+	if newSpec.BackendFramework != oldSpec.BackendFramework {
+		v.warn("Changing spec.backendFramework may cause unexpected behavior")
+		allErrs = append(allErrs, field.Invalid(
+			fldPath.Child("backendFramework"),
+			newSpec.BackendFramework,
+			"is immutable and cannot be changed after creation",
+		))
+	}
+
+	allErrs = append(allErrs, v.validateDynamoComponentDeploymentSharedSpecUpdate(
+		&newSpec.DynamoComponentDeploymentSharedSpec,
+		&oldSpec.DynamoComponentDeploymentSharedSpec,
+		fldPath,
+		canModifyReplicas,
+		nvidiacomv1beta1.DynamoComponentDeploymentGVK.GroupKind(),
+		validateGPUMemoryServiceNewState,
+	)...)
+	return allErrs
+}

@@ -1,0 +1,131 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Build script for GPU Memory Service with C++ extensions.
+
+This setup.py builds the C++ extensions as part of pip install.
+The _allocator_ext extension only requires Python headers (no CUDA or PyTorch needed).
+
+Following the torch_memory_saver pattern of using pure setuptools for extension building.
+"""
+
+from setuptools import Extension, setup
+from setuptools.command.build_ext import build_ext
+
+
+class BuildExtension(build_ext):
+    """Custom build extension for C++ modules."""
+
+    def build_extensions(self):
+        import os
+
+        # Use CXX environment variable if set, otherwise default to g++
+        cxx = os.environ.get("CXX", "g++")
+        self.compiler.set_executable("compiler_so", cxx)
+        self.compiler.set_executable("compiler_cxx", cxx)
+        self.compiler.set_executable("linker_so", f"{cxx} -shared")
+
+        build_ext.build_extensions(self)
+
+
+def _create_ext_modules():
+    """Create extension modules for gpu_memory_service."""
+    # Common compile arguments
+    extra_compile_args = ["-std=c++17", "-O3", "-fPIC"]
+
+    # _allocator_ext: Device-agnostic pluggable allocator shim (Python C API only)
+    # No CUDA or PyTorch dependency - just provides my_malloc/my_free that call Python callbacks
+    return [
+        Extension(
+            name="gpu_memory_service.client.torch.extensions._allocator_ext",
+            sources=["client/torch/extensions/allocator.cpp"],
+            extra_compile_args=extra_compile_args,
+        )
+    ]
+
+
+setup(
+    name="gpu-memory-service",
+    version="0.9.0",
+    description="GPU Memory Service for Dynamo - CUDA VMM-based GPU memory allocation and sharing",
+    author="NVIDIA Inc.",
+    author_email="sw-dl-dynamo@nvidia.com",
+    license="Apache-2.0",
+    python_requires=">=3.10",
+    install_requires=[
+        "uvloop>=0.21.0",
+    ],
+    extras_require={
+        "test": [
+            "pytest>=8.3.4",
+            "pytest-asyncio",
+        ],
+    },
+    # Package directory mapping: the current directory IS the gpu_memory_service package
+    packages=[
+        "gpu_memory_service",
+        "gpu_memory_service.cli",
+        "gpu_memory_service.cli.snapshot",
+        "gpu_memory_service.common",
+        "gpu_memory_service.common.protocol",
+        "gpu_memory_service.common.vmm",
+        "gpu_memory_service.common.vmm._sycl_vmm",
+        "gpu_memory_service.server",
+        "gpu_memory_service.client",
+        "gpu_memory_service.client.torch",
+        "gpu_memory_service.client.torch.extensions",
+        "gpu_memory_service.failover_lock",
+        "gpu_memory_service.failover_lock.flock",
+        "gpu_memory_service.integrations",
+        "gpu_memory_service.integrations.common",
+        "gpu_memory_service.integrations.sglang",
+        "gpu_memory_service.integrations.trtllm",
+        "gpu_memory_service.integrations.vllm",
+        "gpu_memory_service.snapshot",
+        "gpu_memory_service.snapshot.backends",
+        "gpu_memory_service.v1",
+        "gpu_memory_service.v1.client",
+        "gpu_memory_service.v1.server",
+        "gpu_memory_service.v1.snapshot",
+        "gpu_memory_service.v1.integrations",
+        "gpu_memory_service.v1.integrations.sglang",
+        "gpu_memory_service.v1.integrations.vllm",
+    ],
+    package_dir={
+        "gpu_memory_service": ".",
+        "gpu_memory_service.cli": "cli",
+        "gpu_memory_service.cli.snapshot": "cli/snapshot",
+        "gpu_memory_service.common": "common",
+        "gpu_memory_service.common.protocol": "common/protocol",
+        "gpu_memory_service.common.vmm": "common/vmm",
+        "gpu_memory_service.common.vmm._sycl_vmm": "common/vmm/_sycl_vmm",
+        "gpu_memory_service.server": "server",
+        "gpu_memory_service.client": "client",
+        "gpu_memory_service.client.torch": "client/torch",
+        "gpu_memory_service.client.torch.extensions": "client/torch/extensions",
+        "gpu_memory_service.failover_lock": "failover_lock",
+        "gpu_memory_service.failover_lock.flock": "failover_lock/flock",
+        "gpu_memory_service.integrations": "integrations",
+        "gpu_memory_service.integrations.common": "integrations/common",
+        "gpu_memory_service.integrations.sglang": "integrations/sglang",
+        "gpu_memory_service.integrations.trtllm": "integrations/trtllm",
+        "gpu_memory_service.integrations.vllm": "integrations/vllm",
+        "gpu_memory_service.snapshot": "snapshot",
+        "gpu_memory_service.snapshot.backends": "snapshot/backends",
+    },
+    package_data={
+        "gpu_memory_service.client.torch.extensions": ["*.cpp"],
+        "gpu_memory_service.common.vmm._sycl_vmm": ["*.so"],
+    },
+    entry_points={
+        "console_scripts": [
+            "gpu-memory-service=gpu_memory_service.cli.runner:main",
+            "gms-storage-client=gpu_memory_service.cli.storage_runner:main",
+        ],
+        "sglang.srt.plugins": [
+            "gms-v1=gpu_memory_service.v1.integrations.sglang.plugin:register_gms_v1_plugin",
+        ],
+    },
+    ext_modules=_create_ext_modules(),
+    cmdclass={"build_ext": BuildExtension},
+)

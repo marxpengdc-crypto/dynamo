@@ -1,0 +1,487 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Connector for delegating scaling decisions to a centralized GlobalPlanner."""
+
+import logging
+import os
+import time
+from typing import Optional
+from uuid import uuid4
+
+from kubernetes.client import ApiException
+from kubernetes.config.config_exception import ConfigException
+
+from dynamo.planner.config.defaults import SubComponentType, TargetReplica
+from dynamo.planner.connectors.base import PlannerConnector
+from dynamo.planner.connectors.clients.remote_client import RemotePlannerClient
+from dynamo.planner.connectors.kubernetes import KubernetesConnector
+from dynamo.planner.connectors.protocol import (
+    AllocationStatusRequest,
+    ManagedAllocationStatus,
+    ScaleRequest,
+    ScaleResponse,
+    ScaleStatus,
+)
+from dynamo.planner.core.types import WorkerCounts
+from dynamo.planner.errors import (
+    DeploymentModelNameMismatchError,
+    DeploymentValidationError,
+    EmptyTargetReplicasError,
+    ModelNameNotFoundError,
+    UserProvidedModelNameMismatchError,
+)
+from dynamo.planner.monitoring.dgd_services import ComponentGPUShape
+from dynamo.planner.monitoring.worker_info import (
+    WorkerInfo,
+    build_worker_info_from_defaults,
+)
+from dynamo.runtime import DistributedRuntime
+from dynamo.runtime.logging import configure_dynamo_logging
+
+configure_dynamo_logging()
+logger = logging.getLogger(__name__)
+
+
+def _recovery_required(response: ScaleResponse) -> bool:
+    """Whether a managed controller has frozen mutations for manual recovery."""
+    return (
+        response.allocation is not None
+        and response.allocation.phase == "recovery_required"
+    )
+
+
+class GlobalPlannerConnector(PlannerConnector):
+    """
+    Connector that delegates scaling decisions to a centralized GlobalPlanner.
+
+    This connector wraps RemotePlannerClient and implements the InfraScaler
+    interface, allowing planner_core.py to treat global-planner environment mode
+    consistently with kubernetes and virtual modes.
+    """
+
+    def __init__(
+        self,
+        runtime: DistributedRuntime,
+        dynamo_namespace: str,
+        global_planner_namespace: str,
+        global_planner_component: str = "GlobalPlanner",
+        model_name: Optional[str] = None,
+        managed_allocation: bool = False,
+    ):
+        """
+        Initialize GlobalPlannerConnector.
+
+        Args:
+            runtime: Distributed runtime for communication
+            dynamo_namespace: Local dynamo namespace (caller identification)
+            global_planner_namespace: Namespace where GlobalPlanner is deployed
+            global_planner_component: Component name of GlobalPlanner (default: "GlobalPlanner")
+            model_name: Optional model name (will be managed remotely if not provided)
+            managed_allocation: GlobalPlanner runs managed allocation; poll its
+                allocation status alongside worker observations
+        """
+        self.runtime = runtime
+        self.dynamo_namespace = dynamo_namespace
+        self.global_planner_namespace = global_planner_namespace
+        self.global_planner_component = global_planner_component
+        self.model_name = model_name
+        self.remote_client: Optional[RemotePlannerClient] = None
+
+        # Cache for predicted load (will be set by planner before scaling)
+        self.last_predicted_load: Optional[dict] = None
+        # Local demand remains distinct from the controller's allocation grant.
+        # Neither value substitutes for Kubernetes readiness observations.
+        self.last_desired_replicas: list[TargetReplica] = []
+        self.last_managed_allocation: Optional[ManagedAllocationStatus] = None
+        self.managed_allocation = managed_allocation
+
+        # Lazily-initialized KubernetesConnector scoped to the pool's own DGD.
+        # Used only to read pool-local MDC / DGD args for capability discovery
+        # (get_worker_info, get_model_name). Scaling actions still go through
+        # the RemotePlannerClient.
+        self._local_k8s_connector: Optional[KubernetesConnector] = None
+        self._local_k8s_init_attempted: bool = False
+
+    async def async_init(self):
+        """Async initialization - creates RemotePlannerClient"""
+        self.remote_client = RemotePlannerClient(
+            self.runtime,
+            self.global_planner_namespace,
+            self.global_planner_component,
+        )
+        logger.info(
+            f"GlobalPlannerConnector initialized: will delegate to {self.global_planner_namespace}.{self.global_planner_component}"
+        )
+
+    def set_predicted_load(
+        self, num_requests: Optional[float], isl: Optional[float], osl: Optional[float]
+    ):
+        """
+        Set predicted load for inclusion in next scale request.
+
+        This is called by planner_core.py before calling set_component_replicas.
+        """
+        self.last_predicted_load = {
+            "num_requests": num_requests,
+            "isl": isl,
+            "osl": osl,
+        }
+
+    async def set_component_replicas(
+        self, target_replicas: list[TargetReplica], blocking: bool = True
+    ):
+        """
+        Set component replicas by delegating to GlobalPlanner.
+
+        Sends a ScaleRequest to the GlobalPlanner with the target replica configurations.
+
+        Args:
+            target_replicas: List of target replica configurations
+            blocking: Whether to wait for scaling completion (passed to GlobalPlanner)
+
+        Raises:
+            EmptyTargetReplicasError: If target_replicas is empty
+            RuntimeError: If remote_client is not initialized or the response
+                indicates a hard error (e.g., authorization denied, K8s
+                exception). A REJECTED response is NOT raised — it is logged
+                as a warning and treated as a no-op for this tick.
+        """
+        if not target_replicas:
+            raise EmptyTargetReplicasError()
+
+        if self.remote_client is None:
+            raise RuntimeError(
+                "GlobalPlannerConnector not initialized. Call async_init() first."
+            )
+
+        identity = self._allocation_status_request()
+        self.last_desired_replicas = [
+            target.model_copy(deep=True) for target in target_replicas
+        ]
+
+        # Generate the identifier once before transport. Connection retries send
+        # this same request; a later local decision is a new demand update.
+        request = ScaleRequest(
+            **identity.model_dump(),
+            target_replicas=self.last_desired_replicas,
+            blocking=blocking,
+            timestamp=time.time(),
+            predicted_load=self.last_predicted_load,
+            request_id=str(uuid4()),
+        )
+
+        logger.info(
+            "Delegating scale request to GlobalPlanner: DGD=%s, targets=%s",
+            identity.graph_deployment_name,
+            target_replicas,
+        )
+
+        response = await self.remote_client.send_scale_request(request)
+        self.last_managed_allocation = response.allocation
+
+        if response.status == ScaleStatus.SUCCESS:
+            logger.info("GlobalPlanner scaling successful: %s", response.message)
+        elif response.status == ScaleStatus.SCALING:
+            logger.info(
+                "GlobalPlanner demand accepted, scaling pending: %s", response.message
+            )
+        elif response.status == ScaleStatus.REJECTED:
+            # Over-budget rejection is a legitimate business outcome — keep running.
+            logger.warning(f"GlobalPlanner rejected scale request: {response.message}")
+        elif response.status == ScaleStatus.ERROR:
+            logger.error("GlobalPlanner scaling failed: %s", response.message)
+            if _recovery_required(response):
+                # The managed controller has explicitly frozen mutations. Keep
+                # observing and publishing demand so a later recovery can use it.
+                return
+            raise RuntimeError(f"GlobalPlanner scaling failed: {response.message}")
+
+    def _allocation_status_request(self) -> AllocationStatusRequest:
+        """Resolve the pool identity shared by demand and status RPCs."""
+        graph_deployment_name = os.environ.get("DYN_PARENT_DGD_K8S_NAME")
+        if not graph_deployment_name:
+            raise ValueError(
+                "DYN_PARENT_DGD_K8S_NAME environment variable is required but not set. "
+                "Please set DYN_PARENT_DGD_K8S_NAME to specify the parent DGD name."
+            )
+        k8s_namespace = os.environ.get("POD_NAMESPACE")
+        if not k8s_namespace:
+            raise ValueError(
+                "POD_NAMESPACE environment variable is required but not set. "
+                "Please set POD_NAMESPACE to specify the Kubernetes namespace."
+            )
+
+        return AllocationStatusRequest(
+            caller_namespace=self.dynamo_namespace,
+            graph_deployment_name=graph_deployment_name,
+            k8s_namespace=k8s_namespace,
+        )
+
+    async def get_allocation_status(self) -> Optional[ManagedAllocationStatus]:
+        """Refresh the controller's grant and transfer state without changing demand."""
+        if self.remote_client is None:
+            raise RuntimeError(
+                "GlobalPlannerConnector not initialized. Call async_init() first."
+            )
+        request = self._allocation_status_request()
+        try:
+            response = await self.remote_client.get_allocation_status(request)
+        except (RuntimeError, TimeoutError) as exc:
+            # This read cannot have submitted a mutation. Losing the controller
+            # makes its cached allocation unknown, but must not stop independent
+            # Kubernetes observation. Keep polling after the controller returns.
+            self.last_managed_allocation = None
+            logger.warning("GlobalPlanner allocation status unavailable: %s", exc)
+            return None
+        self.last_managed_allocation = response.allocation
+        if response.status == ScaleStatus.ERROR:
+            if _recovery_required(response):
+                logger.error("GlobalPlanner requires recovery: %s", response.message)
+                return self.last_managed_allocation
+            raise RuntimeError(
+                f"GlobalPlanner allocation status failed: {response.message}"
+            )
+        return self.last_managed_allocation
+
+    async def add_component(
+        self, sub_component_type: SubComponentType, blocking: bool = True
+    ):
+        """
+        Add a component (not supported for GlobalPlanner).
+
+        GlobalPlanner only supports batch operations via set_component_replicas.
+        """
+        raise NotImplementedError(
+            "GlobalPlannerConnector only supports batch operations via set_component_replicas(). "
+            "Use set_component_replicas() to scale components."
+        )
+
+    async def remove_component(
+        self, sub_component_type: SubComponentType, blocking: bool = True
+    ):
+        """
+        Remove a component (not supported for GlobalPlanner).
+
+        GlobalPlanner only supports batch operations via set_component_replicas.
+        """
+        raise NotImplementedError(
+            "GlobalPlannerConnector only supports batch operations via set_component_replicas(). "
+            "Use set_component_replicas() to scale components."
+        )
+
+    async def validate_deployment(
+        self,
+        prefill_component_name: Optional[str] = None,
+        decode_component_name: Optional[str] = None,
+        require_prefill: bool = True,
+        require_decode: bool = True,
+    ) -> None:
+        """
+        Validate deployment (no-op for GlobalPlanner).
+
+        The GlobalPlanner validates the deployment on its side, so local
+        validation is not needed in delegating mode.
+        """
+        logger.info(
+            "GlobalPlannerConnector: Skipping local deployment validation "
+            "(GlobalPlanner will validate on its side)"
+        )
+
+    async def wait_for_deployment_ready(self, include_planner: bool = True):
+        """
+        Wait for the pool's own workers to be ready.
+
+        Even though GlobalPlanner handles cluster-wide orchestration, the
+        pool Planner still reads its own workers' DynamoWorkerMetadata CRs
+        for capability discovery (``get_worker_info``). Without a local
+        wait, ``_async_init`` runs within milliseconds of pod entry — long
+        before workers register MDC — so ``get_worker_info`` falls back to
+        defaults with ``context_length`` / ``max_kv_tokens`` unset and
+        load-scaling silently disables itself for the pod's lifetime.
+
+        Mirror the standalone path by delegating to the pool-local
+        KubernetesConnector. If no local connector is available (e.g.
+        running outside a cluster), fall back to the previous no-op so
+        out-of-cluster callers are not blocked.
+        """
+        local = self._get_local_k8s_connector()
+        if local is None:
+            logger.info(
+                "GlobalPlannerConnector: no local KubernetesConnector available, "
+                "skipping deployment ready check"
+            )
+            return
+        logger.info(
+            "GlobalPlannerConnector: waiting for pool-local workers to be ready"
+        )
+        await local.wait_for_deployment_ready(include_planner=include_planner)
+
+    def _get_local_k8s_connector(self) -> Optional[KubernetesConnector]:
+        """Lazily build a KubernetesConnector scoped to the pool's own DGD.
+
+        The pool's Planner pod has access to its own DGD and the
+        DynamoWorkerMetadata CRs of its own workers, even under
+        ``environment: global-planner``. Querying them directly is the
+        simplest way to populate per-engine capabilities (context_length,
+        max_kv_tokens, ...) that load-scaling needs. Returns ``None`` if
+        the connector can't be created (e.g. running outside a cluster).
+        """
+        if self._local_k8s_init_attempted:
+            return self._local_k8s_connector
+        self._local_k8s_init_attempted = True
+        try:
+            self._local_k8s_connector = KubernetesConnector(
+                dynamo_namespace=self.dynamo_namespace,
+                model_name=self.model_name,
+            )
+        except (DeploymentValidationError, ConfigException, ApiException) as e:
+            logger.warning(
+                "GlobalPlannerConnector: could not initialize local "
+                f"KubernetesConnector for MDC capability lookup: {e}. "
+                "Falling back to hard-coded worker defaults; easy-mode "
+                "load scaling will be disabled."
+            )
+        return self._local_k8s_connector
+
+    async def get_actual_worker_counts(
+        self,
+        prefill_component_name: Optional[str] = None,
+        decode_component_name: Optional[str] = None,
+    ) -> tuple[int, int, bool]:
+        """Read ready replica counts and rollout stability from the pool's own DGD.
+
+        GlobalPlanner orchestrates scaling, but the pool Planner pod has direct
+        access to its own DGD status. Mirror KubernetesConnector by delegating
+        to the pool-local connector so ``_scaling_in_progress`` observes real
+        rollouts instead of always seeing ``is_stable=True``.
+
+        Returns ``(0, 0, True)`` when no local KubernetesConnector is available
+        (e.g. running out-of-cluster), matching the existing capability-discovery
+        fallback path so out-of-cluster callers aren't blocked.
+        """
+        # The local planner already polls worker counts. Reuse that cadence for
+        # managed status, including donor changes initiated by another pool.
+        # Legacy deployments never call the new endpoint.
+        if self.managed_allocation:
+            await self.get_allocation_status()
+        local = self._get_local_k8s_connector()
+        if local is None:
+            logger.debug(
+                "GlobalPlannerConnector: no local KubernetesConnector; "
+                "reporting (0, 0, stable=True) for out-of-cluster usage."
+            )
+            return 0, 0, True
+        return await local.get_actual_worker_counts(
+            prefill_component_name=prefill_component_name,
+            decode_component_name=decode_component_name,
+        )
+
+    async def get_worker_inventory(
+        self,
+        prefill_component_name: Optional[str] = None,
+        decode_component_name: Optional[str] = None,
+    ) -> Optional[WorkerCounts]:
+        """Read serving and pending startup inventory from the pool's own DGD.
+
+        Mirrors ``get_actual_worker_counts``: delegate to the pool-local
+        KubernetesConnector so startup can proceed while extra replicas wait
+        for capacity. Returns ``None`` out of cluster or on a Pod-list 403 so
+        callers fall back to ``get_actual_worker_counts``.
+        """
+        local = self._get_local_k8s_connector()
+        if local is None:
+            return None
+        inventory = await local.get_worker_inventory(
+            prefill_component_name=prefill_component_name,
+            decode_component_name=decode_component_name,
+        )
+        # This read replaces the count poll that refreshes managed status. On None
+        # the caller falls back to get_actual_worker_counts, which polls instead.
+        if inventory is not None and self.managed_allocation:
+            await self.get_allocation_status()
+        return inventory
+
+    def get_worker_runtime_namespace(self, base_dynamo_namespace: str) -> str:
+        """Resolve the pool-local worker runtime namespace when available."""
+        local = self._get_local_k8s_connector()
+        if local is None:
+            return base_dynamo_namespace
+        return local.get_worker_runtime_namespace(base_dynamo_namespace)
+
+    def get_gpu_counts(
+        self,
+        require_prefill: bool = True,
+        require_decode: bool = True,
+    ) -> tuple[Optional[int], Optional[int]]:
+        """Resolve pool-local per-engine GPU widths when available."""
+        local = self._get_local_k8s_connector()
+        if local is None:
+            return None, None
+        return local.get_gpu_counts(
+            require_prefill=require_prefill,
+            require_decode=require_decode,
+        )
+
+    def get_gpu_shapes(
+        self,
+        require_prefill: bool = True,
+        require_decode: bool = True,
+    ) -> tuple[Optional[ComponentGPUShape], Optional[ComponentGPUShape]]:
+        """Resolve pool-local GPU shapes when available."""
+        local = self._get_local_k8s_connector()
+        if local is None:
+            return None, None
+        return local.get_gpu_shapes(
+            require_prefill=require_prefill,
+            require_decode=require_decode,
+        )
+
+    def get_worker_info(
+        self,
+        sub_component_type: SubComponentType,
+        backend: str = "vllm",
+    ) -> WorkerInfo:
+        """Resolve per-worker capabilities from the pool's own MDC/DGD.
+
+        Without this, ``resolve_worker_info`` falls through to
+        ``build_worker_info_from_defaults`` which leaves ``context_length``
+        and ``max_kv_tokens`` unset, and load_scaling's easy-mode decisions
+        bail out every tick — so the pool Planner silently sends no
+        ScaleRequests.
+        """
+        local = self._get_local_k8s_connector()
+        if local is not None:
+            return local.get_worker_info(sub_component_type, backend)
+        return build_worker_info_from_defaults(backend, sub_component_type)
+
+    def get_model_name(
+        self,
+        require_prefill: bool = True,
+        require_decode: bool = True,
+    ) -> str:
+        """
+        Get model name.
+
+        Prefers the value provided at init time, then the pool's own DGD
+        container args (via the local KubernetesConnector), and finally
+        falls back to a placeholder indicating the model is managed
+        remotely.
+        """
+        if self.model_name:
+            return self.model_name
+        local = self._get_local_k8s_connector()
+        if local is not None:
+            try:
+                return local.get_model_name(
+                    require_prefill=require_prefill,
+                    require_decode=require_decode,
+                )
+            except (
+                ModelNameNotFoundError,
+                DeploymentModelNameMismatchError,
+                UserProvidedModelNameMismatchError,
+                ApiException,
+            ) as e:
+                logger.warning(f"Could not resolve model name from local DGD args: {e}")
+        return "managed-remotely"

@@ -1,0 +1,4598 @@
+// SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+use std::collections::{HashMap, HashSet};
+use std::env::var;
+use std::path::PathBuf;
+use std::pin::Pin;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU8;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, LazyLock};
+use std::task::{Context as TaskContext, Poll};
+use std::time::Duration;
+
+use axum::body::{Body, Bytes, HttpBody};
+use axum::http::{Response, Version, header};
+use axum::response::IntoResponse;
+use http_body::{Frame, SizeHint};
+
+use super::Metrics;
+use super::RouteDoc;
+use super::frontend_extension::{
+    FrontendExtensionContext, FrontendRouteExtension, FrontendRouteSet,
+};
+use super::metrics;
+use super::metrics::{
+    register_frontend_metrics_start_time_metric, register_lora_allocation_metrics,
+    register_model_ready_metric,
+};
+use super::worker_metrics::register_worker_metrics;
+use crate::discovery::ModelManager;
+use crate::endpoint_type::EndpointType;
+use crate::kv_router::metrics::{RoutingOverheadMetrics, register_router_queue_metrics};
+use crate::reasoning_field::ReasoningField;
+use crate::request_template::RequestTemplate;
+use anyhow::{Context, Result};
+use derive_builder::Builder;
+use dynamo_runtime::DistributedRuntime;
+use dynamo_runtime::config::env_is_truthy;
+use dynamo_runtime::config::environment_names::llm as env_llm;
+use dynamo_runtime::discovery::Discovery;
+use dynamo_runtime::logging::{make_inference_request_span, make_system_request_span};
+use dynamo_runtime::metrics::{
+    frontend_perf::ensure_frontend_perf_metrics_registered_prometheus,
+    request_plane::ensure_request_plane_metrics_registered_prometheus,
+    tokio_perf::{ensure_tokio_perf_metrics_registered_prometheus, tokio_metrics_and_canary_loop},
+    transport_metrics::ensure_transport_metrics_registered_prometheus,
+};
+use std::net::{IpAddr, SocketAddr};
+use tokio::sync::{Notify, Semaphore};
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
+use tower_http::trace::TraceLayer;
+
+use crate::frontend_config::{
+    ChatTemplateDefaults, DISABLE_OPENAI_STRICT_SCHEMA_VALIDATION, FrontendApiConfig,
+    MediaRejectionConfig, MetricsConfig,
+};
+
+/// Middleware that echoes `x-request-id` from request to response headers.
+async fn echo_request_id_header(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let x_request_id = request.headers().get("x-request-id").cloned();
+    let mut response = next.run(request).await;
+    if let Some(value) = x_request_id {
+        response.headers_mut().insert("x-request-id", value);
+    }
+    response
+}
+
+/// State used to select the error format for unmatched routes.
+#[derive(Clone)]
+struct UnmatchedRouteState {
+    /// Base path of the Anthropic Messages API, or `None` when those endpoints
+    /// are disabled and every miss belongs to the OpenAI surface.
+    anthropic_path: Option<Arc<str>>,
+}
+
+/// Returns a protocol-compatible JSON `404` error response for an
+/// unmatched route.
+///
+/// Requests under the configured Anthropic Messages path receive an Anthropic
+/// error envelope. All other requests receive an OpenAI-compatible envelope.
+async fn unmatched_route_fallback(
+    axum::extract::State(state): axum::extract::State<UnmatchedRouteState>,
+    method: axum::http::Method,
+    uri: axum::http::Uri,
+) -> axum::response::Response {
+    match state.anthropic_path.as_deref() {
+        Some(path) if path_within_namespace(uri.path(), path) => {
+            super::anthropic::unmatched_route_response(&method, &uri)
+        }
+        _ => super::openai::unmatched_route_response(&method, &uri).into_response(),
+    }
+}
+
+/// Returns whether `path` is `namespace` or a route beneath it.
+fn path_within_namespace(path: &str, namespace: &str) -> bool {
+    let namespace = namespace.trim_end_matches('/');
+    path.strip_prefix(namespace)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+}
+
+fn draining_inference_response(version: Version) -> axum::response::Response {
+    close_draining_connection(
+        super::openai::ErrorMessage::_service_unavailable().into_response(),
+        version,
+    )
+}
+
+fn close_draining_connection(
+    mut response: axum::response::Response,
+    version: Version,
+) -> axum::response::Response {
+    if version <= Version::HTTP_11 {
+        *response.version_mut() = version;
+        // Do not let connection pools keep sending requests to a retiring frontend.
+        response.headers_mut().insert(
+            header::CONNECTION,
+            header::HeaderValue::from_static("close"),
+        );
+    }
+    response
+}
+
+/// Error protocol of a mounted inference route, used when the readiness gate
+/// rejects a request before the route's own error handling runs.
+#[derive(Clone, Copy)]
+enum MountedProtocol {
+    Decision(dynamo_decisions::Dialect),
+    Anthropic,
+}
+
+struct InferenceReadinessState {
+    state: Arc<State>,
+    mounted_protocols: HashMap<String, MountedProtocol>,
+}
+
+impl InferenceReadinessState {
+    fn rejection(&self, request: &axum::extract::Request) -> axum::response::Response {
+        // Records the unavailable failure once; the protocol bodies below must not record again.
+        let (status, axum::Json(error)) = super::openai::ErrorMessage::_service_unavailable();
+        let protocol = request
+            .extensions()
+            .get::<axum::extract::MatchedPath>()
+            .filter(|_| request.method() == axum::http::Method::POST)
+            .and_then(|path| self.mounted_protocols.get(path.as_str()));
+        let dialect = match protocol {
+            Some(&MountedProtocol::Decision(dialect)) => dialect,
+            Some(MountedProtocol::Anthropic) => {
+                let response = super::anthropic::readiness_rejection_response(
+                    request.headers(),
+                    status,
+                    error.message(),
+                );
+                return close_draining_connection(response, request.version());
+            }
+            None => return draining_inference_response(request.version()),
+        };
+        let decision_error = dynamo_decisions::DecisionError::new(
+            dialect,
+            status.as_u16(),
+            "server_error",
+            error.message(),
+        );
+        let mut response = (status, axum::Json(decision_error.response_body())).into_response();
+        let request_id = super::openai::get_or_create_request_id(request.headers());
+        super::systemone::attach_request_ids(&mut response, &request_id);
+        close_draining_connection(response, request.version())
+    }
+}
+
+async fn track_inflight_inference(
+    axum::extract::State(readiness): axum::extract::State<Arc<InferenceReadinessState>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let state = &readiness.state;
+
+    // Requests rejected during draining should not extend the drain window.
+    if !state.is_ready() {
+        return readiness.rejection(&request);
+    }
+
+    let permit = state.acquire_inflight();
+    // Close the race where shutdown starts after the readiness check but
+    // before this request is counted as inflight.
+    if !state.is_ready() {
+        drop(permit);
+        return readiness.rejection(&request);
+    }
+
+    let response = next.run(request).await;
+    let (parts, body) = response.into_parts();
+    // Keep the permit alive until the full response body, including streams,
+    // finishes or is dropped.
+    Response::from_parts(
+        parts,
+        Body::new(InflightResponseBody {
+            body,
+            _permit: permit,
+        }),
+    )
+}
+
+/// Preserve framing metadata and trailers while holding the response's admission.
+struct InflightResponseBody {
+    body: Body,
+    _permit: InflightPermit,
+}
+
+impl HttpBody for InflightResponseBody {
+    type Data = Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        Pin::new(&mut self.get_mut().body).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.body.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.body.size_hint()
+    }
+}
+
+/// HTTP service shared state
+pub struct State {
+    metrics: Arc<Metrics>,
+    manager: Arc<ModelManager>,
+    discovery_client: Arc<dyn Discovery>,
+    service_observer: Arc<ServiceObserver>,
+    flags: StateFlags,
+    cancel_token: CancellationToken,
+    // Frontend API behavior read by request handlers after the service is built.
+    frontend_api_config: FrontendApiConfig,
+    responses_api_enabled: bool,
+    generate_api_enabled: bool,
+    nvext_enabled: bool,
+    sse_keep_alive: Option<Duration>,
+    streaming_backend_error_check: BackendErrorCheck,
+    pub(super) migration_limit: u32,
+    systemone_admission: Arc<Semaphore>,
+    systemone_preflight_admission: Arc<Semaphore>,
+    systemone_max_inflight_branches: usize,
+    systemone_max_input_tokens: usize,
+    systemone_request_timeout: Duration,
+}
+
+const DEFAULT_SYSTEMONE_MAX_INFLIGHT_BRANCHES: usize = 256;
+const DEFAULT_SYSTEMONE_MAX_INPUT_TOKENS: usize = 65_536;
+const MAX_SYSTEMONE_INFLIGHT_BRANCHES: usize = 4096;
+const MAX_SYSTEMONE_INPUT_TOKENS: usize = 1_048_576;
+const MAX_SYSTEMONE_REQUEST_TIMEOUT_SECS: usize = 3600;
+const SYSTEMONE_MAX_CONCURRENT_PREFLIGHT: usize = 4;
+
+fn bounded_systemone_limit(env_name: &'static str, default: usize, maximum: usize) -> usize {
+    match std::env::var(env_name) {
+        Ok(value) => match value.parse::<usize>() {
+            Ok(parsed) if parsed > 0 => {
+                if parsed > maximum {
+                    tracing::warn!(
+                        env = env_name,
+                        requested = parsed,
+                        effective = maximum,
+                        "lowering configured System One limit"
+                    );
+                } else if parsed > default {
+                    tracing::warn!(
+                        env = env_name,
+                        effective = parsed,
+                        default,
+                        "raising System One resource limit above the default"
+                    );
+                }
+                parsed.min(maximum)
+            }
+            _ => {
+                tracing::warn!(
+                    env = env_name,
+                    value,
+                    default,
+                    "ignoring invalid System One limit"
+                );
+                default
+            }
+        },
+        Err(std::env::VarError::NotPresent) => default,
+        Err(error) => {
+            tracing::warn!(env = env_name, %error, default, "ignoring invalid System One limit");
+            default
+        }
+    }
+}
+
+/// Typed config needed only to construct HTTP shared state.
+///
+/// `MetricsConfig` initializes the per-service metrics object, while
+/// `FrontendApiConfig` is retained in `State` for route and handler decisions.
+struct StateConfig {
+    metrics_config: MetricsConfig,
+    frontend_api_config: FrontendApiConfig,
+    responses_api_enabled: bool,
+    generate_api_enabled: bool,
+    nvext_enabled: bool,
+    sse_keep_alive: Option<Duration>,
+    streaming_backend_error_check: BackendErrorCheck,
+    migration_limit: u32,
+}
+
+fn parse_sse_keep_alive(value: Result<String, std::env::VarError>) -> Option<Duration> {
+    let value = match value {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => return None,
+        Err(error @ std::env::VarError::NotUnicode(_)) => {
+            tracing::warn!(
+                env = env_llm::DYN_HTTP_SSE_KEEP_ALIVE_INTERVAL_MS,
+                %error,
+                "ignoring invalid SSE keep-alive interval"
+            );
+            return None;
+        }
+    };
+
+    match value.parse::<u64>() {
+        Ok(0) => None,
+        Ok(milliseconds) => {
+            let interval = Duration::from_millis(milliseconds);
+            if std::time::Instant::now().checked_add(interval).is_some() {
+                Some(interval)
+            } else {
+                tracing::warn!(
+                    env = env_llm::DYN_HTTP_SSE_KEEP_ALIVE_INTERVAL_MS,
+                    value,
+                    "ignoring SSE keep-alive interval outside the platform range"
+                );
+                None
+            }
+        }
+        Err(error) => {
+            tracing::warn!(
+                env = env_llm::DYN_HTTP_SSE_KEEP_ALIVE_INTERVAL_MS,
+                value,
+                %error,
+                "ignoring invalid SSE keep-alive interval"
+            );
+            None
+        }
+    }
+}
+
+fn sse_keep_alive_from_env() -> Option<Duration> {
+    parse_sse_keep_alive(std::env::var(env_llm::DYN_HTTP_SSE_KEEP_ALIVE_INTERVAL_MS))
+}
+
+const DEFERRED_RESPONSE_KEEP_ALIVE: Duration = Duration::from_secs(15);
+
+fn effective_sse_keep_alive(
+    configured: Option<Duration>,
+    response_can_defer_all_output: bool,
+) -> Option<Duration> {
+    configured.or(response_can_defer_all_output.then_some(DEFERRED_RESPONSE_KEEP_ALIVE))
+}
+
+/// How a handler waits on the backend stream before committing the HTTP status.
+///
+/// Non-streaming handlers always wait for the first event because they need it
+/// to build the response, as does audio speech. The streaming chat, completions,
+/// responses, and Anthropic messages handlers use the service-wide policy from
+/// [`State::streaming_backend_error_check`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendErrorCheck {
+    /// Commit the status immediately and hand the stream to the client
+    /// untouched. A backend error that arrives afterwards surfaces as an SSE
+    /// error frame behind an HTTP 200.
+    Skip,
+    /// Wait at most this long for the first non-annotation event. An error
+    /// within the window maps to its HTTP status; once the window elapses the
+    /// stream is handed over as with `Skip`.
+    Bounded(Duration),
+    /// Wait for the first non-annotation event however long it takes, so a
+    /// backend error before the first item always maps to its HTTP status.
+    UntilFirstEvent,
+}
+
+impl BackendErrorCheck {
+    /// Policy from `DYN_HTTP_PRE_COMMIT_ERROR_PEEK_MS`: unset or `0` is `Skip`;
+    /// any other value is `Bounded` for that many milliseconds. A value that
+    /// cannot be read is `Skip` and warns, so a typo does not silently disable
+    /// the peek someone meant to turn on.
+    fn from_env() -> Self {
+        Self::parse(std::env::var(env_llm::DYN_HTTP_PRE_COMMIT_ERROR_PEEK_MS))
+    }
+
+    fn parse(value: Result<String, std::env::VarError>) -> Self {
+        let value = match value {
+            Ok(value) => value,
+            Err(std::env::VarError::NotPresent) => return Self::Skip,
+            Err(error @ std::env::VarError::NotUnicode(_)) => {
+                tracing::warn!(
+                    env = env_llm::DYN_HTTP_PRE_COMMIT_ERROR_PEEK_MS,
+                    %error,
+                    "ignoring invalid pre-commit error peek window"
+                );
+                return Self::Skip;
+            }
+        };
+
+        match value.parse::<u64>() {
+            Ok(0) => Self::Skip,
+            Ok(milliseconds) => Self::Bounded(Duration::from_millis(milliseconds)),
+            Err(error) => {
+                tracing::warn!(
+                    env = env_llm::DYN_HTTP_PRE_COMMIT_ERROR_PEEK_MS,
+                    value,
+                    %error,
+                    "ignoring invalid pre-commit error peek window"
+                );
+                Self::Skip
+            }
+        }
+    }
+}
+
+/// Lifecycle stage for the HTTP frontend.
+///
+/// The stage gates readiness and request admission separately from the runtime
+/// cancellation token so the frontend can stop accepting new requests before
+/// tearing down discovery and transport state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ServiceStage {
+    /// The frontend is ready to admit new inference requests.
+    Ready = 0,
+    /// The frontend is rejecting new requests while admitted responses drain.
+    Draining = 1,
+    /// The frontend is cancelling runtime state and shutting down.
+    Stopping = 2,
+}
+
+impl ServiceStage {
+    fn as_u8(self) -> u8 {
+        self as u8
+    }
+
+    fn from_u8(value: u8) -> Self {
+        match value {
+            0 => Self::Ready,
+            1 => Self::Draining,
+            _ => Self::Stopping,
+        }
+    }
+}
+
+impl std::fmt::Display for ServiceStage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ready => f.write_str("ready"),
+            Self::Draining => f.write_str("draining"),
+            Self::Stopping => f.write_str("stopping"),
+        }
+    }
+}
+
+/// Shared HTTP frontend lifecycle and inflight request tracker.
+///
+/// `ServiceObserver` is shared by HTTP handlers, health endpoints, and the
+/// shutdown path. It lets shutdown first mark the frontend as draining, then
+/// wait for admitted inference response bodies to complete before cancelling
+/// runtime state.
+#[derive(Debug)]
+pub struct ServiceObserver {
+    stage: AtomicU8,
+    inflight_inference: AtomicU64,
+    inflight_zero: Notify,
+}
+
+impl Default for ServiceObserver {
+    fn default() -> Self {
+        Self {
+            stage: AtomicU8::new(ServiceStage::Ready.as_u8()),
+            inflight_inference: AtomicU64::new(0),
+            inflight_zero: Notify::new(),
+        }
+    }
+}
+
+impl ServiceObserver {
+    /// Return the current frontend lifecycle stage.
+    pub fn stage(&self) -> ServiceStage {
+        ServiceStage::from_u8(self.stage.load(Ordering::Acquire))
+    }
+
+    /// Return true when the frontend should admit new inference requests.
+    pub fn is_ready(&self) -> bool {
+        self.stage() == ServiceStage::Ready
+    }
+
+    /// Mark the frontend as draining.
+    ///
+    /// Draining makes readiness fail and causes request admission checks to
+    /// reject new inference requests while existing response bodies continue.
+    pub fn start_draining(&self) {
+        tracing::info!(
+            previous_stage = ?self.stage(),
+            inflight_requests = self.inflight_count(),
+            "frontend service entering draining stage"
+        );
+        self.stage
+            .store(ServiceStage::Draining.as_u8(), Ordering::Release);
+    }
+
+    /// Mark the frontend as stopping.
+    ///
+    /// Stopping is entered after inflight requests drain or the graceful
+    /// shutdown timeout expires.
+    pub fn start_stopping(&self) {
+        tracing::info!(
+            previous_stage = ?self.stage(),
+            inflight_requests = self.inflight_count(),
+            "frontend service entering stopping stage"
+        );
+        self.stage
+            .store(ServiceStage::Stopping.as_u8(), Ordering::Release);
+    }
+
+    /// Track one admitted inference response body.
+    ///
+    /// The returned permit must live for the full HTTP response body lifetime,
+    /// including streaming responses. Dropping the permit decrements the
+    /// inflight count and wakes shutdown waiters when the count reaches zero.
+    pub fn acquire_inflight(self: &Arc<Self>) -> InflightPermit {
+        self.inflight_inference.fetch_add(1, Ordering::Relaxed);
+        InflightPermit {
+            observer: self.clone(),
+        }
+    }
+
+    /// Return the number of admitted inference requests still in flight.
+    pub fn inflight_count(&self) -> u64 {
+        self.inflight_inference.load(Ordering::Acquire)
+    }
+
+    /// Wait until all admitted inference requests drain or `timeout` expires.
+    ///
+    /// Returns `true` when inflight work drained before the timeout and `false`
+    /// when shutdown should proceed because the timeout expired.
+    pub async fn wait_inflight_zero_or_timeout(&self, timeout: Duration) -> bool {
+        tokio::time::timeout(timeout, async {
+            loop {
+                let notified = self.inflight_zero.notified();
+                tokio::pin!(notified);
+                // Register before reading the count so a final permit drop
+                // cannot notify between the count check and the await.
+                notified.as_mut().enable();
+                if self.inflight_count() == 0 {
+                    break;
+                }
+                notified.as_mut().await;
+            }
+        })
+        .await
+        .is_ok()
+    }
+}
+
+/// RAII guard for one admitted inference response.
+///
+/// This permit is held by a response-body wrapper so it is released only when
+/// the client response body finishes or is dropped.
+pub struct InflightPermit {
+    observer: Arc<ServiceObserver>,
+}
+
+impl Drop for InflightPermit {
+    fn drop(&mut self) {
+        if self
+            .observer
+            .inflight_inference
+            .fetch_sub(1, Ordering::AcqRel)
+            == 1
+            && self.observer.stage() != ServiceStage::Ready
+        {
+            self.observer.inflight_zero.notify_waiters();
+        }
+    }
+}
+
+#[derive(Default, Debug)]
+struct StateFlags {
+    chat_endpoints_enabled: AtomicBool,
+    cmpl_endpoints_enabled: AtomicBool,
+    embeddings_endpoints_enabled: AtomicBool,
+    classify_endpoints_enabled: AtomicBool,
+    rerank_endpoints_enabled: AtomicBool,
+    pooling_endpoints_enabled: AtomicBool,
+    images_endpoints_enabled: AtomicBool,
+    videos_endpoints_enabled: AtomicBool,
+    audios_endpoints_enabled: AtomicBool,
+    transcriptions_endpoints_enabled: AtomicBool,
+    realtime_endpoints_enabled: AtomicBool,
+    responses_endpoints_enabled: AtomicBool,
+    anthropic_endpoints_enabled: AtomicBool,
+    generate_endpoints_enabled: AtomicBool,
+    systemone_endpoints_enabled: AtomicBool,
+    batch_endpoints_enabled: AtomicBool,
+}
+
+impl StateFlags {
+    pub fn get(&self, endpoint_type: &EndpointType) -> bool {
+        match endpoint_type {
+            EndpointType::Chat => self.chat_endpoints_enabled.load(Ordering::Relaxed),
+            EndpointType::Completion => self.cmpl_endpoints_enabled.load(Ordering::Relaxed),
+            EndpointType::Embedding => self.embeddings_endpoints_enabled.load(Ordering::Relaxed),
+            EndpointType::Classify => self.classify_endpoints_enabled.load(Ordering::Relaxed),
+            EndpointType::Rerank => self.rerank_endpoints_enabled.load(Ordering::Relaxed),
+            EndpointType::Pooling => self.pooling_endpoints_enabled.load(Ordering::Relaxed),
+            EndpointType::Images => self.images_endpoints_enabled.load(Ordering::Relaxed),
+            EndpointType::Videos => self.videos_endpoints_enabled.load(Ordering::Relaxed),
+            EndpointType::Audios => self.audios_endpoints_enabled.load(Ordering::Relaxed),
+            EndpointType::Transcriptions => self
+                .transcriptions_endpoints_enabled
+                .load(Ordering::Relaxed),
+            EndpointType::Realtime => self.realtime_endpoints_enabled.load(Ordering::Relaxed),
+            EndpointType::Responses => self.responses_endpoints_enabled.load(Ordering::Relaxed),
+            EndpointType::AnthropicMessages => {
+                self.anthropic_endpoints_enabled.load(Ordering::Relaxed)
+            }
+            EndpointType::Generate => self.generate_endpoints_enabled.load(Ordering::Relaxed),
+            EndpointType::SystemOne => self.systemone_endpoints_enabled.load(Ordering::Relaxed),
+            EndpointType::Batch => self.batch_endpoints_enabled.load(Ordering::Relaxed),
+        }
+    }
+
+    pub fn set(&self, endpoint_type: &EndpointType, enabled: bool) {
+        match endpoint_type {
+            EndpointType::Chat => self
+                .chat_endpoints_enabled
+                .store(enabled, Ordering::Relaxed),
+            EndpointType::Completion => self
+                .cmpl_endpoints_enabled
+                .store(enabled, Ordering::Relaxed),
+            EndpointType::Embedding => self
+                .embeddings_endpoints_enabled
+                .store(enabled, Ordering::Relaxed),
+            EndpointType::Classify => self
+                .classify_endpoints_enabled
+                .store(enabled, Ordering::Relaxed),
+            EndpointType::Rerank => self
+                .rerank_endpoints_enabled
+                .store(enabled, Ordering::Relaxed),
+            EndpointType::Pooling => self
+                .pooling_endpoints_enabled
+                .store(enabled, Ordering::Relaxed),
+            EndpointType::Images => self
+                .images_endpoints_enabled
+                .store(enabled, Ordering::Relaxed),
+            EndpointType::Videos => self
+                .videos_endpoints_enabled
+                .store(enabled, Ordering::Relaxed),
+            EndpointType::Audios => self
+                .audios_endpoints_enabled
+                .store(enabled, Ordering::Relaxed),
+            EndpointType::Transcriptions => self
+                .transcriptions_endpoints_enabled
+                .store(enabled, Ordering::Relaxed),
+            EndpointType::Realtime => self
+                .realtime_endpoints_enabled
+                .store(enabled, Ordering::Relaxed),
+            EndpointType::Responses => self
+                .responses_endpoints_enabled
+                .store(enabled, Ordering::Relaxed),
+            EndpointType::AnthropicMessages => self
+                .anthropic_endpoints_enabled
+                .store(enabled, Ordering::Relaxed),
+            EndpointType::Generate => self
+                .generate_endpoints_enabled
+                .store(enabled, Ordering::Relaxed),
+            EndpointType::SystemOne => self
+                .systemone_endpoints_enabled
+                .store(enabled, Ordering::Relaxed),
+            EndpointType::Batch => self
+                .batch_endpoints_enabled
+                .store(enabled, Ordering::Relaxed),
+        }
+    }
+}
+
+impl State {
+    fn new(
+        manager: Arc<ModelManager>,
+        discovery_client: Arc<dyn Discovery>,
+        cancel_token: CancellationToken,
+        config: StateConfig,
+    ) -> Self {
+        let systemone_max_inflight_branches = bounded_systemone_limit(
+            env_llm::DYN_SYSTEMONE_MAX_INFLIGHT_BRANCHES,
+            DEFAULT_SYSTEMONE_MAX_INFLIGHT_BRANCHES,
+            MAX_SYSTEMONE_INFLIGHT_BRANCHES,
+        );
+        Self {
+            manager,
+            metrics: Arc::new(Metrics::new_with_prefix(config.metrics_config.prefix())),
+            discovery_client,
+            service_observer: Arc::new(ServiceObserver::default()),
+            nvext_enabled: config.nvext_enabled,
+            flags: StateFlags {
+                chat_endpoints_enabled: AtomicBool::new(false),
+                cmpl_endpoints_enabled: AtomicBool::new(false),
+                embeddings_endpoints_enabled: AtomicBool::new(false),
+                classify_endpoints_enabled: AtomicBool::new(false),
+                rerank_endpoints_enabled: AtomicBool::new(false),
+                pooling_endpoints_enabled: AtomicBool::new(false),
+                images_endpoints_enabled: AtomicBool::new(false),
+                videos_endpoints_enabled: AtomicBool::new(false),
+                audios_endpoints_enabled: AtomicBool::new(false),
+                transcriptions_endpoints_enabled: AtomicBool::new(false),
+                realtime_endpoints_enabled: AtomicBool::new(false),
+                responses_endpoints_enabled: AtomicBool::new(false),
+                anthropic_endpoints_enabled: AtomicBool::new(false),
+                generate_endpoints_enabled: AtomicBool::new(false),
+                systemone_endpoints_enabled: AtomicBool::new(false),
+                batch_endpoints_enabled: AtomicBool::new(false),
+            },
+            cancel_token,
+            frontend_api_config: config.frontend_api_config,
+            responses_api_enabled: config.responses_api_enabled,
+            generate_api_enabled: config.generate_api_enabled,
+            sse_keep_alive: config.sse_keep_alive,
+            streaming_backend_error_check: config.streaming_backend_error_check,
+            migration_limit: config.migration_limit,
+            systemone_admission: Arc::new(Semaphore::new(systemone_max_inflight_branches)),
+            systemone_preflight_admission: Arc::new(Semaphore::new(
+                SYSTEMONE_MAX_CONCURRENT_PREFLIGHT,
+            )),
+            systemone_max_inflight_branches,
+            systemone_max_input_tokens: bounded_systemone_limit(
+                env_llm::DYN_SYSTEMONE_MAX_INPUT_TOKENS,
+                DEFAULT_SYSTEMONE_MAX_INPUT_TOKENS,
+                MAX_SYSTEMONE_INPUT_TOKENS,
+            ),
+            systemone_request_timeout: Duration::from_secs(bounded_systemone_limit(
+                env_llm::DYN_SYSTEMONE_REQUEST_TIMEOUT_SECS,
+                300,
+                MAX_SYSTEMONE_REQUEST_TIMEOUT_SECS,
+            ) as u64),
+        }
+    }
+
+    /// Get the Prometheus [`Metrics`] object which tracks request counts and inflight requests
+    pub fn metrics_clone(&self) -> Arc<Metrics> {
+        self.metrics.clone()
+    }
+
+    pub fn manager(&self) -> &ModelManager {
+        Arc::as_ref(&self.manager)
+    }
+
+    pub fn manager_clone(&self) -> Arc<ModelManager> {
+        self.manager.clone()
+    }
+
+    pub(crate) fn systemone_admission(&self) -> Arc<Semaphore> {
+        self.systemone_admission.clone()
+    }
+
+    pub(crate) fn systemone_max_inflight_branches(&self) -> usize {
+        self.systemone_max_inflight_branches
+    }
+
+    pub(crate) fn systemone_preflight_admission(&self) -> Arc<Semaphore> {
+        self.systemone_preflight_admission.clone()
+    }
+
+    pub(crate) fn systemone_max_input_tokens(&self) -> usize {
+        self.systemone_max_input_tokens
+    }
+
+    pub(crate) fn systemone_request_timeout(&self) -> Duration {
+        self.systemone_request_timeout
+    }
+
+    pub(crate) fn systemone_enabled(&self) -> bool {
+        self.frontend_api_config.systemone_enabled()
+    }
+
+    pub fn discovery(&self) -> Arc<dyn Discovery> {
+        self.discovery_client.clone()
+    }
+
+    pub fn service_observer(&self) -> Arc<ServiceObserver> {
+        self.service_observer.clone()
+    }
+
+    pub fn service_stage(&self) -> ServiceStage {
+        self.service_observer.stage()
+    }
+
+    pub fn is_ready(&self) -> bool {
+        self.service_observer.is_ready()
+    }
+
+    /// Check the model's local HTTP routes independently of process readiness.
+    /// Tensor-only models have no HTTP inference route. Every HTTP engine
+    /// registered for this model must have its corresponding route enabled.
+    pub(crate) fn model_http_routes_ready(&self, model: &crate::discovery::Model) -> bool {
+        let routes = [
+            (model.has_chat_engine(), EndpointType::Chat),
+            (
+                model.has_chat_engine() && self.responses_api_enabled,
+                EndpointType::Responses,
+            ),
+            (
+                model.has_chat_engine() && self.anthropic_api_enabled(),
+                EndpointType::AnthropicMessages,
+            ),
+            (model.has_completions_engine(), EndpointType::Completion),
+            (model.has_embeddings_engine(), EndpointType::Embedding),
+            (model.has_classify_engine(), EndpointType::Classify),
+            (model.has_pooling_engine(), EndpointType::Pooling),
+            (model.has_rerank_engine(), EndpointType::Rerank),
+            (model.has_images_engine(), EndpointType::Images),
+            (model.has_videos_engine(), EndpointType::Videos),
+            (model.has_audios_engine(), EndpointType::Audios),
+            (
+                model.has_transcriptions_engine(),
+                EndpointType::Transcriptions,
+            ),
+            (model.has_realtime_engine(), EndpointType::Realtime),
+            (
+                model.has_generate_engine()
+                    && (self.generate_api_enabled || !self.systemone_enabled()),
+                EndpointType::Generate,
+            ),
+        ];
+        routes.iter().any(|(has_engine, _)| *has_engine)
+            && routes
+                .iter()
+                .all(|(has_engine, endpoint)| !*has_engine || self.flags.get(endpoint))
+    }
+
+    pub fn start_draining(&self) {
+        self.service_observer.start_draining();
+    }
+
+    pub fn start_stopping(&self) {
+        self.service_observer.start_stopping();
+    }
+
+    pub fn acquire_inflight(&self) -> InflightPermit {
+        self.service_observer.acquire_inflight()
+    }
+
+    pub fn inflight_count(&self) -> u64 {
+        self.service_observer.inflight_count()
+    }
+
+    pub async fn wait_inflight_zero_or_timeout(&self, timeout: Duration) -> bool {
+        self.service_observer
+            .wait_inflight_zero_or_timeout(timeout)
+            .await
+    }
+
+    /// Check if the service is shutting down
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel_token.is_cancelled()
+    }
+
+    /// Master switch for the `nvext` extension protocol (see
+    /// `environment_names::llm::DYN_DISABLE_FRONTEND_NVEXT`).
+    #[inline]
+    pub fn nvext_enabled(&self) -> bool {
+        self.nvext_enabled
+    }
+
+    /// Get the cancellation token
+    pub fn cancel_token(&self) -> &CancellationToken {
+        &self.cancel_token
+    }
+
+    /// Interval for SSE comment frames while the response stream is idle.
+    ///
+    /// Disabled by default because some OpenAI-compatible clients do not
+    /// ignore SSE comments. Provider-facing deployments can opt in with
+    /// `DYN_HTTP_SSE_KEEP_ALIVE_INTERVAL_MS`.
+    pub fn sse_keep_alive(&self) -> Option<Duration> {
+        self.sse_keep_alive
+    }
+
+    /// Interval for a response that can intentionally suppress all generated
+    /// data frames while it waits to decide which output field owns the text.
+    /// Keep the configured interval when present; otherwise use Axum's standard
+    /// 15-second heartbeat so proxies and clients do not see an idle connection.
+    pub fn sse_keep_alive_for_response(
+        &self,
+        response_can_defer_all_output: bool,
+    ) -> Option<Duration> {
+        effective_sse_keep_alive(self.sse_keep_alive, response_can_defer_all_output)
+    }
+
+    /// How the streaming chat, completions, responses, and Anthropic messages
+    /// handlers wait for the first backend event before committing the HTTP
+    /// status.
+    pub fn streaming_backend_error_check(&self) -> BackendErrorCheck {
+        self.streaming_backend_error_check
+    }
+
+    /// Returns true if Anthropic billing preamble stripping is enabled.
+    pub fn strip_anthropic_preamble_enabled(&self) -> bool {
+        self.frontend_api_config.anthropic().strip_preamble()
+    }
+
+    /// Returns true if the Anthropic Messages API is enabled by service config.
+    pub fn anthropic_api_enabled(&self) -> bool {
+        self.frontend_api_config.anthropic().enabled()
+    }
+
+    /// Returns true if streaming tool call dispatch is enabled.
+    ///
+    /// When enabled, the chat completions streaming path emits `event: tool_call_dispatch`
+    /// SSE events for each complete tool call, letting clients start processing tool calls
+    /// before `finish_reason="tool_calls"` arrives.
+    pub fn streaming_tool_dispatch_enabled(&self) -> bool {
+        self.frontend_api_config
+            .streaming_dispatch()
+            .tool_dispatch()
+    }
+
+    /// Returns true if streaming reasoning dispatch is enabled.
+    ///
+    /// When enabled, the chat completions streaming path accumulates reasoning tokens and
+    /// emits a single `event: reasoning_dispatch` SSE event with the complete reasoning
+    /// block once thinking ends (DeepSeek-R1, Qwen3, etc.).
+    pub fn streaming_reasoning_dispatch_enabled(&self) -> bool {
+        self.frontend_api_config
+            .streaming_dispatch()
+            .reasoning_dispatch()
+    }
+
+    /// Response field used for emitted OpenAI-compatible reasoning content.
+    pub fn reasoning_field(&self) -> ReasoningField {
+        self.frontend_api_config.reasoning_field()
+    }
+
+    pub fn media_rejection(&self) -> MediaRejectionConfig {
+        self.frontend_api_config.media_rejection()
+    }
+
+    pub fn chat_template_defaults(&self) -> &ChatTemplateDefaults {
+        self.frontend_api_config.chat_template_defaults()
+    }
+}
+
+#[derive(Clone)]
+pub struct HttpService {
+    // The state we share with every request handler
+    state: Arc<State>,
+
+    router: axum::Router,
+    port: u16,
+    host: String,
+    enable_tls: bool,
+    tls_cert_path: Option<PathBuf>,
+    tls_key_path: Option<PathBuf>,
+    tls_client_ca_cert_path: Option<PathBuf>,
+    route_docs: Vec<RouteDoc>,
+    /// Worker capabilities accepted by the mounted engine-native Generate routes.
+    generate_engine_capabilities: Vec<&'static str>,
+    /// RL worker discovery router, served on a dedicated port when enabled.
+    rl_router: Option<axum::Router>,
+    rl_port: u16,
+    /// Admin routes, served on their own listener when enabled.
+    admin: Option<AdminListener>,
+    frontend_load_target: Option<FrontendLoadTarget>,
+}
+
+/// Admin routes and the address they are served on.
+#[derive(Clone)]
+struct AdminListener {
+    router: axum::Router,
+    addr: SocketAddr,
+}
+
+/// Where this service publishes frontend load.
+#[derive(Clone)]
+struct FrontendLoadTarget {
+    runtime: DistributedRuntime,
+    namespace: String,
+}
+
+#[derive(Clone, Builder)]
+#[builder(pattern = "owned", build_fn(private, name = "build_internal"))]
+pub struct HttpServiceConfig {
+    /// Replacement worker attempts per eligible realtime transcription socket.
+    #[builder(default)]
+    migration_limit: u32,
+
+    #[builder(default = "8787")]
+    port: u16,
+
+    #[builder(setter(into), default = "String::from(\"0.0.0.0\")")]
+    host: String,
+
+    #[builder(default = "false")]
+    enable_tls: bool,
+
+    #[builder(default = "None")]
+    tls_cert_path: Option<PathBuf>,
+
+    #[builder(default = "None")]
+    tls_key_path: Option<PathBuf>,
+
+    #[builder(default = "None")]
+    tls_client_ca_cert_path: Option<PathBuf>,
+
+    /// Metrics naming config used when initializing the HTTP service metrics registry.
+    #[builder(default)]
+    metrics_config: MetricsConfig,
+
+    /// Additional system routes merged with the built-in health, metrics, and model routes.
+    /// Each extension is invoked with a read-only [`FrontendExtensionContext`].
+    #[builder(default)]
+    frontend_route_extensions: Vec<FrontendRouteExtension>,
+
+    #[builder(default = "false")]
+    enable_chat_endpoints: bool,
+
+    #[builder(default = "false")]
+    enable_cmpl_endpoints: bool,
+
+    #[builder(default = "true")]
+    enable_embeddings_endpoints: bool,
+
+    #[builder(default = "true")]
+    enable_responses_endpoints: bool,
+
+    /// OpenAI-compatible Batch API placeholders. Disabled by default until
+    /// batch storage and job lifecycle support are implemented; when enabled,
+    /// the placeholder handlers return 501.
+    #[builder(default = "false")]
+    enable_batch_endpoints: bool,
+
+    /// Internal Batch Gateway origin. When set, expose the complete Batch API through this frontend.
+    #[builder(default = "None")]
+    batch_gateway_url: Option<String>,
+
+    /// Experimental engine-native Generate APIs. **Disabled by default**. The
+    /// builder flag mounts both vLLM `/inference/v1/generate` and SGLang
+    /// `/generate`; the backend-specific `DYN_*_ENABLE_*` variables mount one.
+    /// Capability-scoped discovery prevents either opaque request envelope from
+    /// reaching the other backend. Disabled routes return 404.
+    #[builder(default = "false")]
+    enable_engine_apis: bool,
+
+    /// API behavior config retained in HTTP state for route and streaming decisions.
+    #[builder(default)]
+    frontend_api_config: FrontendApiConfig,
+
+    #[builder(default = "None")]
+    request_template: Option<RequestTemplate>,
+
+    #[builder(default = "None")]
+    discovery: Option<Arc<dyn Discovery>>,
+
+    #[builder(default = "None")]
+    cancel_token: Option<CancellationToken>,
+
+    /// When set, the `/metrics` endpoint will also expose metrics from the
+    /// DRT's registry tree (anything created via `metrics().create*()`).
+    #[builder(default = "None")]
+    drt_metrics: Option<dynamo_runtime::metrics::MetricsRegistry>,
+
+    /// When set (e.g. DRT discovery), router metrics (dynamo_router_* with router_id label)
+    /// are registered using discovery.instance_id() and exposed on /metrics.
+    #[builder(default = "None")]
+    drt_discovery: Option<Arc<dyn Discovery>>,
+
+    /// When true, serve the RL worker discovery API on `rl_port`.
+    #[builder(default = "false")]
+    enable_rl: bool,
+
+    /// Master switch for the `nvext` extension protocol. Default `true`;
+    /// env-truthy `DYN_DISABLE_FRONTEND_NVEXT` overrides to `false`.
+    #[builder(default = "true")]
+    enable_nvext: bool,
+
+    /// Serve `/router_policy` (including its busy-threshold subresource) and the
+    /// legacy `/busy_threshold` API on the admin listener. Default `false`;
+    /// env-truthy `DYN_ENABLE_FRONTEND_ADMIN_API` also enables it.
+    #[builder(default = "false")]
+    enable_admin_api: bool,
+
+    /// Port for the RL worker discovery listener. Defaults to `DYN_RL_PORT` or 8001.
+    #[builder(default = "default_rl_port()")]
+    rl_port: u16,
+
+    /// Host for the admin listener. Defaults to `DYN_FRONTEND_ADMIN_HOST` or `127.0.0.1`.
+    #[builder(setter(into), default = "default_admin_host()")]
+    admin_host: String,
+
+    /// Port for the admin listener. Defaults to `DYN_FRONTEND_ADMIN_PORT` or 8002.
+    #[builder(default = "default_admin_port()")]
+    admin_port: u16,
+
+    /// Distributed runtime used by the RL worker discovery API and to publish
+    /// frontend load to the Pool Relay.
+    #[builder(default = "None")]
+    runtime: Option<DistributedRuntime>,
+
+    /// Exact Dynamo namespace the frontend was configured with (`--namespace`).
+    /// See [`frontend_load_namespace`](crate::frontend_load::frontend_load_namespace).
+    #[builder(default = "None")]
+    namespace: Option<String>,
+
+    /// Interval for SSE comment frames while a streaming response is idle.
+    /// Defaults to `DYN_HTTP_SSE_KEEP_ALIVE_INTERVAL_MS` when not set explicitly.
+    #[builder(setter(strip_option), default = "sse_keep_alive_from_env()")]
+    sse_keep_alive: Option<Duration>,
+
+    /// How the streaming chat, completions, responses, and Anthropic messages
+    /// handlers wait for the first backend event before committing the HTTP
+    /// status. Defaults to `DYN_HTTP_PRE_COMMIT_ERROR_PEEK_MS` when not set
+    /// explicitly.
+    #[builder(default = "BackendErrorCheck::from_env()")]
+    streaming_backend_error_check: BackendErrorCheck,
+}
+
+fn default_rl_port() -> u16 {
+    std::env::var("DYN_RL_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8001)
+}
+
+fn default_admin_host() -> String {
+    std::env::var(env_llm::DYN_FRONTEND_ADMIN_HOST).unwrap_or_else(|_| "127.0.0.1".to_string())
+}
+
+fn default_admin_port() -> u16 {
+    std::env::var(env_llm::DYN_FRONTEND_ADMIN_PORT)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8002)
+}
+
+impl HttpService {
+    pub fn builder() -> HttpServiceConfigBuilder {
+        HttpServiceConfigBuilder::default()
+    }
+
+    pub fn state_clone(&self) -> Arc<State> {
+        self.state.clone()
+    }
+
+    pub fn state(&self) -> &State {
+        Arc::as_ref(&self.state)
+    }
+
+    pub fn model_manager(&self) -> &ModelManager {
+        self.state().manager()
+    }
+
+    pub fn anthropic_api_enabled(&self) -> bool {
+        self.state().anthropic_api_enabled()
+    }
+
+    pub(crate) fn generate_engine_capabilities(&self) -> Vec<&'static str> {
+        self.generate_engine_capabilities.clone()
+    }
+
+    pub async fn spawn(&self, cancel_token: CancellationToken) -> JoinHandle<Result<()>> {
+        let this = self.clone();
+        tokio::spawn(async move { this.run(cancel_token).await })
+    }
+
+    pub async fn run(&self, cancel_token: CancellationToken) -> Result<()> {
+        self.run_inner(cancel_token, None).await
+    }
+
+    /// Like [`spawn`], but uses a caller-provided pre-bound listener. Closes the TOCTOU
+    /// port-allocation gap for tests that need to know the bound port up front.
+    ///
+    /// [`spawn`]: HttpService::spawn
+    pub async fn spawn_with_listener(
+        &self,
+        cancel_token: CancellationToken,
+        listener: tokio::net::TcpListener,
+    ) -> JoinHandle<Result<()>> {
+        let this = self.clone();
+        tokio::spawn(async move { this.run_with_listener(cancel_token, listener).await })
+    }
+
+    /// Like [`run`], but serves on a caller-provided pre-bound listener instead of
+    /// binding `{host}:{port}` internally.
+    ///
+    /// [`run`]: HttpService::run
+    pub async fn run_with_listener(
+        &self,
+        cancel_token: CancellationToken,
+        listener: tokio::net::TcpListener,
+    ) -> Result<()> {
+        self.run_inner(cancel_token, Some(listener)).await
+    }
+
+    async fn run_inner(
+        &self,
+        cancel_token: CancellationToken,
+        listener: Option<tokio::net::TcpListener>,
+    ) -> Result<()> {
+        if self.tls_client_ca_cert_path.is_some() && !self.enable_tls {
+            anyhow::bail!("TLS must be enabled when a client CA certificate is configured");
+        }
+
+        let address = format!("{}:{}", self.host, self.port);
+        let protocol = if self.enable_tls { "HTTPS" } else { "HTTP" };
+        tracing::info!(protocol, address, "Starting HTTP(S) service");
+
+        let router = self.router.clone();
+        let observer = cancel_token.child_token();
+
+        let state = self.state.clone();
+        let state_cancel = state.cancel_token().clone();
+        // Telemetry continues during drain and stops on every service exit path.
+        let publisher_cancel = CancellationToken::new();
+        let _publisher_guard = publisher_cancel.clone().drop_guard();
+
+        let tls = if self.enable_tls {
+            let cert_path = self
+                .tls_cert_path
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("TLS certificate path not provided"))?;
+            let key_path = self
+                .tls_key_path
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("TLS private key path not provided"))?;
+            let mut server_config = dynamo_runtime::tls_utils::server_tls_config(
+                cert_path,
+                key_path,
+                self.tls_client_ca_cert_path.as_deref(),
+            )
+            .context("Failed to create TLS config")?;
+            server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+            Some(tokio_rustls::TlsAcceptor::from(Arc::new(server_config)))
+        } else {
+            None
+        };
+
+        let listener = match listener {
+            Some(l) => l,
+            None => {
+                let addr = listen_socket_addr(&self.host, self.port)?;
+                bind_listener(addr).map_err(|e| {
+                    tracing::error!(
+                        protocol = %protocol,
+                        address = %address,
+                        error = %e,
+                        "Failed to bind server to address"
+                    );
+                    match e.kind() {
+                        std::io::ErrorKind::AddrInUse => anyhow::anyhow!(
+                            "Failed to start {} server: port {} already in use. Use --http-port to specify a different port.",
+                            protocol,
+                            self.port
+                        ),
+                        _ => anyhow::anyhow!(
+                            "Failed to start {} server on {}: {}",
+                            protocol,
+                            address,
+                            e
+                        ),
+                    }
+                })?
+            }
+        };
+        tracing::info!(address = %listener.local_addr()?, "{protocol} server listening");
+
+        self.spawn_admin_listener_if_configured(&cancel_token, tls.clone())?;
+        self.spawn_rl_listener_if_configured(&cancel_token).await?;
+
+        // Spawn canary after all fallible startup so it won't leak on early errors
+        tokio::spawn(tokio_metrics_and_canary_loop(cancel_token.clone()));
+        self.start_frontend_load_publisher(&publisher_cancel);
+
+        // The server keeps accepting while inflight requests drain, then gives open
+        // connections what is left of the shutdown budget.
+        let shutdown = async {
+            observer.cancelled().await;
+            state.start_draining();
+            tracing::info!("{protocol} server shutdown requested");
+            let shutdown_timeout = Duration::from_secs(get_graceful_shutdown_timeout() as u64);
+            let drain_started = tokio::time::Instant::now();
+            if !state.wait_inflight_zero_or_timeout(shutdown_timeout).await {
+                tracing::warn!(
+                    inflight_requests = state.inflight_count(),
+                    "Timed out waiting for inflight inference requests to drain"
+                );
+            }
+            shutdown_timeout.saturating_sub(drain_started.elapsed())
+        };
+        super::server::serve(listener, tls, router, write_idle_timeout(), shutdown).await;
+        state.start_stopping();
+        state_cancel.cancel();
+        Ok(())
+    }
+
+    fn start_frontend_load_publisher(&self, cancel_token: &CancellationToken) {
+        if !crate::pool_relay::serving_load_publishing_enabled() {
+            return;
+        }
+        let Some(target) = &self.frontend_load_target else {
+            return;
+        };
+        let observer = self.state.service_observer();
+        crate::frontend_load::start_frontend_load_publisher(
+            target.runtime.clone(),
+            target.namespace.clone(),
+            self.state.manager_clone(),
+            self.state.metrics_clone(),
+            move || observer.is_ready(),
+            cancel_token.child_token(),
+        );
+    }
+
+    /// Serves the admin routes on their own listener, with the same TLS settings as
+    /// the HTTP service.
+    fn spawn_admin_listener_if_configured(
+        &self,
+        cancel_token: &CancellationToken,
+        tls: Option<tokio_rustls::TlsAcceptor>,
+    ) -> Result<()> {
+        let Some(admin) = self.admin.clone() else {
+            return Ok(());
+        };
+        let listener = bind_listener(admin.addr)
+            .map_err(|e| anyhow::anyhow!("Failed to bind admin listener on {}: {e}", admin.addr))?;
+        tracing::info!(address = %admin.addr, "Admin listener started");
+        let admin_cancel = cancel_token.child_token();
+        tokio::spawn(super::server::serve(
+            listener,
+            tls,
+            admin.router,
+            write_idle_timeout(),
+            async move {
+                admin_cancel.cancelled_owned().await;
+                Duration::ZERO
+            },
+        ));
+        Ok(())
+    }
+
+    async fn spawn_rl_listener_if_configured(
+        &self,
+        cancel_token: &CancellationToken,
+    ) -> Result<()> {
+        let Some(rl_router) = self.rl_router.clone() else {
+            return Ok(());
+        };
+        let rl_addr = listen_socket_addr(&self.host, self.rl_port)?;
+        // Bind eagerly and fail fast: when RL discovery is enabled, a bind failure
+        // should abort service startup rather than silently leave RL discovery
+        // unavailable while the main HTTP service keeps running.
+        let listener = tokio::net::TcpListener::bind(rl_addr).await.map_err(|e| {
+            tracing::error!(
+                address = %rl_addr,
+                error = %e,
+                "Failed to bind RL worker discovery listener"
+            );
+            anyhow::anyhow!("Failed to bind RL worker discovery listener on {rl_addr}: {e}")
+        })?;
+        tracing::info!(
+            address = %rl_addr,
+            "RL worker discovery listener started"
+        );
+        let rl_cancel = cancel_token.child_token();
+        tokio::spawn(async move {
+            if let Err(e) = axum::serve(listener, rl_router)
+                .with_graceful_shutdown(async move {
+                    rl_cancel.cancelled_owned().await;
+                })
+                .await
+            {
+                tracing::error!("RL worker discovery listener error: {e}");
+            }
+        });
+        Ok(())
+    }
+
+    /// Documentation of exposed HTTP endpoints
+    pub fn route_docs(&self) -> &[RouteDoc] {
+        &self.route_docs
+    }
+
+    /// Updates runtime availability for model-backed endpoints.
+    ///
+    /// Batch API availability is configured when the service is built and cannot be changed here.
+    pub fn enable_model_endpoint(&self, endpoint_type: EndpointType, enable: bool) -> Result<()> {
+        if matches!(endpoint_type, EndpointType::Batch | EndpointType::SystemOne) {
+            anyhow::bail!(
+                "{} endpoint availability is fixed when the HTTP service is built",
+                endpoint_type.as_str()
+            );
+        }
+
+        self.state.flags.set(&endpoint_type, enable);
+        tracing::info!(
+            "{} endpoints {}",
+            endpoint_type.as_str(),
+            if enable { "enabled" } else { "disabled" }
+        );
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn model_endpoint_enabled(&self, endpoint_type: EndpointType) -> bool {
+        self.state.flags.get(&endpoint_type)
+    }
+}
+
+fn get_graceful_shutdown_timeout() -> usize {
+    std::env::var(env_llm::DYN_HTTP_GRACEFUL_SHUTDOWN_TIMEOUT_SECS)
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(5)
+}
+
+fn write_idle_timeout() -> Duration {
+    std::env::var(env_llm::DYN_HTTP_WRITE_IDLE_TIMEOUT_SECS)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .map(Duration::from_secs)
+        .filter(|duration| tokio::time::Instant::now().checked_add(*duration).is_some())
+        .unwrap_or(Duration::from_secs(120))
+}
+
+const DEFAULT_LISTEN_BACKLOG: u32 = 4096;
+
+// `listen(2)` takes an `int`; anything above `i32::MAX` would go negative.
+fn parse_listen_backlog(value: Result<String, std::env::VarError>) -> u32 {
+    value
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .filter(|n| (1..=i32::MAX as u32).contains(n))
+        .unwrap_or(DEFAULT_LISTEN_BACKLOG)
+}
+
+fn listen_backlog() -> u32 {
+    parse_listen_backlog(std::env::var(env_llm::DYN_HTTP_LISTEN_BACKLOG))
+}
+
+/// Build the listen address from an IP literal host. IPv6 brackets are optional,
+/// so `::` and `[::]` are equivalent.
+fn listen_socket_addr(host: &str, port: u16) -> Result<SocketAddr> {
+    let literal = host.trim();
+    let literal = literal
+        .strip_prefix('[')
+        .and_then(|inner| inner.strip_suffix(']'))
+        .unwrap_or(literal);
+    let ip: IpAddr = literal
+        .parse()
+        .map_err(|e| anyhow::anyhow!("Invalid address '{host}:{port}': {e}"))?;
+    Ok(SocketAddr::new(ip, port))
+}
+
+/// `tokio::net::TcpListener::bind` listens with a backlog of 128. A few thousand
+/// clients connecting within seconds overflow that, and overflowed connections
+/// are delayed or, depending on host TCP settings, fail.
+fn bind_listener(addr: SocketAddr) -> std::io::Result<tokio::net::TcpListener> {
+    let socket = if addr.is_ipv4() {
+        tokio::net::TcpSocket::new_v4()?
+    } else {
+        tokio::net::TcpSocket::new_v6()?
+    };
+    socket.set_reuseaddr(true)?;
+    socket.bind(addr)?;
+    socket.listen(listen_backlog())
+}
+
+/// Environment variable to set the metrics endpoint path (default: `/metrics`)
+static HTTP_SVC_METRICS_PATH_ENV: &str = "DYN_HTTP_SVC_METRICS_PATH";
+/// Environment variable to set the models endpoint path (default: `/v1/models`)
+static HTTP_SVC_MODELS_PATH_ENV: &str = "DYN_HTTP_SVC_MODELS_PATH";
+/// Environment variable to set the health endpoint path (default: `/health`)
+static HTTP_SVC_HEALTH_PATH_ENV: &str = "DYN_HTTP_SVC_HEALTH_PATH";
+/// Environment variable to set the live endpoint path (default: `/live`)
+static HTTP_SVC_LIVE_PATH_ENV: &str = "DYN_HTTP_SVC_LIVE_PATH";
+/// Environment variable to set the chat completions endpoint path (default: `/v1/chat/completions`)
+static HTTP_SVC_CHAT_PATH_ENV: &str = "DYN_HTTP_SVC_CHAT_PATH";
+/// Environment variable to set the completions endpoint path (default: `/v1/completions`)
+static HTTP_SVC_CMP_PATH_ENV: &str = "DYN_HTTP_SVC_CMP_PATH";
+/// Environment variable to set the embeddings endpoint path (default: `/v1/embeddings`)
+static HTTP_SVC_EMB_PATH_ENV: &str = "DYN_HTTP_SVC_EMB_PATH";
+/// Environment variable to set the classify endpoint path (default: `/v1/classify`)
+static HTTP_SVC_CLASSIFY_PATH_ENV: &str = "DYN_HTTP_SVC_CLASSIFY_PATH";
+/// Environment variable to set the rerank endpoint path (default: `/v1/rerank`)
+static HTTP_SVC_RERANK_PATH_ENV: &str = "DYN_HTTP_SVC_RERANK_PATH";
+/// Environment variable to set the pooling endpoint path (default: `/v1/pooling`)
+static HTTP_SVC_POOLING_PATH_ENV: &str = "DYN_HTTP_SVC_POOLING_PATH";
+/// Environment variable to set the responses endpoint path (default: `/v1/responses`)
+static HTTP_SVC_RESPONSES_PATH_ENV: &str = "DYN_HTTP_SVC_RESPONSES_PATH";
+/// Environment variable to set the batch files endpoint path (default: `/v1/files`)
+static HTTP_SVC_FILES_PATH_ENV: &str = "DYN_HTTP_SVC_FILES_PATH";
+/// Environment variable to set the batches endpoint path (default: `/v1/batches`)
+static HTTP_SVC_BATCHES_PATH_ENV: &str = "DYN_HTTP_SVC_BATCHES_PATH";
+/// Environment variable to set the anthropic messages endpoint path (default: `/v1/messages`)
+static HTTP_SVC_ANTHROPIC_PATH_ENV: &str = "DYN_HTTP_SVC_ANTHROPIC_PATH";
+/// Environment variable to enable the experimental vLLM-compatible
+/// `/inference/v1/generate` endpoint. Truthy value opts in; disabled by default.
+pub(super) static VLLM_ENABLE_INFERENCE_V1_GENERATE_ENV: &str =
+    "DYN_VLLM_ENABLE_INFERENCE_V1_GENERATE";
+
+/// Environment variable to set the vLLM Generate endpoint path
+/// (default: `/inference/v1/generate`).
+pub(super) static HTTP_SVC_VLLM_GENERATE_PATH_ENV: &str = "DYN_HTTP_SVC_VLLM_GENERATE_PATH";
+/// Environment variable to enable the experimental SGLang-compatible
+/// `/generate` endpoint. Truthy value opts in; disabled by default.
+pub(super) static SGLANG_ENABLE_GENERATE_ENV: &str = "DYN_SGLANG_ENABLE_GENERATE";
+/// Environment variable to set the SGLang Generate endpoint path
+/// (default: `/generate`).
+pub(super) static HTTP_SVC_SGLANG_GENERATE_PATH_ENV: &str = "DYN_HTTP_SVC_SGLANG_GENERATE_PATH";
+/// Environment variable to set the System One endpoint path (default: `/v1/systemone`).
+pub(super) static HTTP_SVC_SYSTEMONE_PATH_ENV: &str = "DYN_HTTP_SVC_SYSTEMONE_PATH";
+/// Resolve legacy backend switches once; readiness and routing use the same formats.
+fn configured_generate_routes(
+    enable_engine_apis: bool,
+) -> Result<Vec<(String, crate::generate_format::SharedFormat)>> {
+    use crate::generate_format::{named, selected};
+    resolve_generate_routes(
+        [
+            (
+                (enable_engine_apis || env_is_truthy(VLLM_ENABLE_INFERENCE_V1_GENERATE_ENV))
+                    .then(|| named("vllm")),
+                HTTP_SVC_VLLM_GENERATE_PATH_ENV,
+                "/inference/v1/generate",
+            ),
+            (
+                (enable_engine_apis || env_is_truthy(SGLANG_ENABLE_GENERATE_ENV)).then(selected),
+                HTTP_SVC_SGLANG_GENERATE_PATH_ENV,
+                "/generate",
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(format, path_env, default_path)| {
+            format.map(|format| {
+                (
+                    format,
+                    var(path_env).unwrap_or_else(|_| default_path.to_string()),
+                )
+            })
+        }),
+    )
+}
+
+fn resolve_generate_routes(
+    entries: impl IntoIterator<Item = (Result<crate::generate_format::SharedFormat>, String)>,
+) -> Result<Vec<(String, crate::generate_format::SharedFormat)>> {
+    let mut routes = Vec::new();
+    for (format, path) in entries {
+        validate_generate_route_path(&path)?;
+        anyhow::ensure!(
+            !routes.iter().any(|(existing, _)| existing == &path),
+            "duplicate Generate route path: {path}"
+        );
+        routes.push((path, format?));
+    }
+    Ok(routes)
+}
+
+fn validate_generate_route_path(path: &str) -> Result<()> {
+    if !path.starts_with("/") {
+        anyhow::bail!("Generate route path must start with '/': {path:?}");
+    }
+    if path
+        .split('/')
+        .any(|segment| segment.starts_with([':', '*']))
+    {
+        anyhow::bail!("Generate route path segment must not start with ':' or '*': {path:?}");
+    }
+    Ok(())
+}
+
+/// Append route metadata, rejecting duplicate method/path pairs regardless of schema kind.
+/// Earlier entries remain appended if a later duplicate returns an error.
+fn append_route_docs(
+    all_docs: &mut Vec<RouteDoc>,
+    seen_routes: &mut HashSet<(axum::http::Method, String)>,
+    route_docs: Vec<RouteDoc>,
+) -> Result<()> {
+    for route_doc in route_docs {
+        if !seen_routes.insert((route_doc.method().clone(), route_doc.path().to_owned())) {
+            anyhow::bail!("duplicate HTTP route registered: {route_doc}");
+        }
+        all_docs.push(route_doc);
+    }
+    Ok(())
+}
+
+impl HttpServiceConfigBuilder {
+    pub fn add_frontend_route_extension<F>(mut self, extension: F) -> Self
+    where
+        F: Fn(FrontendExtensionContext) -> anyhow::Result<FrontendRouteSet> + Send + Sync + 'static,
+    {
+        self.frontend_route_extensions
+            .get_or_insert_with(Vec::new)
+            .push(Arc::new(extension));
+        self
+    }
+
+    pub fn add_frontend_route_extension_arc(mut self, extension: FrontendRouteExtension) -> Self {
+        self.frontend_route_extensions
+            .get_or_insert_with(Vec::new)
+            .push(extension);
+        self
+    }
+
+    pub fn build(self) -> Result<HttpService, anyhow::Error> {
+        let config: HttpServiceConfig = self.build_internal()?;
+        super::image_edits::validate_config()?;
+        LazyLock::force(&DISABLE_OPENAI_STRICT_SCHEMA_VALIDATION);
+        let metrics_config = config.metrics_config.clone();
+        let model_ready_metrics_prefix = metrics_config.prefix();
+        let frontend_api_config = config.frontend_api_config.clone();
+        let anthropic_endpoints_enabled = frontend_api_config.anthropic().enabled();
+        let systemone_enabled = frontend_api_config.systemone_enabled();
+        let generate_routes = configured_generate_routes(config.enable_engine_apis)?;
+        let generate_engine_capabilities = generate_routes
+            .iter()
+            .map(|(_, format)| format.capability())
+            .collect::<Vec<_>>();
+        let model_manager = Arc::new(ModelManager::new());
+        let cancel_token = config.cancel_token.unwrap_or_default().child_token();
+        // Use the provided discovery client, or fall back to a no-op memory-backed one
+        // (for in-process modes that don't need discovery)
+        let discovery_client = config.discovery.unwrap_or_else(|| {
+            use dynamo_runtime::discovery::KVStoreDiscovery;
+            Arc::new(KVStoreDiscovery::new(
+                dynamo_runtime::storage::kv::Manager::memory(),
+                cancel_token.child_token(),
+            )) as Arc<dyn Discovery>
+        });
+        // nvext is on by default; an env-truthy DISABLE var turns it off. The
+        // builder flag can also force it off (e.g. tests), and wins.
+        let nvext_enabled =
+            config.enable_nvext && !env_is_truthy(env_llm::DYN_DISABLE_FRONTEND_NVEXT);
+        let state = Arc::new(State::new(
+            model_manager,
+            discovery_client,
+            cancel_token,
+            StateConfig {
+                metrics_config,
+                frontend_api_config,
+                responses_api_enabled: config.enable_responses_endpoints,
+                generate_api_enabled: !generate_routes.is_empty(),
+                nvext_enabled,
+                sse_keep_alive: config.sse_keep_alive,
+                streaming_backend_error_check: config.streaming_backend_error_check,
+                migration_limit: config.migration_limit,
+            },
+        ));
+        state
+            .flags
+            .set(&EndpointType::Chat, config.enable_chat_endpoints);
+        state
+            .flags
+            .set(&EndpointType::Completion, config.enable_cmpl_endpoints);
+        state
+            .flags
+            .set(&EndpointType::Embedding, config.enable_embeddings_endpoints);
+        state
+            .flags
+            .set(&EndpointType::Responses, config.enable_responses_endpoints);
+        state.flags.set(
+            &EndpointType::Batch,
+            config.enable_batch_endpoints || config.batch_gateway_url.is_some(),
+        );
+        state.flags.set(
+            &EndpointType::AnthropicMessages,
+            anthropic_endpoints_enabled,
+        );
+        state
+            .flags
+            .set(&EndpointType::Generate, !generate_routes.is_empty());
+        state.flags.set(&EndpointType::SystemOne, systemone_enabled);
+
+        // enable prometheus metrics
+        let registry = metrics::Registry::new();
+        register_frontend_metrics_start_time_metric(&registry)?;
+        state
+            .metrics_clone()
+            .register_with_model_manager(&registry, Some(state.manager_clone()))?;
+
+        // Readiness is evaluated from the live routing catalog at scrape time.
+        register_model_ready_metric(&registry, state.manager_clone(), model_ready_metrics_prefix)?;
+
+        register_worker_metrics(&registry, state.manager_clone())?;
+
+        // Register router queue metrics (pending requests per worker_type)
+        // These are updated by KvScheduler on enqueue/update/free
+        if let Err(e) = register_router_queue_metrics(&registry) {
+            tracing::warn!("Failed to register router queue metrics: {}", e);
+        }
+
+        if let Some(ref discovery) = config.drt_discovery {
+            let instance_id = discovery.instance_id();
+            if let Err(e) = RoutingOverheadMetrics::register(&registry, instance_id) {
+                tracing::warn!("Failed to register routing overhead metrics: {}", e);
+            }
+        }
+
+        if let Err(e) = ensure_request_plane_metrics_registered_prometheus(&registry) {
+            tracing::warn!("Failed to register request-plane metrics: {}", e);
+        }
+        if let Err(e) = ensure_frontend_perf_metrics_registered_prometheus(&registry) {
+            tracing::warn!("Failed to register frontend perf metrics: {}", e);
+        }
+        if let Err(e) = ensure_tokio_perf_metrics_registered_prometheus(&registry) {
+            tracing::warn!("Failed to register tokio perf metrics: {}", e);
+        }
+        if let Err(e) = ensure_transport_metrics_registered_prometheus(&registry) {
+            tracing::warn!("Failed to register transport metrics: {}", e);
+        }
+        if let Err(e) = register_lora_allocation_metrics(&registry) {
+            tracing::warn!("Failed to register LoRA allocation metrics: {}", e);
+        }
+
+        let mut all_docs = Vec::new();
+        let mut seen_route_docs = HashSet::new();
+
+        // Shared on_response callback for both system and inference routes
+        let on_response = |response: &Response<Body>, latency: Duration, _span: &tracing::Span| {
+            let status = response.status();
+            let latency_ms = latency.as_millis();
+            if status.is_server_error() || status.is_client_error() {
+                tracing::error!(status = %status.as_u16(), latency_ms = %latency_ms, "http response sent");
+            } else {
+                tracing::info!(status = %status.as_u16(), latency_ms = %latency_ms, "http response sent");
+            }
+        };
+
+        // System routes (health, metrics, models) — debug-level spans
+        let mut system_routes = vec![
+            metrics::router(
+                registry,
+                var(HTTP_SVC_METRICS_PATH_ENV).ok(),
+                config.drt_metrics,
+            ),
+            if anthropic_endpoints_enabled {
+                super::anthropic::anthropic_models_router(
+                    state.clone(),
+                    var(HTTP_SVC_MODELS_PATH_ENV).ok(),
+                )
+            } else {
+                super::openai::list_models_router(state.clone(), var(HTTP_SVC_MODELS_PATH_ENV).ok())
+            },
+            super::health::health_check_router(state.clone(), var(HTTP_SVC_HEALTH_PATH_ENV).ok()),
+            super::health::live_check_router(state.clone(), var(HTTP_SVC_LIVE_PATH_ENV).ok()),
+        ];
+        for extension in &config.frontend_route_extensions {
+            let route_set = extension(FrontendExtensionContext::new(state.clone()))?;
+            system_routes.push(route_set.into_parts());
+        }
+        if let Some(gateway) = config.batch_gateway_url.as_deref() {
+            system_routes.push(super::batch_proxy::router(
+                gateway,
+                var(HTTP_SVC_FILES_PATH_ENV).ok(),
+                var(HTTP_SVC_BATCHES_PATH_ENV).ok(),
+                super::openai::get_body_limit(),
+                super::batch_proxy::upload_body_limit(),
+                state.cancel_token().clone(),
+            )?);
+        }
+        let mut system_router = axum::Router::new();
+        for (route_docs, route) in system_routes {
+            append_route_docs(&mut all_docs, &mut seen_route_docs, route_docs)?;
+            system_router = system_router.merge(route);
+        }
+        // Inference routes (completions, chat, embeddings, etc.) — info-level spans
+        let endpoint_routes = HttpServiceConfigBuilder::get_endpoints_router(
+            state.clone(),
+            &config.request_template,
+            anthropic_endpoints_enabled,
+            generate_routes,
+            systemone_enabled,
+            config.enable_batch_endpoints && config.batch_gateway_url.is_none(),
+        )?;
+        // Route docs carry the resolved paths, including custom Anthropic bases.
+        let mounted_protocols = endpoint_routes
+            .iter()
+            .flat_map(|(endpoint, docs, _)| docs.iter().map(move |doc| (*endpoint, doc)))
+            .filter_map(|(endpoint, doc)| {
+                let protocol = match endpoint {
+                    EndpointType::SystemOne if doc.path() == super::systemone::DECISIONS_PATH => {
+                        MountedProtocol::Decision(dynamo_decisions::Dialect::OpenAi)
+                    }
+                    EndpointType::SystemOne => {
+                        MountedProtocol::Decision(dynamo_decisions::Dialect::Jev)
+                    }
+                    EndpointType::AnthropicMessages => MountedProtocol::Anthropic,
+                    _ => return None,
+                };
+                Some((doc.path().to_owned(), protocol))
+            })
+            .collect();
+        let mut inference_router = axum::Router::new();
+        for (_, route_docs, route) in endpoint_routes {
+            append_route_docs(&mut all_docs, &mut seen_route_docs, route_docs)?;
+            inference_router = inference_router.merge(route);
+        }
+        inference_router = inference_router.layer(
+            TraceLayer::new_for_http()
+                .make_span_with(make_inference_request_span)
+                .on_response(on_response),
+        );
+        inference_router = inference_router.layer(axum::middleware::from_fn_with_state(
+            Arc::new(InferenceReadinessState {
+                state: state.clone(),
+                mounted_protocols,
+            }),
+            track_inflight_inference,
+        ));
+
+        // OpenAPI documentation routes (system)
+        let (openapi_docs, openapi_route) = super::openapi_docs::openapi_router(
+            all_docs.clone(),
+            super::openapi_docs::OpenApiOptions {
+                reasoning_field: state.reasoning_field(),
+                streaming_tool_dispatch: state.streaming_tool_dispatch_enabled(),
+                streaming_reasoning_dispatch: state.streaming_reasoning_dispatch_enabled(),
+            },
+        );
+        append_route_docs(&mut all_docs, &mut seen_route_docs, openapi_docs)?;
+        system_router = system_router.merge(openapi_route);
+
+        // Admin routes are served on their own listener, so they are documented after the
+        // inference port's `/openapi.json` is built: `route_docs()` lists them, that spec does not.
+        // TODO: Add authentication to the admin listener.
+        let admin_api_enabled =
+            config.enable_admin_api || env_is_truthy(env_llm::DYN_ENABLE_FRONTEND_ADMIN_API);
+        let admin = if admin_api_enabled {
+            let mut admin_router = axum::Router::new();
+            for (route_docs, route) in [
+                super::router_policy::router_policy_router(state.manager_clone()),
+                super::busy_threshold::busy_threshold_router(state.clone(), None),
+            ] {
+                append_route_docs(&mut all_docs, &mut seen_route_docs, route_docs)?;
+                admin_router = admin_router.merge(route);
+            }
+            Some(AdminListener {
+                router: admin_router.layer(
+                    TraceLayer::new_for_http()
+                        .make_span_with(make_system_request_span)
+                        .on_response(on_response),
+                ),
+                addr: listen_socket_addr(&config.admin_host, config.admin_port)?,
+            })
+        } else {
+            None
+        };
+
+        system_router = system_router.layer(
+            TraceLayer::new_for_http()
+                .make_span_with(make_system_request_span)
+                .on_response(on_response),
+        );
+
+        let router = system_router.merge(inference_router);
+
+        // Return protocol-compatible JSON errors for unmatched routes. Register this router
+        // outside `track_inflight_inference` so unmatched requests do not acquire an
+        // inference permit or return `503` while the service is draining.
+        let unmatched_router = axum::Router::new()
+            .fallback(unmatched_route_fallback)
+            .with_state(UnmatchedRouteState {
+                anthropic_path: anthropic_endpoints_enabled.then(|| {
+                    var(HTTP_SVC_ANTHROPIC_PATH_ENV)
+                        .unwrap_or_else(|_| super::anthropic::DEFAULT_MESSAGES_PATH.to_string())
+                        .into()
+                }),
+            })
+            .layer(
+                // Use the inference span maker so 404s retain method, URI, and request ID
+                // at the default log level.
+                TraceLayer::new_for_http()
+                    .make_span_with(make_inference_request_span)
+                    .on_response(on_response),
+            );
+        let router = router.fallback_service(unmatched_router);
+
+        // Echo x-request-id from request to response headers for client correlation
+        let router = router.layer(axum::middleware::from_fn(echo_request_id_header));
+
+        let enable_rl_router = config.enable_rl || env_is_truthy("DYN_ENABLE_RL");
+        let rl_router = if enable_rl_router {
+            let Some(drt) = config.runtime.as_ref() else {
+                return Err(anyhow::anyhow!(
+                    "RL worker discovery was requested (DYN_ENABLE_RL=true \
+                     or enable_rl) but HttpServiceConfig.runtime is not set."
+                ));
+            };
+            let router = super::openai::rl_router(Arc::new(drt.clone()))?;
+            tracing::info!(
+                rl_port = config.rl_port,
+                "RL worker discovery enabled at /v1/rl/workers"
+            );
+            Some(
+                router.layer(
+                    TraceLayer::new_for_http()
+                        .make_span_with(make_system_request_span)
+                        .on_response(on_response),
+                ),
+            )
+        } else {
+            None
+        };
+
+        Ok(HttpService {
+            state,
+            router,
+            port: config.port,
+            host: config.host,
+            enable_tls: config.enable_tls,
+            tls_cert_path: config.tls_cert_path,
+            tls_key_path: config.tls_key_path,
+            tls_client_ca_cert_path: config.tls_client_ca_cert_path,
+            route_docs: all_docs,
+            generate_engine_capabilities,
+            rl_router,
+            rl_port: config.rl_port,
+            admin,
+            frontend_load_target: config.runtime.map(|runtime| FrontendLoadTarget {
+                runtime,
+                namespace: crate::frontend_load::frontend_load_namespace(config.namespace),
+            }),
+        })
+    }
+
+    pub fn with_request_template(mut self, request_template: Option<RequestTemplate>) -> Self {
+        self.request_template = Some(request_template);
+        self
+    }
+
+    pub fn metrics_prefix(mut self, prefix: Option<String>) -> Self {
+        self.metrics_config = Some(MetricsConfig::new(prefix));
+        self
+    }
+
+    pub fn enable_anthropic_endpoints(mut self, enabled: bool) -> Self {
+        self.frontend_api_config
+            .get_or_insert_with(FrontendApiConfig::default)
+            .anthropic_mut()
+            .set_enabled(enabled);
+        self
+    }
+
+    pub fn strip_anthropic_preamble(mut self, enabled: bool) -> Self {
+        self.frontend_api_config
+            .get_or_insert_with(FrontendApiConfig::default)
+            .anthropic_mut()
+            .set_strip_preamble(enabled);
+        self
+    }
+
+    pub fn enable_streaming_tool_dispatch(mut self, enabled: bool) -> Self {
+        self.frontend_api_config
+            .get_or_insert_with(FrontendApiConfig::default)
+            .streaming_dispatch_mut()
+            .set_tool_dispatch(enabled);
+        self
+    }
+
+    pub fn enable_streaming_reasoning_dispatch(mut self, enabled: bool) -> Self {
+        self.frontend_api_config
+            .get_or_insert_with(FrontendApiConfig::default)
+            .streaming_dispatch_mut()
+            .set_reasoning_dispatch(enabled);
+        self
+    }
+
+    pub fn reasoning_field(mut self, reasoning_field: ReasoningField) -> Self {
+        self.frontend_api_config
+            .get_or_insert_with(FrontendApiConfig::default)
+            .set_reasoning_field(reasoning_field);
+        self
+    }
+
+    pub fn media_rejection(mut self, media_rejection: MediaRejectionConfig) -> Self {
+        self.frontend_api_config
+            .get_or_insert_with(FrontendApiConfig::default)
+            .set_media_rejection(media_rejection);
+        self
+    }
+
+    fn get_endpoints_router(
+        state: Arc<State>,
+        request_template: &Option<RequestTemplate>,
+        enable_anthropic_endpoints: bool,
+        generate_routes: Vec<(String, crate::generate_format::SharedFormat)>,
+        systemone_enabled: bool,
+        enable_batch_endpoints: bool,
+    ) -> Result<Vec<(EndpointType, Vec<RouteDoc>, axum::Router)>> {
+        let mut routes = Vec::new();
+        // Add chat completions route with conditional middleware
+        let (chat_docs, chat_route) = super::openai::chat_completions_router(
+            state.clone(),
+            request_template.clone(),
+            var(HTTP_SVC_CHAT_PATH_ENV).ok(),
+        );
+        let (cmpl_docs, cmpl_route) =
+            super::openai::completions_router(state.clone(), var(HTTP_SVC_CMP_PATH_ENV).ok());
+        let (embed_docs, embed_route) =
+            super::openai::embeddings_router(state.clone(), var(HTTP_SVC_EMB_PATH_ENV).ok());
+        let (classify_docs, classify_route) =
+            super::openai::classify_router(state.clone(), var(HTTP_SVC_CLASSIFY_PATH_ENV).ok());
+        let (rerank_docs, rerank_route) =
+            super::openai::rerank_router(state.clone(), var(HTTP_SVC_RERANK_PATH_ENV).ok());
+        let (pooling_docs, pooling_route) =
+            super::openai::pooling_router(state.clone(), var(HTTP_SVC_POOLING_PATH_ENV).ok());
+        let (images_docs, images_route) = super::openai::images_router(state.clone(), None);
+        let (videos_docs, videos_route) = super::openai::videos_router(state.clone(), None);
+        let (audios_docs, audios_route) = super::openai::audios_router(state.clone(), None);
+        let (transcriptions_docs, transcriptions_route) =
+            super::transcriptions::transcriptions_router(state.clone(), None);
+        let (realtime_docs, realtime_route) = super::realtime::realtime_router(state.clone(), None);
+        let (responses_docs, responses_route) = super::openai::responses_router(
+            state.clone(),
+            request_template.clone(),
+            var(HTTP_SVC_RESPONSES_PATH_ENV).ok(),
+        );
+        let mut endpoint_routes = HashMap::new();
+        endpoint_routes.insert(EndpointType::Chat, (chat_docs, chat_route));
+        endpoint_routes.insert(EndpointType::Completion, (cmpl_docs, cmpl_route));
+        endpoint_routes.insert(EndpointType::Embedding, (embed_docs, embed_route));
+        endpoint_routes.insert(EndpointType::Classify, (classify_docs, classify_route));
+        endpoint_routes.insert(EndpointType::Rerank, (rerank_docs, rerank_route));
+        endpoint_routes.insert(EndpointType::Pooling, (pooling_docs, pooling_route));
+        endpoint_routes.insert(EndpointType::Images, (images_docs, images_route));
+        endpoint_routes.insert(EndpointType::Videos, (videos_docs, videos_route));
+        endpoint_routes.insert(EndpointType::Audios, (audios_docs, audios_route));
+        endpoint_routes.insert(
+            EndpointType::Transcriptions,
+            (transcriptions_docs, transcriptions_route),
+        );
+        endpoint_routes.insert(EndpointType::Realtime, (realtime_docs, realtime_route));
+        endpoint_routes.insert(EndpointType::Responses, (responses_docs, responses_route));
+
+        if enable_batch_endpoints {
+            let (batch_docs, batch_route) = super::openai::batch_router(
+                state.clone(),
+                var(HTTP_SVC_FILES_PATH_ENV).ok(),
+                var(HTTP_SVC_BATCHES_PATH_ENV).ok(),
+            );
+            endpoint_routes.insert(EndpointType::Batch, (batch_docs, batch_route));
+        }
+
+        if enable_anthropic_endpoints {
+            tracing::warn!("Anthropic Messages API (/v1/messages) is experimental.");
+            let (anthropic_docs, anthropic_route) = super::anthropic::anthropic_messages_router(
+                state.clone(),
+                request_template.clone(),
+                var(HTTP_SVC_ANTHROPIC_PATH_ENV).ok(),
+            );
+            endpoint_routes.insert(
+                EndpointType::AnthropicMessages,
+                (anthropic_docs, anthropic_route),
+            );
+        }
+
+        if systemone_enabled {
+            tracing::warn!("The Decisions and System One APIs are experimental.");
+            let path = var(HTTP_SVC_SYSTEMONE_PATH_ENV).ok();
+            if let Some(path) = path.as_deref() {
+                validate_generate_route_path(path)?;
+                anyhow::ensure!(
+                    path != super::systemone::DECISIONS_PATH,
+                    "System One route must not collide with /v1/decisions"
+                );
+            }
+            let (docs, route) = super::systemone::router(state.clone(), path);
+            endpoint_routes.insert(EndpointType::SystemOne, (docs, route));
+        }
+
+        if !generate_routes.is_empty() {
+            tracing::warn!("The engine-native Generate APIs are experimental.");
+            let mut generate_docs = Vec::new();
+            let mut generate_route = axum::Router::new();
+            for (path, format) in generate_routes {
+                let (docs, route) =
+                    super::format_generate::router(state.clone(), Some(path), format);
+                generate_docs.extend(docs);
+                generate_route = generate_route.merge(route);
+            }
+            endpoint_routes.insert(EndpointType::Generate, (generate_docs, generate_route));
+        }
+
+        for endpoint_type in EndpointType::all() {
+            let state_route = state.clone();
+            if !endpoint_routes.contains_key(&endpoint_type) {
+                tracing::debug!("{} endpoints are disabled", endpoint_type.as_str());
+                continue;
+            }
+            let (docs, route) = endpoint_routes.get(&endpoint_type).cloned().unwrap();
+            let route = route.route_layer(axum::middleware::from_fn(
+                move |req: axum::http::Request<axum::body::Body>, next: axum::middleware::Next| {
+                    let state: Arc<State> = state_route.clone();
+                    async move {
+                        // Check if the endpoint is enabled
+                        let enabled = state.flags.get(&endpoint_type);
+                        if enabled {
+                            Ok(next.run(req).await)
+                        } else {
+                            tracing::debug!("{} endpoints are disabled", endpoint_type.as_str());
+                            Err(axum::http::StatusCode::NOT_FOUND)
+                        }
+                    }
+                },
+            ));
+            routes.push((endpoint_type, docs, route));
+        }
+        Ok(routes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::local_model::runtime_config::{
+        SGLANG_GENERATE_CAPABILITY, VLLM_INFERENCE_V1_GENERATE_CAPABILITY,
+    };
+    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::sync::Arc;
+    use tempfile::NamedTempFile;
+    use tokio_util::sync::CancellationToken;
+
+    #[test]
+    fn bounded_systemone_limit_accepts_operator_increases_and_warns_when_clamped() {
+        let _keep = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+        for (configured, effective, warned) in [
+            ("128", 128, false),
+            ("1024", 1024, false),
+            ("8192", 4096, true),
+        ] {
+            let mut capture = tempfile::tempfile().unwrap();
+            let subscriber = tracing_subscriber::fmt()
+                .without_time()
+                .with_ansi(false)
+                .with_max_level(tracing::Level::WARN)
+                .with_writer(capture.try_clone().unwrap())
+                .finish();
+            tracing::subscriber::with_default(subscriber, || {
+                temp_env::with_var("DYN_TEST_DECISION_LIMIT", Some(configured), || {
+                    assert_eq!(
+                        bounded_systemone_limit("DYN_TEST_DECISION_LIMIT", 256, 4096),
+                        effective
+                    );
+                });
+            });
+            capture.seek(SeekFrom::Start(0)).unwrap();
+            let mut logs = String::new();
+            capture.read_to_string(&mut logs).unwrap();
+            assert_eq!(
+                logs.contains("lowering configured System One limit"),
+                warned
+            );
+            assert_eq!(
+                logs.contains("raising System One resource limit above the default"),
+                configured == "1024"
+            );
+            if warned {
+                assert!(logs.contains("requested=8192"), "{logs}");
+                assert!(logs.contains("effective=4096"), "{logs}");
+            }
+        }
+    }
+
+    #[test]
+    fn bounded_systemone_limits_reject_invalid_values_and_preserve_defaults() {
+        for configured in [
+            None,
+            Some("0"),
+            Some("-1"),
+            Some("abc"),
+            Some("184467440737095516160"),
+        ] {
+            temp_env::with_var("DYN_TEST_DECISION_LIMIT", configured, || {
+                assert_eq!(
+                    bounded_systemone_limit("DYN_TEST_DECISION_LIMIT", 256, 4096),
+                    256
+                );
+            });
+        }
+    }
+
+    #[tokio::test]
+    async fn raised_systemone_limits_reach_state_and_admission() {
+        temp_env::with_vars(
+            [
+                (env_llm::DYN_SYSTEMONE_MAX_INFLIGHT_BRANCHES, Some("512")),
+                (env_llm::DYN_SYSTEMONE_MAX_INPUT_TOKENS, Some("131072")),
+                (env_llm::DYN_SYSTEMONE_REQUEST_TIMEOUT_SECS, Some("600")),
+            ],
+            || {
+                let service = HttpService::builder().build().unwrap();
+                let state = service.state_clone();
+                assert_eq!(state.systemone_max_inflight_branches(), 512);
+                assert_eq!(state.systemone_max_input_tokens(), 131_072);
+                assert_eq!(state.systemone_request_timeout(), Duration::from_secs(600));
+                assert!(
+                    state
+                        .systemone_admission()
+                        .try_acquire_many_owned(512)
+                        .is_ok()
+                );
+            },
+        );
+    }
+
+    struct MtlsTestCertificates {
+        ca: NamedTempFile,
+        server_cert: NamedTempFile,
+        server_key: NamedTempFile,
+        client_identity_pem: Vec<u8>,
+    }
+
+    fn write_pem(contents: &str) -> NamedTempFile {
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(contents.as_bytes()).unwrap();
+        file
+    }
+
+    fn make_mtls_test_certificates() -> MtlsTestCertificates {
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let mut ca_params = rcgen::CertificateParams::new(Vec::new()).unwrap();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+
+        let server_key = rcgen::KeyPair::generate().unwrap();
+        let mut server_params =
+            rcgen::CertificateParams::new(vec!["127.0.0.1".to_string()]).unwrap();
+        server_params
+            .extended_key_usages
+            .push(rcgen::ExtendedKeyUsagePurpose::ServerAuth);
+        let server_cert = server_params
+            .signed_by(&server_key, &ca_cert, &ca_key)
+            .unwrap();
+
+        let client_key = rcgen::KeyPair::generate().unwrap();
+        let mut client_params =
+            rcgen::CertificateParams::new(vec!["dynamo-client".to_string()]).unwrap();
+        client_params
+            .extended_key_usages
+            .push(rcgen::ExtendedKeyUsagePurpose::ClientAuth);
+        let client_cert = client_params
+            .signed_by(&client_key, &ca_cert, &ca_key)
+            .unwrap();
+        let client_identity_pem =
+            format!("{}{}", client_cert.pem(), client_key.serialize_pem()).into_bytes();
+
+        MtlsTestCertificates {
+            ca: write_pem(&ca_cert.pem()),
+            server_cert: write_pem(&server_cert.pem()),
+            server_key: write_pem(&server_key.serialize_pem()),
+            client_identity_pem,
+        }
+    }
+
+    async fn wait_for_service_stage(state: &State, expected: ServiceStage) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            if state.service_stage() == expected {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "service did not enter {expected} before timeout; current stage is {}",
+                state.service_stage()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[rstest::rstest]
+    #[case(false)]
+    #[case(true)]
+    #[tokio::test]
+    async fn test_http_tls_negotiation_and_client_authentication(#[case] mtls: bool) {
+        let certificates = make_mtls_test_certificates();
+        let untrusted_certificates = make_mtls_test_certificates();
+
+        let service = HttpService::builder()
+            .host("127.0.0.1")
+            .port(0)
+            .enable_tls(true)
+            .tls_cert_path(Some(certificates.server_cert.path().to_path_buf()))
+            .tls_key_path(Some(certificates.server_key.path().to_path_buf()))
+            .tls_client_ca_cert_path(mtls.then(|| certificates.ca.path().to_path_buf()))
+            .build()
+            .unwrap();
+        let cancel = CancellationToken::new();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = service.spawn_with_listener(cancel.clone(), listener).await;
+
+        let root = reqwest::Certificate::from_pem(&std::fs::read(certificates.ca.path()).unwrap())
+            .unwrap();
+        let unauthenticated_client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .add_root_certificate(root.clone())
+            .build()
+            .unwrap();
+        let authenticated_client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .add_root_certificate(root.clone())
+            .identity(reqwest::Identity::from_pem(&certificates.client_identity_pem).unwrap())
+            .build()
+            .unwrap();
+        let untrusted_client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .add_root_certificate(root)
+            .identity(
+                reqwest::Identity::from_pem(&untrusted_certificates.client_identity_pem).unwrap(),
+            )
+            .build()
+            .unwrap();
+        let url = format!("https://{addr}/live");
+        let client = if mtls {
+            &authenticated_client
+        } else {
+            &unauthenticated_client
+        };
+        let response = client.get(&url).send().await.unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(response.version(), reqwest::Version::HTTP_2);
+
+        let http1_client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .add_root_certificate(
+                reqwest::Certificate::from_pem(&std::fs::read(certificates.ca.path()).unwrap())
+                    .unwrap(),
+            )
+            .identity(reqwest::Identity::from_pem(&certificates.client_identity_pem).unwrap())
+            .http1_only()
+            .build()
+            .unwrap();
+        let response = http1_client.get(&url).send().await.unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(response.version(), reqwest::Version::HTTP_11);
+
+        if mtls {
+            let error = unauthenticated_client
+                .get(&url)
+                .send()
+                .await
+                .expect_err("client without a certificate must be rejected");
+            assert!(!error.is_timeout(), "request timed out: {error}");
+            let error = untrusted_client
+                .get(&url)
+                .send()
+                .await
+                .expect_err("client with an untrusted certificate must be rejected");
+            assert!(!error.is_timeout(), "request timed out: {error}");
+        }
+
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("mTLS service did not stop")
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_http_mtls_requires_tls() {
+        let service = HttpService::builder()
+            .tls_client_ca_cert_path(Some(PathBuf::from("client-ca.crt")))
+            .build()
+            .unwrap();
+
+        let error = service
+            .run(CancellationToken::new())
+            .await
+            .expect_err("client CA without TLS must be rejected");
+        assert_eq!(
+            error.to_string(),
+            "TLS must be enabled when a client CA certificate is configured"
+        );
+    }
+
+    struct ReadinessOnlyEngine;
+
+    #[async_trait::async_trait]
+    impl<Req, Resp>
+        dynamo_runtime::engine::AsyncEngine<
+            dynamo_runtime::pipeline::SingleIn<Req>,
+            dynamo_runtime::pipeline::ManyOut<Resp>,
+            dynamo_runtime::pipeline::Error,
+        > for ReadinessOnlyEngine
+    where
+        Req: Send + Sync + 'static,
+        Resp: dynamo_runtime::engine::Data,
+    {
+        async fn generate(
+            &self,
+            _request: dynamo_runtime::pipeline::SingleIn<Req>,
+        ) -> Result<dynamo_runtime::pipeline::ManyOut<Resp>, dynamo_runtime::pipeline::Error>
+        {
+            unreachable!("model readiness must not dispatch inference")
+        }
+    }
+
+    #[tokio::test]
+    async fn model_readiness_waits_for_topology_engine_and_routes() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let service = HttpService::builder().port(port).build().unwrap();
+        let state = service.state_clone();
+        let control = service.clone();
+        let handle = tokio::spawn(async move {
+            service
+                .run_with_listener(CancellationToken::new(), listener)
+                .await
+                .unwrap();
+        });
+        let client = reqwest::Client::new();
+        let base = format!("http://127.0.0.1:{port}");
+        let model_name = "test/model";
+        let ready_url = format!("{base}/v1/models/{model_name}/ready");
+        let encoded_ready_url = format!("{base}/v1/models/test%2Fmodel/ready");
+        assert_eq!(
+            client.get(&ready_url).send().await.unwrap().status(),
+            reqwest::StatusCode::NOT_FOUND
+        );
+
+        let mut card = crate::model_card::ModelDeploymentCard::default();
+        card.worker_type = Some(crate::worker_type::WorkerType::Aggregated);
+        card.needs = Vec::new();
+        let mut workers =
+            crate::discovery::WorkerSet::new("test-ns".to_string(), "worker".to_string(), card);
+        let (members, receiver) = tokio::sync::watch::channel::<Vec<u64>>(vec![]);
+        workers.set_instance_watcher(receiver);
+        state
+            .manager()
+            .add_worker_set(model_name, "test-ns", workers);
+
+        let response = client.get(&ready_url).send().await.unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        let body = response.json::<serde_json::Value>().await.unwrap();
+        assert_eq!(body["ready"], false);
+        assert_eq!(body["namespaces"]["test-ns"]["ready"], false);
+        assert!(
+            body["reason"]
+                .as_str()
+                .unwrap()
+                .contains("required worker types")
+        );
+        members.send(vec![1]).unwrap();
+        let response = client.get(&ready_url).send().await.unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        let body = response.json::<serde_json::Value>().await.unwrap();
+        assert_eq!(body["namespaces"]["test-ns"]["ready"], true);
+        assert_eq!(body["ready"], false);
+        assert_eq!(body["reason"], "model has no usable serving engine");
+
+        state
+            .manager()
+            .add_chat_completions_model(
+                model_name,
+                "worker",
+                Arc::new(crate::engines::StreamingEngineAdapter::new(
+                    crate::engines::make_echo_engine(),
+                )),
+            )
+            .unwrap();
+        let response = client.get(&ready_url).send().await.unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response.json::<serde_json::Value>().await.unwrap()["reason"],
+            "model HTTP inference routes are not ready"
+        );
+        // Model readiness must not change process-level health or liveness.
+        for path in ["/health", "/live"] {
+            assert_eq!(
+                client
+                    .get(format!("{base}{path}"))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                reqwest::StatusCode::OK
+            );
+        }
+        control
+            .enable_model_endpoint(EndpointType::Chat, true)
+            .unwrap();
+        let response = client.get(&ready_url).send().await.unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let body = response.json::<serde_json::Value>().await.unwrap();
+        assert_eq!(body["model"], model_name);
+        assert_eq!(body["ready"], true);
+        assert_eq!(body["reason"], serde_json::Value::Null);
+        let response = client.get(&encoded_ready_url).send().await.unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let encoded_body = response.json::<serde_json::Value>().await.unwrap();
+        assert_eq!(encoded_body["model"], model_name);
+        assert_eq!(encoded_body["ready"], true);
+        assert!(
+            body["namespaces"]
+                .as_object()
+                .unwrap()
+                .contains_key("test-ns")
+        );
+        assert_eq!(client.post(format!("{base}/v1/chat/completions")).json(&serde_json::json!({"model": model_name, "messages": [{"role": "user", "content": "test"}]})).send().await.unwrap().status(), reqwest::StatusCode::OK);
+        control
+            .enable_model_endpoint(EndpointType::Chat, false)
+            .unwrap();
+        assert_eq!(
+            client.get(&ready_url).send().await.unwrap().status(),
+            reqwest::StatusCode::SERVICE_UNAVAILABLE
+        );
+        state.manager().remove_model(model_name);
+        assert_eq!(
+            client.get(&ready_url).send().await.unwrap().status(),
+            reqwest::StatusCode::NOT_FOUND
+        );
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn model_readiness_rejects_tensor_only_without_blocking_other_models() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let service = HttpService::builder().port(port).build().unwrap();
+        let state = service.state_clone();
+        let control = service.clone();
+        state
+            .manager()
+            .add_tensor_model("tensor-only", "worker", Arc::new(ReadinessOnlyEngine))
+            .unwrap();
+        state
+            .manager()
+            .add_chat_completions_model(
+                "http-model",
+                "worker",
+                Arc::new(crate::engines::StreamingEngineAdapter::new(
+                    crate::engines::make_echo_engine(),
+                )),
+            )
+            .unwrap();
+        control
+            .enable_model_endpoint(EndpointType::Chat, true)
+            .unwrap();
+        let handle = tokio::spawn(async move {
+            service
+                .run_with_listener(CancellationToken::new(), listener)
+                .await
+                .unwrap();
+        });
+        let client = reqwest::Client::new();
+        let base = format!("http://127.0.0.1:{port}");
+        let response = client
+            .get(format!("{base}/v1/models/tensor-only/ready"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        let body = response.json::<serde_json::Value>().await.unwrap();
+        assert_eq!(body["ready"], false);
+        assert!(
+            body["namespaces"]
+                .as_object()
+                .unwrap()
+                .values()
+                .any(|ns| ns["ready"] == true)
+        );
+        assert_eq!(
+            client
+                .get(format!("{base}/v1/models/http-model/ready"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::OK
+        );
+        assert_eq!(
+            client
+                .get(format!("{base}/health"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::OK
+        );
+        state.start_draining();
+        let response = client
+            .get(format!("{base}/v1/models/http-model/ready"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response.json::<serde_json::Value>().await.unwrap()["reason"],
+            "frontend is draining"
+        );
+        assert_eq!(
+            client
+                .get(format!("{base}/live"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::OK
+        );
+        handle.abort();
+    }
+
+    // These tests own route readiness, not either backend's wire format.
+    fn install_readiness_formats() {
+        crate::generate_format::test_formats::install();
+    }
+
+    #[tokio::test]
+    async fn model_readiness_waits_for_generate_route_without_dispatching_inference() {
+        install_readiness_formats();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let service = HttpService::builder()
+            .port(port)
+            .enable_engine_apis(true)
+            .build()
+            .unwrap();
+        let state = service.state_clone();
+        let control = service.clone();
+        state
+            .manager()
+            .add_generate_model("generate-only", "worker", Arc::new(ReadinessOnlyEngine))
+            .unwrap();
+        control
+            .enable_model_endpoint(EndpointType::Generate, false)
+            .unwrap();
+        let handle = tokio::spawn(async move {
+            service
+                .run_with_listener(CancellationToken::new(), listener)
+                .await
+                .unwrap();
+        });
+        let client = reqwest::Client::new();
+        let url = format!("http://127.0.0.1:{port}/v1/models/generate-only/ready");
+        let response = client.get(&url).send().await.unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response.json::<serde_json::Value>().await.unwrap()["ready"],
+            false
+        );
+        control
+            .enable_model_endpoint(EndpointType::Generate, true)
+            .unwrap();
+        assert_eq!(
+            client.get(&url).send().await.unwrap().status(),
+            reqwest::StatusCode::OK
+        );
+        control
+            .enable_model_endpoint(EndpointType::Generate, false)
+            .unwrap();
+        assert_eq!(
+            client.get(&url).send().await.unwrap().status(),
+            reqwest::StatusCode::SERVICE_UNAVAILABLE
+        );
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn model_readiness_waits_for_transcriptions_route() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let service = HttpService::builder().port(port).build().unwrap();
+        let state = service.state_clone();
+        let control = service.clone();
+        state
+            .manager()
+            .add_transcriptions_model("whisper", "worker", Arc::new(ReadinessOnlyEngine))
+            .unwrap();
+        control
+            .enable_model_endpoint(EndpointType::Transcriptions, false)
+            .unwrap();
+        let handle = tokio::spawn(async move {
+            service
+                .run_with_listener(CancellationToken::new(), listener)
+                .await
+                .unwrap();
+        });
+        let client = reqwest::Client::new();
+        let url = format!("http://127.0.0.1:{port}/v1/models/whisper/ready");
+        assert_eq!(
+            client.get(&url).send().await.unwrap().status(),
+            reqwest::StatusCode::SERVICE_UNAVAILABLE
+        );
+        control
+            .enable_model_endpoint(EndpointType::Transcriptions, true)
+            .unwrap();
+        assert_eq!(
+            client.get(&url).send().await.unwrap().status(),
+            reqwest::StatusCode::OK
+        );
+        handle.abort();
+    }
+
+    async fn spawn_derived_route_readiness_service(
+        responses: bool,
+        anthropic: bool,
+    ) -> (HttpService, u16, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let service = HttpService::builder()
+            .port(port)
+            .enable_chat_endpoints(true)
+            .enable_responses_endpoints(responses)
+            .enable_anthropic_endpoints(anthropic)
+            .build()
+            .unwrap();
+        service
+            .model_manager()
+            .add_chat_completions_model("derived-chat", "worker", Arc::new(ReadinessOnlyEngine))
+            .unwrap();
+        let running = service.clone();
+        let handle = tokio::spawn(async move {
+            running
+                .run_with_listener(CancellationToken::new(), listener)
+                .await
+                .unwrap();
+        });
+        (service, port, handle)
+    }
+
+    #[tokio::test]
+    async fn model_readiness_requires_configured_responses_route() {
+        for configured in [false, true] {
+            let (service, port, handle) =
+                spawn_derived_route_readiness_service(configured, false).await;
+            let path = "/v1/models/derived-chat/ready";
+            assert_eq!(get_status(port, path).await, reqwest::StatusCode::OK);
+            service
+                .enable_model_endpoint(EndpointType::Responses, false)
+                .unwrap();
+            assert_eq!(
+                get_status(port, path).await,
+                if configured {
+                    reqwest::StatusCode::SERVICE_UNAVAILABLE
+                } else {
+                    reqwest::StatusCode::OK
+                }
+            );
+            assert!(service.model_endpoint_enabled(EndpointType::Chat));
+            service
+                .enable_model_endpoint(EndpointType::Responses, true)
+                .unwrap();
+            assert_eq!(get_status(port, path).await, reqwest::StatusCode::OK);
+            handle.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn model_readiness_requires_configured_anthropic_route() {
+        for configured in [false, true] {
+            let (service, port, handle) =
+                spawn_derived_route_readiness_service(true, configured).await;
+            let path = "/v1/models/derived-chat/ready";
+            assert_eq!(get_status(port, path).await, reqwest::StatusCode::OK);
+            service
+                .enable_model_endpoint(EndpointType::AnthropicMessages, false)
+                .unwrap();
+            assert_eq!(
+                get_status(port, path).await,
+                if configured {
+                    reqwest::StatusCode::SERVICE_UNAVAILABLE
+                } else {
+                    reqwest::StatusCode::OK
+                }
+            );
+            assert!(service.model_endpoint_enabled(EndpointType::Chat));
+            service
+                .enable_model_endpoint(EndpointType::AnthropicMessages, true)
+                .unwrap();
+            assert_eq!(get_status(port, path).await, reqwest::StatusCode::OK);
+            handle.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn model_readiness_anthropic_preserves_exact_model_precedence() {
+        let (service, port, handle) = spawn_derived_route_readiness_service(true, true).await;
+        service
+            .model_manager()
+            .add_chat_completions_model(
+                "derived-chat/ready",
+                "worker",
+                Arc::new(ReadinessOnlyEngine),
+            )
+            .unwrap();
+        let client = reqwest::Client::new();
+        let url = format!("http://127.0.0.1:{port}/v1/models/derived-chat/ready");
+        let response = client
+            .get(&url)
+            .header("anthropic-version", "2023-06-01")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let body = response.json::<serde_json::Value>().await.unwrap();
+        assert_eq!(body["id"], "derived-chat/ready");
+        assert_eq!(body["type"], "model");
+        assert!(body.get("ready").is_none());
+        service
+            .model_manager()
+            .remove_chat_completions_model("derived-chat/ready")
+            .unwrap();
+        let response = client.get(&url).send().await.unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            response.json::<serde_json::Value>().await.unwrap()["ready"],
+            true
+        );
+        service.state().start_draining();
+        let response = client.get(&url).send().await.unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        let body = response.json::<serde_json::Value>().await.unwrap();
+        assert_eq!(body["ready"], false);
+        assert_eq!(body["reason"], "frontend is draining");
+        handle.abort();
+    }
+
+    #[test]
+    fn batch_endpoint_enablement_is_fixed_at_build_time() {
+        let disabled = HttpService::builder().build().unwrap();
+        let error = disabled
+            .enable_model_endpoint(EndpointType::Batch, true)
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "batch endpoint availability is fixed when the HTTP service is built"
+        );
+        assert!(!disabled.state.flags.get(&EndpointType::Batch));
+
+        let enabled = HttpService::builder()
+            .enable_batch_endpoints(true)
+            .build()
+            .unwrap();
+        let error = enabled
+            .enable_model_endpoint(EndpointType::Batch, false)
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "batch endpoint availability is fixed when the HTTP service is built"
+        );
+        assert!(enabled.state.flags.get(&EndpointType::Batch));
+    }
+
+    /// Actual HTTP docs must use the service flags and response-key configuration.
+    #[tokio::test]
+    async fn openapi_http_uses_service_configuration() {
+        for enabled in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let service = HttpService::builder()
+                .port(port)
+                .enable_streaming_tool_dispatch(enabled)
+                .enable_streaming_reasoning_dispatch(enabled)
+                .reasoning_field(crate::reasoning_field::ReasoningField::Reasoning)
+                .build()
+                .unwrap();
+            let cancel = CancellationToken::new();
+            let server_cancel = cancel.clone();
+            let server = tokio::spawn(async move {
+                service
+                    .run_with_listener(server_cancel, listener)
+                    .await
+                    .unwrap()
+            });
+            let spec: serde_json::Value = reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .unwrap()
+                .get(format!("http://127.0.0.1:{port}/openapi.json"))
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(spec["paths"]["/v1/chat/completions"]["post"]["responses"]["200"]["content"]["text/event-stream"]["itemSchema"]["anyOf"].as_array().unwrap().len(), if enabled { 3 } else { 1 });
+            let properties = &spec["components"]["schemas"]["dynamo_protocols.chat.ChatCompletionResponseMessage"]
+                ["properties"];
+            assert!(properties.get("reasoning").is_some());
+            assert!(properties.get("reasoning_content").is_none());
+            cancel.cancel();
+            server.await.unwrap();
+        }
+    }
+
+    /// Handler metadata must not allow two registrations of the same method/path.
+    #[test]
+    fn openapi_metadata_does_not_change_duplicate_route_detection() {
+        let mut docs = Vec::new();
+        let mut seen = HashSet::new();
+        let route = RouteDoc::new(axum::http::Method::POST, "/chat");
+        append_route_docs(&mut docs, &mut seen, vec![route.clone()]).unwrap();
+        assert!(
+            append_route_docs(
+                &mut docs,
+                &mut seen,
+                vec![route.with_openapi_kind(super::super::OpenApiRouteKind::ChatCompletions)]
+            )
+            .is_err()
+        );
+        assert_eq!(docs.len(), 1);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_liveness_endpoint_stays_live_while_draining() {
+        temp_env::async_with_vars(
+            [(env_llm::DYN_HTTP_GRACEFUL_SHUTDOWN_TIMEOUT_SECS, Some("1"))],
+            async {
+                let cancel_token = Arc::new(CancellationToken::new());
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .expect("failed to bind ephemeral port");
+                let port = listener.local_addr().unwrap().port();
+                let service = HttpService::builder().port(port).build().unwrap();
+                let state = service.state_clone();
+                let inflight = state.acquire_inflight();
+
+                let service_token = cancel_token.clone();
+                let handle = tokio::spawn(async move {
+                    service
+                        .run_with_listener((*service_token).clone(), listener)
+                        .await
+                        .unwrap();
+                });
+
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                cancel_token.cancel();
+                wait_for_service_stage(&state, ServiceStage::Draining).await;
+
+                let resp = reqwest::Client::new()
+                    .get(format!("http://localhost:{}/live", port))
+                    .send()
+                    .await
+                    .expect("Request failed");
+
+                assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+                drop(inflight);
+                handle.abort();
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_health_endpoint_reflects_draining_before_cancellation() {
+        temp_env::async_with_vars(
+            [(env_llm::DYN_HTTP_GRACEFUL_SHUTDOWN_TIMEOUT_SECS, Some("1"))],
+            async {
+                let cancel_token = Arc::new(CancellationToken::new());
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .expect("failed to bind ephemeral port");
+                let port = listener.local_addr().unwrap().port();
+                let service = HttpService::builder().port(port).build().unwrap();
+                let state = service.state_clone();
+                let inflight = state.acquire_inflight();
+
+                let service_token = cancel_token.clone();
+                let handle = tokio::spawn(async move {
+                    service
+                        .run_with_listener((*service_token).clone(), listener)
+                        .await
+                        .unwrap();
+                });
+
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                cancel_token.cancel();
+                wait_for_service_stage(&state, ServiceStage::Draining).await;
+
+                assert_eq!(state.service_stage(), ServiceStage::Draining);
+
+                let client = reqwest::Client::new();
+                let health = client
+                    .get(format!("http://localhost:{}/health", port))
+                    .send()
+                    .await
+                    .expect("health request failed");
+                assert_eq!(health.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+
+                let live = client
+                    .get(format!("http://localhost:{}/live", port))
+                    .send()
+                    .await
+                    .expect("live request failed");
+                assert_eq!(live.status(), reqwest::StatusCode::OK);
+
+                drop(inflight);
+                handle.abort();
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_health_lists_instances_only_on_request() {
+        let (port, state, handle) = spawn_service(|builder| builder).await;
+        state
+            .discovery()
+            .register(dynamo_runtime::discovery::DiscoverySpec::Endpoint {
+                namespace: "ns".to_string(),
+                component: "backend".to_string(),
+                endpoint: "generate".to_string(),
+                transport: dynamo_runtime::component::TransportType::Nats(
+                    "nats://localhost:4222".to_string(),
+                ),
+                device_type: None,
+                request_plane_codec: None,
+            })
+            .await
+            .unwrap();
+        let client = reqwest::Client::new();
+
+        let health: serde_json::Value = client
+            .get(format!("http://localhost:{port}/health"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            health,
+            serde_json::json!({"status": "healthy", "stage": "ready"})
+        );
+
+        let health: serde_json::Value = client
+            .get(format!("http://localhost:{port}/health?instances=true"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(health["status"], "healthy");
+        assert_eq!(
+            health["endpoints"],
+            serde_json::json!(["dyn://ns.backend.generate"])
+        );
+        assert_eq!(health["instances"].as_array().unwrap().len(), 1);
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_service_observer_waits_for_inflight_requests() {
+        let observer = Arc::new(ServiceObserver::default());
+        let permit = observer.acquire_inflight();
+
+        observer.start_draining();
+        assert_eq!(observer.inflight_count(), 1);
+        assert!(
+            !observer
+                .wait_inflight_zero_or_timeout(Duration::from_millis(1))
+                .await
+        );
+
+        let waiter = {
+            let observer = observer.clone();
+            tokio::spawn(async move {
+                observer
+                    .wait_inflight_zero_or_timeout(Duration::from_secs(1))
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+        drop(permit);
+        assert!(waiter.await.unwrap());
+        assert_eq!(observer.inflight_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn inflight_body_preserves_trailers_and_holds_admission() {
+        use http_body_util::{BodyExt, StreamBody};
+
+        let observer = Arc::new(ServiceObserver::default());
+        let trailers = axum::http::HeaderMap::from_iter([(
+            header::HeaderName::from_static("x-checksum"),
+            header::HeaderValue::from_static("done"),
+        )]);
+        let frames = futures::stream::iter([
+            Ok::<_, std::convert::Infallible>(Frame::data(Bytes::from_static(b"data"))),
+            Ok(Frame::trailers(trailers.clone())),
+        ]);
+        let mut body = InflightResponseBody {
+            body: Body::new(StreamBody::new(frames)),
+            _permit: observer.acquire_inflight(),
+        };
+
+        assert_eq!(body.size_hint().exact(), None);
+        assert!(!body.is_end_stream());
+        assert_eq!(observer.inflight_count(), 1);
+        let frame = body.frame().await.unwrap().unwrap();
+        assert_eq!(frame.into_data().unwrap(), "data");
+        assert_eq!(observer.inflight_count(), 1);
+        let frame = body.frame().await.unwrap().unwrap();
+        assert_eq!(frame.into_trailers().unwrap(), trailers);
+        assert!(body.frame().await.is_none());
+        assert_eq!(observer.inflight_count(), 1);
+        drop(body);
+        assert_eq!(observer.inflight_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn track_inflight_inference_preserves_length() {
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let service = HttpService::builder().build().unwrap();
+        let router = axum::Router::new()
+            .route("/", axum::routing::get(|| async { Body::from("data") }))
+            .layer(axum::middleware::from_fn_with_state(
+                Arc::new(InferenceReadinessState {
+                    state: service.state_clone(),
+                    mounted_protocols: HashMap::new(),
+                }),
+                track_inflight_inference,
+            ));
+
+        let response = router
+            .oneshot(axum::http::Request::new(Body::empty()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body = response.into_body();
+        assert_eq!(body.size_hint().exact(), Some(4));
+        assert_eq!(body.collect().await.unwrap().to_bytes(), "data");
+    }
+
+    #[tokio::test]
+    async fn test_admin_routes_only_on_admin_listener() {
+        // Off by default, and bound to loopback when enabled.
+        assert!(HttpService::builder().build().unwrap().admin.is_none());
+        let enabled = HttpService::builder()
+            .enable_admin_api(true)
+            .build()
+            .unwrap();
+        assert!(enabled.admin.unwrap().addr.ip().is_loopback());
+
+        let admin_port = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let (port, _, handle) =
+            spawn_service(|builder| builder.enable_admin_api(true).admin_port(admin_port)).await;
+
+        let client = reqwest::Client::new();
+        for (method, path) in [
+            (reqwest::Method::GET, "/busy_threshold"),
+            (reqwest::Method::POST, "/busy_threshold"),
+            (reqwest::Method::GET, "/router_policy/busy_threshold"),
+            (reqwest::Method::POST, "/router_policy/busy_threshold"),
+            (reqwest::Method::GET, "/router_policy"),
+            (reqwest::Method::PATCH, "/router_policy"),
+        ] {
+            let response = client
+                .request(method, format!("http://localhost:{port}{path}"))
+                .json(&serde_json::json!({"model": "missing"}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND, "{path}");
+        }
+
+        let admin = client
+            .get(format!("http://127.0.0.1:{admin_port}/busy_threshold"))
+            .send()
+            .await
+            .expect("admin request failed");
+        assert_eq!(admin.status(), reqwest::StatusCode::OK);
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_admin_port_bind_failure_aborts_startup() {
+        let taken = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let taken_port = taken.local_addr().unwrap().port();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let service = HttpService::builder()
+            .enable_admin_api(true)
+            .admin_port(taken_port)
+            .build()
+            .unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            service.run_with_listener(CancellationToken::new(), listener),
+        )
+        .await
+        .expect("startup did not abort");
+        assert!(result.is_err());
+    }
+
+    /// Starts an `HttpService` on an ephemeral local port.
+    ///
+    /// Applies `configure` before starting the service. These tests run before the
+    /// readiness check, so no model registration is required.
+    async fn spawn_service(
+        configure: impl FnOnce(HttpServiceConfigBuilder) -> HttpServiceConfigBuilder,
+    ) -> (u16, Arc<State>, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let service = configure(HttpService::builder().port(port))
+            .build()
+            .unwrap();
+        let state = service.state_clone();
+        let handle = tokio::spawn(async move {
+            service
+                .run_with_listener(CancellationToken::new(), listener)
+                .await
+                .ok();
+        });
+
+        // Allow the server to begin accepting connections.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        (port, state, handle)
+    }
+
+    async fn spawn_default_service() -> (u16, tokio::task::JoinHandle<()>) {
+        let (port, _, handle) = spawn_service(|builder| builder).await;
+        (port, handle)
+    }
+
+    #[tokio::test]
+    async fn test_batch_proxy_uses_frontend_without_inference_admission() {
+        let mut gateway = mockito::Server::new_async().await;
+        let list = gateway
+            .mock("GET", "/v1/batches")
+            .match_header("authorization", "Bearer batch-test")
+            .with_status(200)
+            .with_body(r#"{"object":"list","data":[]}"#)
+            .create_async()
+            .await;
+        let (port, state, handle) =
+            spawn_service(|builder| builder.batch_gateway_url(Some(gateway.url()))).await;
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        // No model is registered: batch control-plane calls must still work.
+        let response = client
+            .get(format!("http://127.0.0.1:{port}/v1/batches"))
+            .header("authorization", "Bearer batch-test")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            response.json::<serde_json::Value>().await.unwrap()["object"],
+            "list"
+        );
+        assert_eq!(state.inflight_count(), 0);
+        list.assert_async().await;
+        handle.abort();
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_batch_upload_limit_preserves_online_json_limit() {
+        temp_env::async_with_vars(
+            [
+                (env_llm::DYN_HTTP_BODY_LIMIT_MB, Some("1")),
+                (env_llm::DYN_BATCH_UPLOAD_BODY_LIMIT_MB, Some("3")),
+            ],
+            async {
+                let mut gateway = mockito::Server::new_async().await;
+                let upload = gateway
+                    .mock("POST", "/v1/files")
+                    .with_status(200)
+                    .with_body(r#"{"id":"file-1"}"#)
+                    .create_async()
+                    .await;
+                let (port, _, task) =
+                    spawn_service(|builder| builder.batch_gateway_url(Some(gateway.url()))).await;
+                let task = tokio_util::task::AbortOnDropHandle::new(task);
+                let client = reqwest::Client::builder()
+                    .no_proxy()
+                    .timeout(Duration::from_secs(5))
+                    .build()
+                    .unwrap();
+                let body = serde_json::to_vec(&serde_json::json!({
+                    "model": "model", "input": "x".repeat(2 * 1024 * 1024),
+                }))
+                .unwrap();
+                let response = client
+                    .post(format!("http://127.0.0.1:{port}/v1/files"))
+                    .body(body.clone())
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), reqwest::StatusCode::OK);
+                let _ = response.bytes().await.unwrap();
+                let response = client
+                    .post(format!("http://127.0.0.1:{port}/v1/responses"))
+                    .header("content-type", "application/json")
+                    .body(body)
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), reqwest::StatusCode::PAYLOAD_TOO_LARGE);
+                assert_eq!(
+                    response.json::<serde_json::Value>().await.unwrap()["code"],
+                    413
+                );
+                upload.assert_async().await;
+                task.abort();
+                let _ = task.await;
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_shutdown_closes_stalled_batch_downloads() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        trait Connection: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+        impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> Connection for T {}
+
+        temp_env::async_with_vars(
+            [
+                (env_llm::DYN_BATCH_MAX_FILE_TRANSFERS, Some("1")),
+                (env_llm::DYN_HTTP_WRITE_IDLE_TIMEOUT_SECS, Some("120")),
+                (env_llm::DYN_HTTP_GRACEFUL_SHUTDOWN_TIMEOUT_SECS, Some("1")),
+            ],
+            tokio::time::timeout(Duration::from_secs(20), async {
+                for is_tls in [false, true] {
+                    let released = CancellationToken::new();
+                    let body_released = released.clone();
+                    let upstream_router = axum::Router::new().route(
+                        "/v1/files/file-1/content",
+                        axum::routing::get(move || {
+                            let guard = body_released.clone().drop_guard();
+                            async move {
+                                let chunk = axum::body::Bytes::from(vec![b'x'; 65536]);
+                                axum::body::Body::from_stream(async_stream::stream! {
+                                    let _guard = guard;
+                                    loop { yield Ok::<_, std::io::Error>(chunk.clone()); }
+                                })
+                            }
+                        }),
+                    );
+                    let upstream_listener =
+                        tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let upstream_addr = upstream_listener.local_addr().unwrap();
+                    let upstream_cancel = CancellationToken::new();
+                    let _upstream_guard = upstream_cancel.clone().drop_guard();
+                    let upstream_task =
+                        tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+                            axum::serve(upstream_listener, upstream_router)
+                                .with_graceful_shutdown(upstream_cancel.cancelled_owned())
+                                .await
+                                .unwrap();
+                        }));
+
+                    let certificates = make_mtls_test_certificates();
+                    let service = HttpService::builder()
+                        .host("127.0.0.1")
+                        .port(0)
+                        .batch_gateway_url(Some(format!("http://{upstream_addr}")))
+                        .enable_tls(is_tls)
+                        .tls_cert_path(
+                            is_tls.then(|| certificates.server_cert.path().to_path_buf()),
+                        )
+                        .tls_key_path(is_tls.then(|| certificates.server_key.path().to_path_buf()))
+                        .build()
+                        .unwrap();
+                    let state = service.state_clone();
+                    let cancel = CancellationToken::new();
+                    let _guard = cancel.clone().drop_guard();
+                    let server_cancel = cancel.clone();
+                    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let addr = listener.local_addr().unwrap();
+                    let mut task =
+                        tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+                            service.run_with_listener(server_cancel, listener).await
+                        }));
+                    let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+                    let mut client: Box<dyn Connection> = if is_tls {
+                        let config = dynamo_runtime::tls_utils::client_tls_config(
+                            Some(certificates.ca.path()),
+                            false,
+                            None,
+                            None,
+                        )
+                        .unwrap();
+                        let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+                        Box::new(
+                            connector
+                                .connect(
+                                    rustls::pki_types::ServerName::try_from("127.0.0.1").unwrap(),
+                                    stream,
+                                )
+                                .await
+                                .unwrap(),
+                        )
+                    } else {
+                        Box::new(stream)
+                    };
+                    client
+                        .write_all(
+                            b"GET /v1/files/file-1/content HTTP/1.1\r\nHost: localhost\r\n\r\n",
+                        )
+                        .await
+                        .unwrap();
+                    client.flush().await.unwrap();
+                    let mut headers = Vec::new();
+                    while !headers.ends_with(b"\r\n\r\n") {
+                        assert!(headers.len() < 8192);
+                        headers.push(client.read_u8().await.unwrap());
+                    }
+                    assert!(headers.starts_with(b"HTTP/1.1 200"));
+                    assert_eq!(state.inflight_count(), 0);
+                    assert!(!released.is_cancelled());
+                    // The 120-second idle deadline cannot make the 1-second drain pass.
+                    cancel.cancel();
+                    tokio::time::timeout(Duration::from_secs(3), &mut task)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(state.service_stage(), ServiceStage::Stopping);
+                    tokio::time::timeout(Duration::from_secs(1), released.cancelled())
+                        .await
+                        .expect("frontend retained upstream response");
+                    drop(client);
+                    upstream_task.abort();
+                    let _ = upstream_task.await;
+                }
+            }),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn shutdown_deadline_interrupts_handlers_and_response_bodies() {
+        temp_env::async_with_vars(
+            [(env_llm::DYN_HTTP_GRACEFUL_SHUTDOWN_TIMEOUT_SECS, Some("1"))],
+            async {
+                for (tls, before_headers) in [(false, false), (true, true)] {
+                        let certificates = make_mtls_test_certificates();
+                        let parent = CancellationToken::new();
+                        let mut service = HttpService::builder()
+                            .host("127.0.0.1").port(0).enable_tls(tls)
+                            .cancel_token(Some(parent.clone()))
+                            .tls_cert_path(tls.then(|| certificates.server_cert.path().to_path_buf()))
+                            .tls_key_path(tls.then(|| certificates.server_key.path().to_path_buf()))
+                            .build().unwrap();
+                        let state = service.state_clone();
+                        let entered = CancellationToken::new();
+                        let released = CancellationToken::new();
+                        let handler_entered = entered.clone();
+                        let handler_released = released.clone();
+                        service.router = axum::Router::new().route("/blocked", axum::routing::get(move || {
+                            let entered = handler_entered.clone();
+                            let guard = handler_released.clone().drop_guard();
+                            async move {
+                                entered.cancel();
+                                if before_headers { std::future::pending::<()>().await; }
+                                Body::from_stream(async_stream::stream! {
+                                    let _guard = guard;
+                                    yield Ok::<_, std::io::Error>(axum::body::Bytes::from_static(b"first"));
+                                    std::future::pending::<()>().await;
+                                })
+                            }
+                        })).layer(axum::middleware::from_fn_with_state(
+                            Arc::new(InferenceReadinessState {
+                                state: state.clone(),
+                                mounted_protocols: HashMap::new(),
+                            }),
+                            track_inflight_inference,
+                        ));
+                        let cancel = CancellationToken::new();
+                        let server_cancel = cancel.clone();
+                        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                        let address = listener.local_addr().unwrap();
+                        let task = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+                            service.run_with_listener(server_cancel, listener).await
+                        }));
+                        let client = reqwest::Client::builder().no_proxy().danger_accept_invalid_certs(true)
+                            .timeout(Duration::from_secs(4)).build().unwrap();
+                        let request = client.get(format!("{}://{address}/blocked", if tls { "https" } else { "http" })).send();
+                        let mut request = Some(tokio::spawn(request));
+                        tokio::time::timeout(Duration::from_secs(2), entered.cancelled()).await.unwrap();
+                        let response = if before_headers { None } else { Some(request.take().unwrap().await.unwrap().unwrap()) };
+                        cancel.cancel();
+                        if let Some(response) = response {
+                            assert!(response.bytes().await.is_err(), "interruption must not look like EOF");
+                        }
+                        tokio::time::timeout(Duration::from_secs(3), task).await.unwrap().unwrap().unwrap();
+                        tokio::time::timeout(Duration::from_secs(1), released.cancelled()).await.unwrap();
+                        if let Some(request) = request
+                            && let Ok(response) = request.await.unwrap()
+                        {
+                            assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+                        }
+                        assert_eq!(state.inflight_count(), 0);
+                        assert!(!parent.is_cancelled(), "local deadline must not cancel the runtime");
+                }
+            },
+        ).await;
+    }
+
+    /// Verifies that an unsupported content type returns the standard JSON error
+    /// envelope instead of Axum's default plain-text rejection.
+    #[tokio::test]
+    async fn test_responses_non_json_content_type_returns_json_error() {
+        let (port, handle) = spawn_default_service().await;
+
+        let resp = reqwest::Client::new()
+            .post(format!("http://localhost:{port}/v1/responses"))
+            .header("content-type", "text/plain")
+            .body(r#"{"model":"model","input":"hi"}"#)
+            .send()
+            .await
+            .expect("request failed");
+
+        assert_eq!(resp.status(), reqwest::StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        let body: serde_json::Value = resp.json().await.expect("body must be JSON");
+        assert_eq!(body["code"], 415);
+        assert_eq!(
+            body["message"],
+            "Expected request with Content-Type application/json"
+        );
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_embeddings_non_json_content_type_returns_json_error() {
+        let (port, handle) = spawn_default_service().await;
+
+        let resp = reqwest::Client::new()
+            .post(format!("http://localhost:{port}/v1/embeddings"))
+            .header("content-type", "text/plain")
+            .body(r#"{"model":"model","input":"hi"}"#)
+            .send()
+            .await
+            .expect("request failed");
+
+        assert_eq!(resp.status(), reqwest::StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert_eq!(
+            resp.headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .map(|v| v.starts_with("application/json")),
+            Some(true),
+            "the 415 must be JSON, not Axum's text/plain rejection"
+        );
+        let body: serde_json::Value = resp.json().await.expect("body must be JSON");
+        assert_eq!(body["code"], 415);
+        assert_eq!(
+            body["message"],
+            "Expected request with Content-Type application/json"
+        );
+
+        handle.abort();
+    }
+
+    /// Verifies that malformed JSON returns the standard JSON error envelope
+    /// instead of Axum's default plain-text rejection.
+    #[tokio::test]
+    async fn test_responses_malformed_json_returns_json_error() {
+        let (port, handle) = spawn_default_service().await;
+
+        let resp = reqwest::Client::new()
+            .post(format!("http://localhost:{port}/v1/responses"))
+            .header("content-type", "application/json")
+            .body(r#"{"model":"model","input":"#)
+            .send()
+            .await
+            .expect("request failed");
+
+        assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+        let body: serde_json::Value = resp.json().await.expect("body must be JSON");
+        assert_eq!(body["code"], 400);
+        assert!(
+            body["message"]
+                .as_str()
+                .expect("message must be a string")
+                .starts_with("Failed to deserialize the JSON body into the target type"),
+            "unexpected message: {}",
+            body["message"]
+        );
+
+        handle.abort();
+    }
+
+    /// Verifies that an unknown response ID returns a JSON `404 Not Found` response.
+    #[tokio::test]
+    async fn test_unknown_response_id_returns_json_404() {
+        let (port, handle) = spawn_default_service().await;
+
+        let resp = reqwest::Client::new()
+            .get(format!("http://localhost:{port}/v1/responses/resp_missing"))
+            .send()
+            .await
+            .expect("request failed");
+
+        assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+        let body: serde_json::Value = resp.json().await.expect("body must be JSON");
+        assert_eq!(body["code"], 404);
+        assert_eq!(
+            body["message"],
+            "Route not found: GET /v1/responses/resp_missing"
+        );
+
+        handle.abort();
+    }
+
+    /// Verifies that an oversized request body returns a JSON `413 Payload Too Large`
+    /// response.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_oversized_body_returns_json_413() {
+        temp_env::async_with_vars([(env_llm::DYN_HTTP_BODY_LIMIT_MB, Some("1"))], async move {
+            let (port, handle) = spawn_default_service().await;
+
+            let oversized = serde_json::json!({
+                "model": "model",
+                "input": "x".repeat(2 * 1024 * 1024),
+            });
+            let resp = reqwest::Client::new()
+                .post(format!("http://localhost:{port}/v1/responses"))
+                .header("content-type", "application/json")
+                .body(serde_json::to_vec(&oversized).unwrap())
+                .send()
+                .await
+                .expect("request failed");
+
+            assert_eq!(resp.status(), reqwest::StatusCode::PAYLOAD_TOO_LARGE);
+            let body: serde_json::Value = resp.json().await.expect("body must be JSON");
+            assert_eq!(body["code"], 413);
+            assert_eq!(
+                body["message"],
+                format!(
+                    "Request body exceeds the limit of 1 MB set by {}",
+                    env_llm::DYN_HTTP_BODY_LIMIT_MB
+                )
+            );
+
+            handle.abort();
+        })
+        .await;
+    }
+
+    /// Verifies that unmatched routes return `404 Not Found` while registered
+    /// inference routes return `503 Service Unavailable` during draining.
+    #[tokio::test]
+    async fn test_unmatched_route_while_draining_returns_json_404() {
+        let (port, state, handle) = spawn_service(|builder| builder).await;
+        state.start_draining();
+
+        let client = reqwest::Client::new();
+        let unmatched = client
+            .get(format!("http://localhost:{port}/v1/not_a_route"))
+            .send()
+            .await
+            .expect("request failed");
+
+        assert_eq!(unmatched.status(), reqwest::StatusCode::NOT_FOUND);
+        let body: serde_json::Value = unmatched.json().await.expect("body must be JSON");
+        assert_eq!(body["code"], 404);
+
+        let registered = client
+            .post(format!("http://localhost:{port}/v1/responses"))
+            .json(&serde_json::json!({"model": "model", "input": "hi"}))
+            .send()
+            .await
+            .expect("request failed");
+
+        assert_eq!(
+            registered.status(),
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            "draining must still reject registered inference routes"
+        );
+
+        handle.abort();
+    }
+
+    /// Verifies that unmatched routes under the Anthropic Messages API path return
+    /// the Anthropic error envelope.
+    #[tokio::test]
+    // Serial because other tests set `DYN_HTTP_SVC_ANTHROPIC_PATH`.
+    #[serial_test::serial]
+    async fn test_unmatched_anthropic_route_returns_anthropic_envelope() {
+        let (port, _state, handle) =
+            spawn_service(|builder| builder.enable_anthropic_endpoints(true)).await;
+
+        let resp = reqwest::Client::new()
+            .get(format!("http://localhost:{port}/v1/messages/missing"))
+            .header("anthropic-version", "2023-06-01")
+            .send()
+            .await
+            .expect("request failed");
+
+        assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+        let body: serde_json::Value = resp.json().await.expect("body must be JSON");
+        assert_eq!(body["type"], "error");
+        assert_eq!(body["error"]["type"], "not_found_error");
+        assert_eq!(
+            body["error"]["message"],
+            "Route not found: GET /v1/messages/missing"
+        );
+
+        let openai_response = reqwest::Client::new()
+            .get(format!("http://localhost:{port}/v1/messages_beta/missing"))
+            .send()
+            .await
+            .expect("request failed");
+
+        assert_eq!(openai_response.status(), reqwest::StatusCode::NOT_FOUND);
+        let openai_body: serde_json::Value =
+            openai_response.json().await.expect("body must be JSON");
+        assert_eq!(openai_body["code"], 404);
+        assert_eq!(
+            openai_body["message"],
+            "Route not found: GET /v1/messages_beta/missing"
+        );
+        assert!(
+            openai_body.get("error").is_none(),
+            "sibling paths must use the OpenAI error envelope"
+        );
+
+        handle.abort();
+    }
+
+    /// Verifies that Anthropic fallback routing matches complete path segments.
+    #[test]
+    fn test_path_within_namespace() {
+        assert!(path_within_namespace("/v1/messages", "/v1/messages"));
+        assert!(path_within_namespace("/v1/messages/", "/v1/messages"));
+        assert!(path_within_namespace(
+            "/v1/messages/missing",
+            "/v1/messages"
+        ));
+        assert!(path_within_namespace(
+            "/v1/messages/missing",
+            "/v1/messages/"
+        ));
+        assert!(!path_within_namespace("/v1/messages_beta", "/v1/messages"));
+        assert!(!path_within_namespace("/v1/messages-v2", "/v1/messages"));
+        assert!(!path_within_namespace(
+            "/v1/chat/completions",
+            "/v1/messages"
+        ));
+    }
+
+    /// Verifies that `GET /v1/responses` returns `405 Method Not Allowed` and an
+    /// `Allow: POST` header.
+    #[tokio::test]
+    async fn test_registered_route_with_unsupported_method_returns_405() {
+        let (port, handle) = spawn_default_service().await;
+
+        let resp = reqwest::Client::new()
+            .get(format!("http://localhost:{port}/v1/responses"))
+            .send()
+            .await
+            .expect("request failed");
+
+        assert_eq!(resp.status(), reqwest::StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(
+            resp.headers()
+                .get(reqwest::header::ALLOW)
+                .and_then(|value| value.to_str().ok()),
+            Some("POST"),
+            "expected Allow header to contain POST"
+        );
+
+        handle.abort();
+    }
+
+    fn make_chat_engine()
+    -> crate::types::openai::chat_completions::OpenAIChatCompletionsStreamingEngine {
+        Arc::new(crate::engines::StreamingEngineAdapter::new(
+            crate::engines::make_echo_engine(),
+        ))
+    }
+
+    // Test extensions read live state via the narrowed context captured in the
+    // handler closure (the Python bridge's shape), not Router::with_state.
+    fn readiness_extension(context: FrontendExtensionContext) -> anyhow::Result<FrontendRouteSet> {
+        Ok(FrontendRouteSet::builder()
+            .get("/test/frontend-route", move || {
+                let context = context.clone();
+                async move {
+                    if context.has_any_ready_model() {
+                        axum::http::StatusCode::OK
+                    } else {
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE
+                    }
+                }
+            })?
+            .build())
+    }
+
+    fn first_test_extension(context: FrontendExtensionContext) -> anyhow::Result<FrontendRouteSet> {
+        test_status_extension(context, "/test/frontend-route/one")
+    }
+
+    fn second_test_extension(
+        context: FrontendExtensionContext,
+    ) -> anyhow::Result<FrontendRouteSet> {
+        test_status_extension(context, "/test/frontend-route/two")
+    }
+
+    fn duplicate_health_extension(
+        context: FrontendExtensionContext,
+    ) -> anyhow::Result<FrontendRouteSet> {
+        test_status_extension(context, "/health")
+    }
+
+    fn duplicate_test_extension(
+        context: FrontendExtensionContext,
+    ) -> anyhow::Result<FrontendRouteSet> {
+        test_status_extension(context, "/test/frontend-route/duplicate")
+    }
+
+    fn draining_extension(context: FrontendExtensionContext) -> anyhow::Result<FrontendRouteSet> {
+        Ok(FrontendRouteSet::builder()
+            .get("/test/frontend-route/draining", move || {
+                let context = context.clone();
+                async move {
+                    if context.is_ready() {
+                        axum::http::StatusCode::OK
+                    } else {
+                        axum::http::StatusCode::ACCEPTED
+                    }
+                }
+            })?
+            .build())
+    }
+
+    fn test_status_extension(
+        _context: FrontendExtensionContext,
+        path: &str,
+    ) -> anyhow::Result<FrontendRouteSet> {
+        Ok(FrontendRouteSet::builder()
+            .get(path.to_string(), || async {
+                axum::http::StatusCode::NO_CONTENT
+            })?
+            .build())
+    }
+
+    async fn get_status(port: u16, path: &str) -> reqwest::StatusCode {
+        reqwest::Client::new()
+            .get(format!("http://localhost:{}{}", port, path))
+            .send()
+            .await
+            .expect("request failed")
+            .status()
+    }
+
+    fn build_error_message(builder: HttpServiceConfigBuilder) -> String {
+        match builder.build() {
+            Ok(_) => panic!("service build unexpectedly succeeded"),
+            Err(err) => err.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_frontend_route_extension_uses_live_frontend_state() {
+        let cancel_token = Arc::new(CancellationToken::new());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let service = HttpService::builder()
+            .port(port)
+            .add_frontend_route_extension(readiness_extension)
+            .build()
+            .unwrap();
+
+        assert!(
+            service
+                .route_docs()
+                .iter()
+                .any(|doc| doc.to_string() == "GET /test/frontend-route")
+        );
+
+        let running_service = service.clone();
+        let service_token = cancel_token.clone();
+        let handle = tokio::spawn(async move {
+            running_service
+                .run_with_listener((*service_token).clone(), listener)
+                .await
+                .unwrap();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        assert_eq!(
+            get_status(port, "/test/frontend-route").await,
+            reqwest::StatusCode::SERVICE_UNAVAILABLE
+        );
+
+        let mut card = crate::model_card::ModelDeploymentCard::default();
+        card.display_name = "pending-llama".to_string();
+        service
+            .model_manager()
+            .save_model_card("instance-pending", card)
+            .unwrap();
+        assert_eq!(
+            get_status(port, "/test/frontend-route").await,
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            "card-only model registration must not make the extension report ready"
+        );
+
+        service
+            .model_manager()
+            .add_chat_completions_model("ready-llama", "abc", make_chat_engine())
+            .unwrap();
+        assert_eq!(
+            get_status(port, "/test/frontend-route").await,
+            reqwest::StatusCode::OK
+        );
+
+        let openapi = reqwest::Client::new()
+            .get(format!("http://localhost:{}/openapi.json", port))
+            .send()
+            .await
+            .expect("openapi request failed")
+            .text()
+            .await
+            .expect("openapi body failed");
+        assert!(openapi.contains("/test/frontend-route"));
+
+        cancel_token.cancel();
+        handle.abort();
+    }
+
+    #[test]
+    fn test_multiple_frontend_route_extensions_are_registered() {
+        let service = HttpService::builder()
+            .add_frontend_route_extension(first_test_extension)
+            .add_frontend_route_extension(second_test_extension)
+            .build()
+            .unwrap();
+        let route_doc_strings = service
+            .route_docs()
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+
+        assert!(route_doc_strings.contains(&"GET /test/frontend-route/one".to_string()));
+        assert!(route_doc_strings.contains(&"GET /test/frontend-route/two".to_string()));
+    }
+
+    #[test]
+    fn test_frontend_route_extension_rejects_builtin_route_conflict() {
+        let error = build_error_message(
+            HttpService::builder().add_frontend_route_extension(duplicate_health_extension),
+        );
+
+        assert!(
+            error.contains("duplicate HTTP route registered: GET /health"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn test_frontend_route_extension_rejects_extension_route_conflict() {
+        let error = build_error_message(
+            HttpService::builder()
+                .add_frontend_route_extension(duplicate_test_extension)
+                .add_frontend_route_extension(duplicate_test_extension),
+        );
+
+        assert!(
+            error.contains("duplicate HTTP route registered: GET /test/frontend-route/duplicate"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_frontend_route_extension_stays_available_while_draining() {
+        let cancel_token = Arc::new(CancellationToken::new());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let service = HttpService::builder()
+            .port(port)
+            .add_frontend_route_extension(draining_extension)
+            .build()
+            .unwrap();
+        let state = service.state_clone();
+        let inflight = state.acquire_inflight();
+
+        let service_token = cancel_token.clone();
+        let handle = tokio::spawn(async move {
+            service
+                .run_with_listener((*service_token).clone(), listener)
+                .await
+                .unwrap();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        cancel_token.cancel();
+        wait_for_service_stage(&state, ServiceStage::Draining).await;
+
+        assert_eq!(
+            get_status(port, "/test/frontend-route/draining").await,
+            reqwest::StatusCode::ACCEPTED
+        );
+
+        drop(inflight);
+        handle.abort();
+    }
+
+    /// `enable_nvext` is wired from the builder onto `State.nvext_enabled` and
+    /// exposed via the accessor used by the openai handlers.
+    #[test]
+    #[serial_test::serial]
+    fn test_enable_nvext_propagates_through_builder_to_state() {
+        use dynamo_runtime::config::environment_names::llm::DYN_DISABLE_FRONTEND_NVEXT;
+
+        // `build()` ANDs the builder flag with the env var, so this test must
+        // pin the env to unset. Going through `temp_env` also serializes it
+        // against `test_dyn_disable_frontend_nvext_env_var_mirror`, which mutates
+        // the same process-global var in parallel.
+        temp_env::with_var_unset(DYN_DISABLE_FRONTEND_NVEXT, || {
+            let on = HttpService::builder().enable_nvext(true).build().unwrap();
+            assert!(on.state.nvext_enabled());
+
+            let off = HttpService::builder().enable_nvext(false).build().unwrap();
+            assert!(!off.state.nvext_enabled());
+
+            let default = HttpService::builder().build().unwrap();
+            assert!(
+                default.state.nvext_enabled(),
+                "default should preserve current behavior (nvext on)"
+            );
+        });
+    }
+
+    /// `DYN_DISABLE_FRONTEND_NVEXT` is the env-var mirror of the builder
+    /// flag. Unset -> builder default wins (on). Falsey strings -> on.
+    /// Truthy strings (`1` / `true` / `yes` / `on`, case-insensitive) ->
+    /// off, regardless of what the builder asked for.
+    #[test]
+    #[serial_test::serial]
+    fn test_dyn_disable_frontend_nvext_env_var_mirror() {
+        use dynamo_runtime::config::environment_names::llm::DYN_DISABLE_FRONTEND_NVEXT;
+
+        // Unset -> builder default (true) wins.
+        temp_env::with_var_unset(DYN_DISABLE_FRONTEND_NVEXT, || {
+            let svc = HttpService::builder().build().unwrap();
+            assert!(
+                svc.state.nvext_enabled(),
+                "unset env + default builder = on"
+            );
+        });
+
+        // Explicit falsey -> still on (disable not requested).
+        temp_env::with_var(DYN_DISABLE_FRONTEND_NVEXT, Some("false"), || {
+            let svc = HttpService::builder().build().unwrap();
+            assert!(
+                svc.state.nvext_enabled(),
+                "disable=false + default builder = on"
+            );
+        });
+
+        // Explicit truthy -> off, even though the builder default is on.
+        for truthy in ["true", "1", "yes", "on", "TRUE"] {
+            temp_env::with_var(DYN_DISABLE_FRONTEND_NVEXT, Some(truthy), || {
+                let svc = HttpService::builder().build().unwrap();
+                assert!(
+                    !svc.state.nvext_enabled(),
+                    "disable={truthy:?} should override builder default to off"
+                );
+            });
+        }
+
+        // Builder=false short-circuits regardless of env.
+        temp_env::with_var_unset(DYN_DISABLE_FRONTEND_NVEXT, || {
+            let svc = HttpService::builder().enable_nvext(false).build().unwrap();
+            assert!(
+                !svc.state.nvext_enabled(),
+                "builder=false wins even if disable is unset"
+            );
+        });
+    }
+
+    #[test]
+    fn test_backend_error_check_env_var() {
+        assert_eq!(
+            BackendErrorCheck::parse(Err(std::env::VarError::NotPresent)),
+            BackendErrorCheck::Skip
+        );
+        assert_eq!(
+            BackendErrorCheck::parse(Ok("0".to_string())),
+            BackendErrorCheck::Skip
+        );
+        assert_eq!(
+            BackendErrorCheck::parse(Ok("invalid".to_string())),
+            BackendErrorCheck::Skip
+        );
+        assert_eq!(
+            BackendErrorCheck::parse(Err(std::env::VarError::NotUnicode("500".into()))),
+            BackendErrorCheck::Skip
+        );
+        assert_eq!(
+            BackendErrorCheck::parse(Ok("500".to_string())),
+            BackendErrorCheck::Bounded(Duration::from_millis(500))
+        );
+    }
+
+    #[test]
+    fn test_sse_keep_alive_env_var() {
+        assert_eq!(
+            parse_sse_keep_alive(Err(std::env::VarError::NotPresent)),
+            None
+        );
+        assert_eq!(parse_sse_keep_alive(Ok("0".to_string())), None);
+        assert_eq!(
+            parse_sse_keep_alive(Ok("5000".to_string())),
+            Some(Duration::from_millis(5000))
+        );
+        assert_eq!(parse_sse_keep_alive(Ok("invalid".to_string())), None);
+
+        #[cfg(unix)]
+        {
+            use std::ffi::OsString;
+            use std::os::unix::ffi::OsStringExt;
+
+            assert_eq!(
+                parse_sse_keep_alive(Err(std::env::VarError::NotUnicode(OsString::from_vec(
+                    vec![0xff]
+                ),))),
+                None
+            );
+        }
+
+        let interval = Duration::from_millis(u64::MAX);
+        let expected = std::time::Instant::now()
+            .checked_add(interval)
+            .map(|_| interval);
+        assert_eq!(parse_sse_keep_alive(Ok(u64::MAX.to_string())), expected);
+    }
+
+    #[test]
+    fn test_listen_backlog_env_var() {
+        assert_eq!(
+            parse_listen_backlog(Err(std::env::VarError::NotPresent)),
+            DEFAULT_LISTEN_BACKLOG
+        );
+        assert_eq!(
+            parse_listen_backlog(Ok("0".to_string())),
+            DEFAULT_LISTEN_BACKLOG
+        );
+        assert_eq!(
+            parse_listen_backlog(Ok("invalid".to_string())),
+            DEFAULT_LISTEN_BACKLOG
+        );
+        assert_eq!(
+            parse_listen_backlog(Ok((i32::MAX as u32 + 1).to_string())),
+            DEFAULT_LISTEN_BACKLOG
+        );
+        assert_eq!(
+            parse_listen_backlog(Ok(i32::MAX.to_string())),
+            i32::MAX as u32
+        );
+        assert_eq!(parse_listen_backlog(Ok(" 8192 ".to_string())), 8192);
+    }
+
+    #[tokio::test]
+    async fn test_bind_listener_accepts_connections() {
+        let listener = bind_listener("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = listener.local_addr().unwrap();
+        assert_ne!(addr.port(), 0);
+        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (_server_side, peer) = listener.accept().await.unwrap();
+        assert_eq!(peer, client.local_addr().unwrap());
+    }
+
+    #[test]
+    fn test_listen_socket_addr_accepts_ip_literals() {
+        for (host, expected) in [
+            ("0.0.0.0", "0.0.0.0:8000"),
+            ("127.0.0.1", "127.0.0.1:8000"),
+            ("::", "[::]:8000"),
+            ("[::]", "[::]:8000"),
+            (" [::1] ", "[::1]:8000"),
+        ] {
+            assert_eq!(
+                listen_socket_addr(host, 8000).unwrap(),
+                expected.parse::<SocketAddr>().unwrap(),
+                "{host}"
+            );
+        }
+        for host in ["localhost", "[::", "::1]", ""] {
+            let error = listen_socket_addr(host, 8000).unwrap_err().to_string();
+            assert!(
+                error.starts_with(&format!("Invalid address '{host}:8000'")),
+                "{host}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_sse_keep_alive_for_deferred_response() {
+        let configured = Duration::from_millis(5000);
+        assert_eq!(
+            effective_sse_keep_alive(Some(configured), true),
+            Some(configured),
+            "an explicit interval must win"
+        );
+        assert_eq!(
+            effective_sse_keep_alive(None, true),
+            Some(Duration::from_secs(15)),
+            "a response that can suppress every data frame needs a heartbeat"
+        );
+        assert_eq!(
+            effective_sse_keep_alive(None, false),
+            None,
+            "ordinary responses keep the opt-in behavior"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn generate_capabilities_follow_startup_gates() {
+        install_readiness_formats();
+        temp_env::with_vars(
+            [
+                (VLLM_ENABLE_INFERENCE_V1_GENERATE_ENV, None::<&str>),
+                (SGLANG_ENABLE_GENERATE_ENV, None),
+            ],
+            || {
+                let disabled = HttpService::builder().build().unwrap();
+                assert!(disabled.generate_engine_capabilities().is_empty());
+
+                let enabled = HttpService::builder()
+                    .enable_engine_apis(true)
+                    .build()
+                    .unwrap();
+                assert_eq!(
+                    enabled.generate_engine_capabilities(),
+                    vec![
+                        VLLM_INFERENCE_V1_GENERATE_CAPABILITY,
+                        SGLANG_GENERATE_CAPABILITY
+                    ]
+                );
+
+                for (variable, capability) in [
+                    (
+                        VLLM_ENABLE_INFERENCE_V1_GENERATE_ENV,
+                        VLLM_INFERENCE_V1_GENERATE_CAPABILITY,
+                    ),
+                    (SGLANG_ENABLE_GENERATE_ENV, SGLANG_GENERATE_CAPABILITY),
+                ] {
+                    temp_env::with_var(variable, Some("1"), || {
+                        let enabled = HttpService::builder().build().unwrap();
+                        assert_eq!(enabled.generate_engine_capabilities(), vec![capability]);
+                    });
+                }
+            },
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn decisions_mount_both_routes_without_enabling_public_generate_capabilities() {
+        temp_env::with_vars(
+            [
+                (VLLM_ENABLE_INFERENCE_V1_GENERATE_ENV, None::<&str>),
+                (SGLANG_ENABLE_GENERATE_ENV, None),
+                (HTTP_SVC_SYSTEMONE_PATH_ENV, None),
+            ],
+            || {
+                let mut api = FrontendApiConfig::default();
+                api.set_systemone_enabled(true);
+                let service = HttpService::builder()
+                    .frontend_api_config(api)
+                    .enable_chat_endpoints(true)
+                    .build()
+                    .unwrap();
+
+                assert!(service.generate_engine_capabilities().is_empty());
+                assert!(service.model_endpoint_enabled(EndpointType::SystemOne));
+                assert!(!service.model_endpoint_enabled(EndpointType::Generate));
+                let routes = service
+                    .route_docs()
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>();
+                assert!(routes.contains(&"POST /v1/systemone".to_string()));
+                assert!(routes.contains(&"POST /v1/decisions".to_string()));
+                assert!(!routes.contains(&"POST /generate".to_string()));
+                let state = service.state_clone();
+                state
+                    .manager()
+                    .add_chat_completions_model(
+                        "decision-model",
+                        "chat-worker",
+                        Arc::new(crate::engines::StreamingEngineAdapter::new(
+                            crate::engines::make_echo_engine(),
+                        )),
+                    )
+                    .unwrap();
+                state
+                    .manager()
+                    .add_generate_model(
+                        "decision-model",
+                        "scoring-worker",
+                        Arc::new(ReadinessOnlyEngine),
+                    )
+                    .unwrap();
+                let model = state.manager().get_model("decision-model").unwrap();
+                assert!(model.has_chat_engine());
+                assert!(model.has_generate_engine());
+                assert!(state.model_http_routes_ready(&model));
+                assert!(
+                    service
+                        .enable_model_endpoint(EndpointType::SystemOne, false)
+                        .is_err()
+                );
+            },
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn systemone_route_cannot_override_decisions() {
+        temp_env::with_var(HTTP_SVC_SYSTEMONE_PATH_ENV, Some("/v1/decisions"), || {
+            let mut api = FrontendApiConfig::default();
+            api.set_systemone_enabled(true);
+            let result = HttpService::builder().frontend_api_config(api).build();
+            assert!(result.is_err());
+        });
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn decision_readiness_rejections_preserve_mounted_protocol_and_request_ids() {
+        use tower::ServiceExt;
+
+        for configured_path in [None, Some("/custom/decide")] {
+            temp_env::async_with_vars(
+                [(HTTP_SVC_SYSTEMONE_PATH_ENV, configured_path)],
+                async move {
+                    let mut api = FrontendApiConfig::default();
+                    api.set_systemone_enabled(true);
+                    let service = HttpService::builder()
+                        .frontend_api_config(api)
+                        .build()
+                        .unwrap();
+                    service.state().start_draining();
+                    let systemone_path = configured_path.unwrap_or("/v1/systemone");
+                    for (path, client_id) in [
+                        (systemone_path, Some("readiness-request")),
+                        ("/v1/decisions", Some("readiness-request")),
+                        ("/v1/responses", Some("readiness-request")),
+                        (systemone_path, None),
+                        ("/v1/decisions", None),
+                    ] {
+                        let mut request = axum::http::Request::post(path)
+                            .header("content-type", "application/json");
+                        if let Some(client_id) = client_id {
+                            request = request.header("x-request-id", client_id);
+                        }
+                        let response = service
+                            .router
+                            .clone()
+                            .oneshot(request.body(Body::from("{}")).unwrap())
+                            .await
+                            .unwrap();
+                        assert_eq!(
+                            response.status(),
+                            axum::http::StatusCode::SERVICE_UNAVAILABLE
+                        );
+                        if path != "/v1/responses" {
+                            assert_eq!(response.headers()["x-dynamo-systemone-version"], "1");
+                            let canonical_id = &response.headers()["x-typesafe-request-id"];
+                            assert!(uuid::Uuid::parse_str(canonical_id.to_str().unwrap()).is_ok());
+                            if let Some(client_id) = client_id {
+                                assert_eq!(response.headers()["x-request-id"], client_id);
+                            } else {
+                                assert_eq!(&response.headers()["x-request-id"], canonical_id);
+                            }
+                        }
+                        let body = axum::body::to_bytes(response.into_body(), 4096)
+                            .await
+                            .unwrap();
+                        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                        if path == systemone_path {
+                            assert_eq!(body["detail"], "Service is not ready");
+                            assert_eq!(body["code"], "server_error");
+                            assert!(body.get("error").is_none());
+                        } else if path == "/v1/decisions" {
+                            assert_eq!(body["error"]["message"], "Service is not ready");
+                            assert_eq!(body["error"]["code"], "server_error");
+                        } else {
+                            assert_eq!(body["code"], 503);
+                        }
+                    }
+                    let unmatched = service
+                        .router
+                        .clone()
+                        .oneshot(
+                            axum::http::Request::post(format!("{systemone_path}/not-registered"))
+                                .body(Body::empty())
+                                .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(unmatched.status(), axum::http::StatusCode::NOT_FOUND);
+                    assert_eq!(service.state().inflight_count(), 0);
+                },
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn anthropic_readiness_rejections_preserve_envelope_and_request_ids() {
+        use tower::ServiceExt;
+
+        for configured_path in [None, Some("/custom/messages")] {
+            temp_env::async_with_vars(
+                [(HTTP_SVC_ANTHROPIC_PATH_ENV, configured_path)],
+                async move {
+                    let service = HttpService::builder()
+                        .enable_anthropic_endpoints(true)
+                        .build()
+                        .unwrap();
+                    service.state().start_draining();
+                    let base = configured_path.unwrap_or("/v1/messages");
+                    let count_tokens = format!("{base}/count_tokens");
+                    for path in [base, count_tokens.as_str()] {
+                        let response = service
+                            .router
+                            .clone()
+                            .oneshot(
+                                axum::http::Request::post(path)
+                                    .header("content-type", "application/json")
+                                    .header("anthropic-version", "2023-06-01")
+                                    .header("x-request-id", "anthropic-readiness")
+                                    .body(Body::from("{}"))
+                                    .unwrap(),
+                            )
+                            .await
+                            .unwrap();
+                        assert_eq!(
+                            response.status(),
+                            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                            "{path}"
+                        );
+                        assert_eq!(response.headers()[header::CONNECTION], "close");
+                        let request_id = response.headers()["request-id"]
+                            .to_str()
+                            .unwrap()
+                            .to_owned();
+                        // The server owns `request-id`; clients correlate with `x-request-id`.
+                        assert!(uuid::Uuid::parse_str(&request_id).is_ok());
+                        assert_eq!(response.headers()["x-request-id"], "anthropic-readiness");
+                        let body = axum::body::to_bytes(response.into_body(), 4096)
+                            .await
+                            .unwrap();
+                        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                        assert_eq!(body["type"], "error", "{path}: {body}");
+                        assert_eq!(body["error"]["type"], "overloaded_error");
+                        assert_eq!(body["error"]["message"], "Service is not ready");
+                        assert_eq!(body["request_id"], request_id.as_str());
+                    }
+
+                    // Other inference routes keep the OpenAI body.
+                    let control = service
+                        .router
+                        .clone()
+                        .oneshot(
+                            axum::http::Request::post("/v1/chat/completions")
+                                .header("content-type", "application/json")
+                                .body(Body::from("{}"))
+                                .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        control.status(),
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE
+                    );
+                    let body = axum::body::to_bytes(control.into_body(), 4096)
+                        .await
+                        .unwrap();
+                    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                    assert_eq!(body["code"], 503);
+                    assert_ne!(body["type"], "error");
+                    assert_eq!(service.state().inflight_count(), 0);
+                },
+            )
+            .await;
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn systemone_does_not_bypass_disabled_public_generate_route() {
+        crate::generate_format::test_formats::install();
+        let mut api = FrontendApiConfig::default();
+        api.set_systemone_enabled(true);
+        let service = HttpService::builder()
+            .frontend_api_config(api)
+            .enable_engine_apis(true)
+            .build()
+            .unwrap();
+        let state = service.state_clone();
+        state
+            .manager()
+            .add_generate_model("generate-model", "worker", Arc::new(ReadinessOnlyEngine))
+            .unwrap();
+        let model = state.manager().get_model("generate-model").unwrap();
+        assert!(state.model_http_routes_ready(&model));
+        service
+            .enable_model_endpoint(EndpointType::Generate, false)
+            .unwrap();
+        assert!(!state.model_http_routes_ready(&model));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn generate_route_paths_use_overrides() {
+        install_readiness_formats();
+        temp_env::with_vars(
+            [
+                (VLLM_ENABLE_INFERENCE_V1_GENERATE_ENV, Some("1")),
+                (HTTP_SVC_VLLM_GENERATE_PATH_ENV, Some("/native/vllm")),
+                (SGLANG_ENABLE_GENERATE_ENV, Some("1")),
+                (HTTP_SVC_SGLANG_GENERATE_PATH_ENV, Some("/native/sglang")),
+            ],
+            || {
+                let service = HttpService::builder().build().unwrap();
+                let route_docs: Vec<_> = service
+                    .route_docs()
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect();
+
+                assert!(route_docs.contains(&"POST /native/vllm".to_string()));
+                assert!(route_docs.contains(&"POST /native/sglang".to_string()));
+                assert!(route_docs.contains(&"PUT /native/sglang".to_string()));
+                assert!(!route_docs.contains(&"POST /generate".to_string()));
+                assert!(!route_docs.contains(&"POST /inference/v1/generate".to_string()));
+            },
+        );
+    }
+
+    #[test]
+    fn generate_route_paths_reject_collisions() {
+        install_readiness_formats();
+        let error = resolve_generate_routes(["vllm", "sglang"].map(|name| {
+            (
+                crate::generate_format::named(name),
+                "/native/shared".to_string(),
+            )
+        }))
+        .err()
+        .expect("duplicate path must fail");
+        assert_eq!(
+            error.to_string(),
+            "duplicate Generate route path: /native/shared"
+        );
+    }
+
+    #[test]
+    fn generate_route_path_validation_rejects_invalid_paths() {
+        for path in ["", "native/vllm", "/:model", "/*path"] {
+            assert!(validate_generate_route_path(path).is_err());
+        }
+    }
+}

@@ -1,0 +1,22 @@
+// SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+//! Mock LLM scheduler and KV manager for testing.
+//!
+//! This crate provides a mock implementation of an LLM scheduler that simulates
+//! KV cache management, request scheduling, and token generation timing without
+//! requiring actual GPU resources or a full distributed runtime.
+
+pub mod common;
+pub mod config;
+pub mod engine;
+pub(crate) mod engine_adapter;
+pub(crate) mod engine_observations;
+pub(crate) mod generalized_live;
+pub mod grouped_scheduler;
+pub mod live;
+pub mod loadgen;
+pub mod replay;
+pub mod scheduler;
+pub mod services;
+pub mod sglang;

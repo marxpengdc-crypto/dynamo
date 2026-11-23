@@ -1,0 +1,159 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+import json
+import os
+import sys
+from collections.abc import Mapping
+
+from tests.utils.http_checks import check_http_ok
+from tests.utils.managed_process import ManagedProcess
+
+
+class SlotTrackerProcess(ManagedProcess):
+    """Manages a standalone dynamo.slot_tracker process."""
+
+    def __init__(self, request, port: int):
+        super().__init__(
+            command=[
+                sys.executable,
+                "-m",
+                "dynamo.slot_tracker",
+                "--port",
+                str(port),
+            ],
+            timeout=10,
+            display_output=False,
+            health_check_ports=[port],
+            health_check_urls=[f"http://localhost:{port}/health"],
+            log_dir=request.node.name,
+            terminate_all_matching_process_names=False,
+            display_name="dynamo-slot-tracker",
+        )
+        self.port = port
+
+
+class FrontendRouterProcess(ManagedProcess):
+    """Manages a dynamo.frontend process with configurable --router-mode.
+
+    Supports all router modes (round-robin, random, kv, direct) and all
+    KV-specific options (block size, thresholds, disagg). With
+    router_policy_config and router_mode=None, the policy file alone selects
+    each role's policy.
+    block_size is only sent to the CLI when the KV router runs: router_mode is
+    "kv", or a policy file is given.
+    """
+
+    def __init__(
+        self,
+        request,
+        block_size: int,
+        frontend_port: int,
+        namespace: str,
+        store_backend: str = "etcd",
+        blocks_threshold: float | str | None = None,
+        tokens_threshold: int | str | None = None,
+        tokens_threshold_frac: float | str | None = None,
+        router_queue_threshold: float | str | None = None,
+        request_plane: str = "nats",
+        router_mode: str | None = "kv",
+        router_policy_config: str | None = None,
+        min_initial_workers: int | None = None,
+        router_ais_config: dict[str, str | int] | None = None,
+        serve_indexer: bool = False,
+        use_remote_indexer: bool = False,
+        event_plane: str | None = None,
+        session_affinity_ttl_secs: int | None = None,
+        extra_env: Mapping[str, str | None] | None = None,
+    ):
+        command = [
+            sys.executable,
+            "-m",
+            "dynamo.frontend",
+            "--http-port",
+            str(frontend_port),
+            "--discovery-backend",
+            store_backend,
+            "--namespace",
+            namespace,
+        ]
+
+        if router_mode is not None:
+            command.extend(["--router-mode", router_mode])
+
+        if router_policy_config is not None:
+            command.extend(["--router-policy-config", router_policy_config])
+
+        if router_mode == "kv" or router_policy_config is not None:
+            command.extend(["--kv-cache-block-size", str(block_size)])
+
+        if blocks_threshold is not None:
+            command.extend(["--active-decode-blocks-threshold", str(blocks_threshold)])
+
+        if tokens_threshold is not None:
+            command.extend(["--active-prefill-tokens-threshold", str(tokens_threshold)])
+
+        if tokens_threshold_frac is not None:
+            command.extend(
+                ["--active-prefill-tokens-threshold-frac", str(tokens_threshold_frac)]
+            )
+
+        if router_queue_threshold is not None:
+            command.extend(["--router-queue-threshold", str(router_queue_threshold)])
+
+        if serve_indexer:
+            command.append("--serve-indexer")
+
+        if use_remote_indexer:
+            command.append("--use-remote-indexer")
+
+        if session_affinity_ttl_secs is not None:
+            command.extend(
+                ["--router-session-affinity-ttl-secs", str(session_affinity_ttl_secs)]
+            )
+
+        if router_ais_config is not None:
+            command.extend(
+                [
+                    "--router-track-prefill-tokens",
+                    "--router-prefill-load-model",
+                    "ais",
+                    "--ais-perf-model",
+                    json.dumps(router_ais_config),
+                ]
+            )
+
+        env = os.environ.copy()
+        env["DYN_REQUEST_PLANE"] = request_plane
+        if event_plane is not None:
+            env["DYN_EVENT_PLANE"] = event_plane
+        if event_plane == "zmq" and request_plane != "nats":
+            env.pop("NATS_SERVER", None)
+        if min_initial_workers is not None:
+            env["DYN_ROUTER_MIN_INITIAL_WORKERS"] = str(min_initial_workers)
+        for name, value in (extra_env or {}).items():
+            if value is None:
+                env.pop(name, None)
+            else:
+                env[name] = value
+
+        super().__init__(
+            command=command,
+            env=env,
+            timeout=60,
+            display_output=True,
+            health_check_ports=[frontend_port],
+            health_check_urls=[
+                (f"http://localhost:{frontend_port}/v1/models", check_http_ok)
+            ],
+            log_dir=request.node.name,
+            terminate_all_matching_process_names=False,
+            display_name=f"dynamo-frontend-{router_mode or 'policy-file'}-{frontend_port}",
+        )
+        self.port = frontend_port
+        self.router_mode = router_mode
+
+
+# Backward-compatible alias so existing callers that import KVRouterProcess
+# continue to work without changes.
+KVRouterProcess = FrontendRouterProcess

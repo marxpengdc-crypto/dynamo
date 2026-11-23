@@ -1,0 +1,241 @@
+{#
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#}
+# === BEGIN templates/frontend.Dockerfile ===
+##############################################
+########## Frontend entrypoint image #########
+##############################################
+FROM ${EPP_IMAGE} AS epp
+
+# The EPP image is built from deploy/inference-gateway/ext-proc (Rust). This
+# image contributes three things to the frontend: the /epp binary (copied
+# below), and — consumed by compliance.Dockerfile's licenses and sources_collect
+# stages — the CycloneDX SBOM describing /epp's crate closure plus the harvested
+# LICENSE texts for those crates. /epp ships in no wheel, so that SBOM is the
+# only thing that puts its crates into the frontend's NOTICES and OSRB bundle.
+
+# Build `crick` as a wheel in an isolated stage so the C toolchain never
+# reaches the final frontend image. aiperf depends on crick==0.0.8,
+# which publishes no manylinux aarch64 wheel — without this, arm64 builds
+# fall back to sdist and fail in the final stage where gcc is intentionally
+# absent. amd64 has a prebuilt manylinux_x86_64 wheel on PyPI, so the build
+# is gated on TARGETARCH=arm64; amd64 ships an empty /wheels and uv pulls
+# crick straight from PyPI in the final stage. /wheels is created either
+# way so the COPY --from=crick_builder in the final stage always succeeds.
+FROM ${FRONTEND_IMAGE} AS crick_builder
+ARG PYTHON_VERSION
+ARG TARGETARCH
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    mkdir -p /wheels \
+    && if [ "$TARGETARCH" = "arm64" ]; then \
+        apt-get update -y \
+        && apt-get install -y --no-install-recommends \
+            ca-certificates \
+            gcc \
+            libc6-dev \
+            python${PYTHON_VERSION}-dev \
+            python${PYTHON_VERSION}-venv \
+        && apt-get clean \
+        && rm -rf /var/lib/apt/lists/* \
+        && {% include "templates/verify_ca_certificates.Dockerfile" %}; \
+    fi
+RUN if [ "$TARGETARCH" = "arm64" ]; then \
+        python${PYTHON_VERSION} -m venv /tmp/buildenv \
+        && /tmp/buildenv/bin/pip install --no-cache-dir --upgrade pip wheel \
+        && /tmp/buildenv/bin/pip wheel --no-cache-dir --no-deps crick==0.0.8 -w /wheels; \
+    fi
+
+FROM ${FRONTEND_IMAGE} AS pre_frontend
+
+ARG PYTHON_VERSION
+# Cache apt downloads; sharing=locked avoids apt/dpkg races with concurrent builds.
+# Keep the CA floor in this RUN so its version participates in the layer cache key.
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    apt-get update -y \
+    && apt-get install -y --no-install-recommends \
+        # required for EPP
+        ca-certificates \
+        libstdc++6 \
+        # required by EPP's embedded ZMQ KV-event/replica-sync subscriber
+        # (dynamo-kv-router's ingest-zmq and replica-sync-zmq features); matches the
+        # runtime dep installed in deploy/inference-gateway/ext-proc/Dockerfile
+        libzmq5 \
+        # required for verification of GPG keys
+        gnupg2 \
+        # required for installing dependencies from git repositories
+        git \
+        # compliance audit bootstraps syft over HTTPS
+        curl \
+        # lets CPython and C code opt into jemalloc via
+        # LD_PRELOAD; not preloaded by default
+        libjemalloc2 \
+        # Python runtime - required for virtual environment to work
+        python${PYTHON_VERSION}-dev \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/* \
+    && {% include "templates/verify_ca_certificates.Dockerfile" %}
+
+ENV GRPC_DEFAULT_SSL_ROOTS_FILE_PATH=/etc/ssl/certs/ca-certificates.crt
+
+# Bring base-image OS packages up to the current patch releases published in
+# the distro archives. --only-upgrade skips anything not already installed, so
+# no new packages are added; versions are left unpinned so a cache-busted
+# rebuild picks up the newest patch level (BuildKit reuses this layer otherwise).
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    apt-get update -y \
+    && apt-get install -y --no-install-recommends --only-upgrade \
+        apt \
+        apt-utils \
+        dirmngr \
+        gnupg \
+        gnupg-utils \
+        gnupg2 \
+        gpg \
+        gpg-agent \
+        gpgconf \
+        gpgsm \
+        gpgv \
+        keyboxd \
+        libapt-pkg6.0t64 \
+        libbrotli1 \
+        libglib2.0-0t64 \
+        libgnutls30t64 \
+        libperl5.38t64 \
+        libssl3t64 \
+        openssh-client \
+        openssh-server \
+        openssh-sftp-server \
+        openssl \
+        perl \
+        perl-base \
+        perl-modules-5.38 \
+        zlib1g \
+        zlib1g-dev \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+
+# Create dynamo user with group 0 for OpenShift compatibility
+RUN userdel -r ubuntu > /dev/null 2>&1 || true \
+    && useradd -m -s /bin/bash -g 0 dynamo \
+    && [ `id -u dynamo` -eq 1000 ] \
+    && mkdir -p /home/dynamo/.cache /opt/dynamo /workspace \
+    && chown -R dynamo: /opt/dynamo /home/dynamo/.cache /workspace \
+    && chmod -R g+w /opt/dynamo /home/dynamo/.cache /workspace
+
+# Set HOME so ModelExpress can find the cache directory
+ENV HOME=/home/dynamo
+# Switch to dynamo user
+USER dynamo
+ENV DYNAMO_HOME=/opt/dynamo
+
+WORKDIR /
+COPY --chown=dynamo: --from=epp /epp /epp
+
+COPY --chown=dynamo: container/launch_message/frontend.txt /opt/dynamo/.launch_screen
+# Copy tests, benchmarks, deploy and components with correct ownership
+COPY --chown=dynamo: tests /workspace/tests
+COPY --chown=dynamo: examples /workspace/examples
+COPY --chown=dynamo: benchmarks /workspace/benchmarks
+COPY --chown=dynamo: deploy /workspace/deploy
+COPY --chown=dynamo: dev /workspace/dev
+COPY --chown=dynamo: components/ /workspace/components/
+COPY --chown=dynamo: recipes/ /workspace/recipes/
+# Copy LICENSE; ATTRIBUTIONS files removed in favor of /legal/ generated at build time.
+COPY --chown=dynamo: LICENSE /workspace/
+
+ENV VIRTUAL_ENV=/opt/dynamo/venv
+ENV PATH="/opt/dynamo/venv/bin:$PATH"
+
+# Copy uv from base stage and wheels from wheel_builder (no runtime stage dependency)
+COPY --chown=dynamo: --from=dynamo_base /opt/uv/bin/uv /opt/uv/bin/uvx /opt/uv/bin/
+ENV PATH=/opt/uv/bin:${PATH}
+COPY --chown=dynamo: --from=wheel_builder /opt/dynamo/dist/*.whl /opt/dynamo/wheelhouse/
+# crick wheel pre-built in the crick_builder stage; see comment near the top.
+COPY --chown=dynamo: --from=crick_builder /wheels/ /opt/dynamo/wheelhouse/extra/
+
+# Create virtual environment
+RUN --mount=type=cache,id=uv-dynamo-{{ context.dynamo.uv_version }},target=/home/dynamo/.cache/uv,uid=1000,gid=0,mode=0775,sharing=shared \
+    export UV_CACHE_DIR=/home/dynamo/.cache/uv && \
+    mkdir -p /opt/dynamo/venv && \
+    uv venv /opt/dynamo/venv --python $PYTHON_VERSION
+
+# Install runtime dependencies (common + frontend).
+# Frontend needs tritonclient and its grpcio/protobuf constraints for gRPC serving,
+# plus AIC core for the experimental router-side prefill-load model.
+# Test and dev dependencies are NOT installed here — they go in the test and dev images.
+# --only-binary python-rapidjson (from tritonclient): this stage has no C++ compiler on
+# purpose, so take the newest release that has a wheel rather than building an sdist.
+RUN --mount=type=bind,source=./container/deps/requirements.common.txt,target=/tmp/requirements.common.txt \
+    --mount=type=bind,source=./container/deps/requirements.frontend.txt,target=/tmp/requirements.frontend.txt \
+    --mount=type=bind,source=./container/deps/overrides.frontend.txt,target=/tmp/overrides.frontend.txt \
+    --mount=type=cache,id=uv-dynamo-{{ context.dynamo.uv_version }},target=/home/dynamo/.cache/uv,uid=1000,gid=0,mode=0775,sharing=shared \
+    export UV_CACHE_DIR=/home/dynamo/.cache/uv UV_HTTP_TIMEOUT=300 UV_HTTP_RETRIES=5 && \
+    uv pip install \
+        --only-binary python-rapidjson \
+        --overrides /tmp/overrides.frontend.txt \
+        --requirement /tmp/requirements.common.txt \
+        --requirement /tmp/requirements.frontend.txt
+
+ARG ENABLE_GPU_MEMORY_SERVICE
+ARG NIXL_REF
+# In an ideal world, we'd use a mirror of PyPI for much more reliable downloads.
+# UV_FIND_LINKS points at the crick wheel pre-built in the crick_builder stage;
+# uv prefers it over the sdist on arm64 where no manylinux aarch64 wheel exists.
+RUN --mount=type=bind,source=./container/deps/overrides.frontend.txt,target=/tmp/overrides.frontend.txt \
+    --mount=type=cache,id=uv-dynamo-{{ context.dynamo.uv_version }},target=/home/dynamo/.cache/uv,uid=1000,gid=0,mode=0775,sharing=shared \
+    echo "${NIXL_REF}" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$' || { echo "NIXL_REF must be a vX.Y.Z release tag; got '${NIXL_REF}'" >&2; exit 1; } && \
+    export UV_CACHE_DIR=/home/dynamo/.cache/uv UV_FIND_LINKS=/opt/dynamo/wheelhouse/extra && \
+    uv pip install \
+    --overrides /tmp/overrides.frontend.txt \
+    /opt/dynamo/wheelhouse/ai_dynamo_runtime*.whl \
+    /opt/dynamo/wheelhouse/ai_dynamo*any.whl && \
+    # The meta package requires both backends unconditionally (its cu12/cu13
+    # extras are vestigial), so install the backend first and the meta module
+    # --no-deps to keep a single CUDA build and one libnixl_capi.so.
+    uv pip install "nixl-cu13==${NIXL_REF#v}" && \
+    uv pip install --no-deps "nixl==${NIXL_REF#v}" && \
+    uv pip show nixl nixl-cu13 | grep -E '^(Name|Version)' | tee /opt/dynamo/nixl-versions.txt && \
+    if [ "$ENABLE_GPU_MEMORY_SERVICE" = "true" ]; then \
+        GMS_WHEEL=$(ls /opt/dynamo/wheelhouse/gpu_memory_service*.whl 2>/dev/null | head -1); \
+        if [ -z "$GMS_WHEEL" ]; then \
+            echo "ERROR: ENABLE_GPU_MEMORY_SERVICE is true but no gpu_memory_service wheel found in wheelhouse" >&2; \
+            exit 1; \
+        fi; \
+        uv pip install "$GMS_WHEEL"; \
+    fi && \
+    cd /workspace/benchmarks && \
+    export UV_HTTP_TIMEOUT=300 UV_HTTP_RETRIES=5 && \
+    uv pip install --overrides /tmp/overrides.frontend.txt .
+
+# Setup environment for all users
+USER root
+# nixl-sys resolves the C API with a bare dlopen("libnixl_capi.so"), and
+# dynamo/_core.abi3.so carries no RPATH, so without this the Rust bindings
+# silently fall back to stub mode while the Python ones work. The wheel keeps
+# its libraries in a private directory; put that on the loader path. NIXL finds
+# the backend plugins beside them on its own (nixl_plugin_manager.cpp's
+# getPluginDir dladdr fallback), so NIXL_PLUGIN_DIR is deliberately left unset.
+RUN NIXL_LIB_DIR="$(/opt/dynamo/venv/bin/python -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')/.nixl_cu13.mesonpy.libs" && \
+    [ -f "${NIXL_LIB_DIR}/libnixl_capi.so" ] || { echo "missing ${NIXL_LIB_DIR}/libnixl_capi.so; NIXL wheel layout changed" >&2; exit 1; } && \
+    [ -d "${NIXL_LIB_DIR}/plugins" ] || { echo "missing ${NIXL_LIB_DIR}/plugins; NIXL wheel layout changed" >&2; exit 1; } && \
+    echo "${NIXL_LIB_DIR}" > /etc/ld.so.conf.d/nixl.conf && \
+    ldconfig && \
+    chmod 755 /opt/dynamo/.launch_screen && \
+    echo 'source /opt/dynamo/venv/bin/activate' >> /etc/bash.bashrc && \
+    echo 'cat /opt/dynamo/.launch_screen' >> /etc/bash.bashrc
+
+USER dynamo
+
+ENTRYPOINT ["/epp"]
+CMD ["/bin/bash"]
+
+
+{% include "templates/compliance.Dockerfile" %}
+
+
+FROM pre_frontend AS frontend
+COPY --from=licenses /legal /legal
+ENTRYPOINT ["/epp"]
+CMD ["/bin/bash"]

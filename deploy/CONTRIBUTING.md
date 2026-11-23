@@ -1,0 +1,153 @@
+# Contributing to Dynamo Deploy
+
+Welcome to the Dynamo Deploy project! This guide will help you get started with contributing to the deployment infrastructure and tooling for the Dynamo distributed inference platform.
+
+## Getting Started
+
+### Prerequisites
+
+
+### Quick Setup
+
+### Project Structure
+
+The deploy directory contains several key components:
+
+```
+├── helm
+│   └── charts
+│       ├── platform     # Dynamo platform helm chart
+│       ├── power-agent  # Helm chart for the GPU power-cap DaemonSet
+│       └── snapshot     # Helm chart for the CRIU snapshot DaemonSet
+├── inference-gateway    # Dynamo integration with inference gateway
+├── observability        # Observability tools for Dynamo k8s
+├── operator             # Source code for the Dynamo operator
+├── power-agent          # Privileged DaemonSet for GPU power-cap enforcement
+├── pre-deployment       # Pre-deployment scripts to check your k8s cluster meets the requirements for deploying Dynamo
+├── snapshot             # CRIU-based checkpoint/restore DaemonSet
+└── utils                # Utilities and manifests for Dynamo benchmarking and profiling workflows
+```
+
+## Development Environment
+
+### Setting Up Your Environment
+
+
+### IDE Configuration
+
+**VS Code:**
+
+- Install Go extension
+- Install Python extension
+- Configure settings for Go formatting and linting
+- Add workspace settings for consistent formatting
+
+### Contribution Workflow Caveats
+
+- We do signed commits
+
+```bash
+git commit -s -S
+```
+
+#### Commit Message Guidelines
+
+Follow conventional commit format:
+
+- `feat:` new features
+- `fix:` bug fixes
+- `docs:` documentation changes
+- `test:` adding or updating tests
+- `refactor:` code refactoring
+- `perf:` performance improvements
+- `ci:` CI/CD changes
+
+Examples:
+
+```
+feat(operator): add support for custom resource limits
+fix(sdk): resolve service discovery timeout issue
+docs(helm): update deployment guide with new examples
+test(e2e): add integration tests for disaggregated serving
+```
+
+## Style Guide
+
+### Go Code Style (Operator)
+
+Follow standard Go conventions.
+
+
+### Python Code Style (SDK)
+
+Follow PEP 8 and use modern Python practices:
+
+
+### YAML/Helm Templates
+
+```yaml
+# Use consistent indentation (2 spaces)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "dynamo.fullname" . }}
+  labels:
+    {{- include "dynamo.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "dynamo.selectorLabels" . | nindent 6 }}
+```
+
+## Testing
+
+Once you have an MR up and standard checks pass trigger the integration tests by adding the comment “/ok to test <COMMIT-ID> “
+
+
+### Unit Tests
+
+**Go Tests (Operator):**
+
+```bash
+cd deploy/operator
+go test ./... -v
+go test -race ./...
+```
+
+### Integration Tests
+
+**End-to-End Deployment Tests:**
+
+```bash
+# Run full deployment test suite
+pytest tests/serve/test_dynamo_serve.py -v
+
+# Test specific deployment scenarios
+pytest tests/serve/test_dynamo_serve.py::test_serve_deployment[agg] -v
+```
+
+**Operator API-Only Integration Tests:**
+
+```bash
+cd deploy/operator
+make envtest
+```
+
+For the Kind-backed `make integration` workflow, including the required local image
+builds and environment variables, follow the
+[cluster environment setup](operator/internal/testing/clusterenv/DESIGN.md#external-setup).
+
+### Writing Tests
+
+**Example Unit Test:**
+
+**Example Integration Test:**
+
+
+### Examples Testing
+
+Ensure documentation examples work.
+
+
+Thank you for contributing to Dynamo Deploy! 🚀

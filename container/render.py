@@ -1,0 +1,427 @@
+#!/usr/bin/env python3
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+import argparse
+import copy
+import re
+import sys
+from pathlib import Path
+
+import yaml
+from jinja2 import Environment, FileSystemLoader, StrictUndefined
+
+_VALID_ARCHS = {"amd64", "arm64"}
+
+_PYTHON_PACKAGE_DOWNLOAD_RE = re.compile(
+    r"\buv\s+(?:build|lock|sync|pip\s+(?:compile|install|sync))\b"
+    r"|(?:^|[\s;&|])(?:\S*/)?pip3?\s+(?:install|wheel)\b"
+    r"|(?:^|[\s;&|])(?:\S*/)?python3?(?:\.\d+)?\s+-m\s+pip\s+(?:install|wheel)\b"
+    # vLLM Omni installs packages inside this mounted script.
+    r"|(?:^|[\s;&|])bash\s+/tmp/install_vllm_omni\.sh\b"
+    # NIXL's Meson build resolves Python build dependencies through uv.
+    r"|github\.com/ai-dynamo/nixl\.git",
+    re.MULTILINE,
+)
+
+_PYPI_RUN_PREFIX = (
+    "RUN --mount=type=secret,id=pip-index-url,env=PIP_INDEX_URL \\\n"
+    "    --mount=type=secret,id=uv-default-index,env=UV_DEFAULT_INDEX \\\n"
+    "    --mount=type=secret,id=pypi-netrc,target=/run/secrets/pypi-netrc,mode=0444 \\\n"
+    "    "
+)
+
+_PYPI_ENV = "export NETRC=/run/secrets/pypi-netrc && \\\n    "
+
+
+def parse_platform(platform_str: str) -> str:
+    """Normalize a --platform value to the template variable used by Jinja2.
+
+    Accepts Docker-style values (linux/amd64, linux/arm64) or short form (amd64,
+    arm64, x86_64), and comma-separated lists for multi-arch
+    (linux/amd64,linux/arm64).
+
+    Returns one of: 'amd64', 'arm64', or 'multi'.
+
+    Raises ValueError for unrecognized architecture values.
+    """
+    parts = [p.strip() for p in platform_str.split(",")]
+    archs = [p.split("/")[-1] for p in parts]
+    for arch in archs:
+        if arch not in _VALID_ARCHS:
+            raise ValueError(
+                f"Unrecognized architecture '{arch}' in --platform '{platform_str}'. "
+                f"Valid architectures: {', '.join(sorted(_VALID_ARCHS))}"
+            )
+    if len(archs) > 1:
+        return "multi"
+    return archs[0]
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Renders dynamo Dockerfiles from templates"
+    )
+    parser.add_argument(
+        "--framework",
+        type=str,
+        default="vllm",
+        choices=["dynamo", "vllm", "sglang", "trtllm", "triton"],
+        help="Dockerfile framework to use",
+    )
+
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="cuda",
+        choices=["cuda", "xpu", "cpu"],
+        help="Dockerfile device to use",
+    )
+
+    parser.add_argument(
+        "--target",
+        type=str,
+        default="runtime",
+        help="Dockerfile target to use. Non-exhaustive examples: [runtime, dev, local-dev]",
+    )
+    parser.add_argument(
+        "--platform",
+        type=str,
+        default="linux/amd64",
+        help=(
+            "Target platform(s), Docker-style. Examples:\n"
+            "  linux/amd64            single-arch amd64 build\n"
+            "  linux/arm64            single-arch arm64 build\n"
+            "  linux/amd64,linux/arm64  multi-arch build; the rendered Dockerfile uses\n"
+            "                         Docker BuildX TARGETARCH directly (set per platform\n"
+            "                         by: docker buildx build --platform linux/amd64,linux/arm64)"
+        ),
+    )
+    parser.add_argument(
+        "--cuda-version",
+        type=str,
+        default="13.0",
+        choices=["13.0", "13.4"],
+        help=(
+            "CUDA version to use. [13.0 for vllm and sglang, 13.4 for trtllm].\n"
+            "Not required for non-cuda devices.\n"
+            "Not supported by Triton - CUDA version is predefined by its release image."
+        ),
+    )
+    parser.add_argument("--make-efa", action="store_true", help="Enable AWS EFA")
+    parser.add_argument(
+        "--variant",
+        type=str,
+        default="",
+        choices=["", "enterprise"],
+        help=(
+            "Optional runtime variant from context.yaml's <framework>.variants.\n"
+            "  enterprise  vllm cuda runtime on the NIM vLLM enterprise base"
+        ),
+    )
+    parser.add_argument(
+        "--output-short-filename",
+        action="store_true",
+        help="Output filename is rendered.Dockerfile instead of <framework>-<target>-cuda<cuda_version>-<arch>-rendered.Dockerfile",
+    )
+    parser.add_argument(
+        "--show-result",
+        action="store_true",
+        help="Prints the rendered Dockerfile to stdout.",
+    )
+    args = parser.parse_args()
+    return args
+
+
+def validate_args(args):
+    valid_inputs = {
+        "vllm": {
+            "device": ["cuda", "xpu", "cpu"],
+            "target": [
+                "runtime",
+                "dev",
+                "local-dev",
+                "wheel_builder",
+                "base",
+            ],
+            "cuda_version": ["13.0"],
+        },
+        "trtllm": {
+            "device": ["cuda"],
+            "target": [
+                "runtime",
+                "dev",
+                "local-dev",
+                "wheel_builder",
+                "base",
+            ],
+            "cuda_version": ["13.4"],
+        },
+        "sglang": {
+            "device": ["cuda", "xpu"],
+            "target": [
+                "runtime",
+                "dev",
+                "local-dev",
+                "wheel_builder",
+                "base",
+            ],
+            "cuda_version": ["13.0"],
+        },
+        "triton": {
+            "device": ["cuda"],
+            # Triton is runtime-only: Dynamo is installed from prebuilt PyPI wheels
+            # on top of the upstream Triton release image, so the from-source targets
+            # (dev/local-dev/wheel_builder/base) do not apply.
+            "target": [
+                "runtime",
+            ],
+            "cuda_version": ["13.4"],
+        },
+        "dynamo": {
+            "device": ["cuda"],
+            "target": [
+                "runtime",
+                "dev",
+                "local-dev",
+                "frontend",
+                "planner",
+                "wheel_builder",
+                "base",
+            ],
+            "cuda_version": ["13.0"],
+        },
+    }
+
+    # Triton's CUDA family is fixed by its release image, so it cannot be chosen
+    # by the user: reject an explicitly-passed --cuda-version (detected from argv
+    # since the arg has a default) and pin it to Triton's single valid value.
+    if args.framework == "triton":
+        if any(
+            a == "--cuda-version" or a.startswith("--cuda-version=") for a in sys.argv
+        ):
+            raise ValueError(
+                "--cuda-version cannot be specified for triton: its CUDA family is "
+                "fixed by the Triton release image."
+            )
+        args.cuda_version = valid_inputs["triton"]["cuda_version"][0]
+
+    if args.variant == "enterprise" and not (
+        args.framework == "vllm"
+        and args.device == "cuda"
+        and args.target == "runtime"
+        and not args.make_efa
+    ):
+        raise ValueError(
+            "--variant enterprise requires --framework vllm --device cuda "
+            "--target runtime without --make-efa"
+        )
+
+    if args.framework in valid_inputs:
+        cuda_version_valid = (
+            args.device != "cuda"
+            or args.cuda_version in valid_inputs[args.framework]["cuda_version"]
+        )
+        if (
+            args.target in valid_inputs[args.framework]["target"]
+            and cuda_version_valid
+            and args.device in valid_inputs[args.framework]["device"]
+        ):
+            # XPU is only supported on amd64 (Intel discrete GPUs)
+            if args.device == "xpu" and args.platform != "amd64":
+                raise ValueError(
+                    f"XPU builds require --platform linux/amd64, "
+                    f"got '{args.platform}'"
+                )
+            return
+
+        raise ValueError(
+            f"Invalid input combination: [framework={args.framework},target={args.target},cuda_version={args.cuda_version},device={args.device}]"
+        )
+
+    raise ValueError(
+        f"Invalid input combination: [framework={args.framework},target={args.target},cuda_version={args.cuda_version},device={args.device}]"
+    )
+
+
+def _make_jinja_env(script_dir):
+    return Environment(
+        loader=FileSystemLoader(script_dir),
+        trim_blocks=False,
+        lstrip_blocks=True,
+        undefined=StrictUndefined,
+    )
+
+
+def _inject_python_index_mounts(dockerfile: str) -> str:
+    """Mount optional PyPI configuration in every Python package install layer."""
+    instructions = re.split(r"(?=^[A-Z]+\b)", dockerfile, flags=re.MULTILINE)
+    for index, instruction in enumerate(instructions):
+        # BuildKit strips full-line comments before parsing RUN flags; ignore them here too.
+        code = re.sub(r"(?m)^[ \t]*#[^\n]*$", "", instruction)
+        if not instruction.startswith("RUN ") or not _PYTHON_PACKAGE_DOWNLOAD_RE.search(
+            code
+        ):
+            continue
+
+        instructions[index] = re.sub(
+            r"^RUN (?P<mounts>(?:(?:--mount=[^\n]*\\|#[^\n]*)\n[ \t]+)*)",
+            lambda match: _PYPI_RUN_PREFIX + match.group("mounts") + _PYPI_ENV,
+            instruction,
+            count=1,
+        )
+
+    return "".join(instructions)
+
+
+def _render_context(args, context=None):
+    # device_key is the lookup key into context.yaml's per-device dict
+    # (e.g. "cuda12.9", "xpu"). Computed here so it's available to every
+    # included template — `{% set device_key = ... %}` inside an
+    # included file doesn't propagate to peer includes in Jinja's
+    # default scoping rules.
+    device_key = (
+        args.device + args.cuda_version if args.device == "cuda" else args.device
+    )
+    # Compliance Jinja vars consumed by templates/compliance.Dockerfile.
+    # Computed here (not in the template) so the per-target lookup
+    # against context.yaml stays in Python and the template stays declarative.
+    (
+        compliance_base_stage,
+        compliance_baseline_sbom,
+        compliance_ecosystems,
+        compliance_source_ecosystem_flags,
+    ) = _resolve_compliance_inputs(args.framework, args.target, device_key, context)
+    return dict(
+        framework=args.framework,
+        device=args.device,
+        device_key=device_key,
+        target=args.target,
+        platform=args.platform,
+        cuda_version=args.cuda_version,
+        make_efa=args.make_efa,
+        variant=args.variant,
+        compliance_base_stage=compliance_base_stage,
+        compliance_baseline_sbom=compliance_baseline_sbom,
+        compliance_ecosystems=compliance_ecosystems,
+        compliance_source_ecosystem_flags=compliance_source_ecosystem_flags,
+    )
+
+
+def _resolve_compliance_inputs(framework, target, device_key, context):
+    """Return (base_stage, baseline_sbom, ecosystems, source_ecosystem_flags).
+
+    The shared compliance template needs to know:
+      - which earlier stage to FROM (pre_runtime / planner_builder)
+      - which baseline SBOM file to subtract (may be empty if not captured)
+      - which ecosystems to scan. planner is distroless-python: it ships the
+        venv (python), the runtime wheel's crates (rust) and a few native
+        binaries, but none of planner_builder's Debian packages — so it drops
+        dpkg to avoid attributing builder-only packages. dash is carried via
+        native and libgomp via the base SBOM instead.
+    All depend on `target` + `framework` + `device_key`, so the lookup lives
+    here rather than being repeated as Jinja expressions per template.
+    """
+    full_ecosystems = "python,rust,dpkg,native"
+    full_source_flags = "--ecosystem dpkg --ecosystem rust --ecosystem native"
+    if context is None:
+        return "pre_runtime", "", full_ecosystems, full_source_flags
+    if target == "planner":
+        # planner is framework=dynamo, but its distroless-python base differs
+        # from dynamo-runtime's, so it carries its own baseline stem.
+        return (
+            "planner_builder",
+            context.get("dynamo", {}).get("planner_baseline_sbom", ""),
+            "python,rust,native",
+            "--ecosystem rust --ecosystem native",
+        )
+    if target == "frontend":
+        # frontend is framework-agnostic (its ubuntu base is shared across
+        # frameworks), so it carries its own baseline stem under `dynamo`.
+        return (
+            "pre_frontend",
+            context.get("dynamo", {}).get("frontend_baseline_sbom", ""),
+            full_ecosystems,
+            full_source_flags,
+        )
+    # runtime / dev / local-dev / wheel_builder / base / framework
+    return (
+        "pre_runtime",
+        context.get(framework, {}).get(device_key, {}).get("baseline_sbom", ""),
+        full_ecosystems,
+        full_source_flags,
+    )
+
+
+def render(args, context, script_dir):
+    env = _make_jinja_env(script_dir)
+    template = env.get_template("Dockerfile.template")
+    rendered = template.render(context=context, **_render_context(args, context))
+    # Replace all instances of 3+ newlines with 2 newlines
+    cleaned = re.sub(r"\n{3,}", "\n\n", rendered)
+    cleaned = _inject_python_index_mounts(cleaned)
+
+    if args.output_short_filename:
+        filename = "rendered.Dockerfile"
+    else:
+        variant = f"-{args.variant}" if args.variant else ""
+        filename = f"{args.framework}-{args.target}{variant}-{args.device}{args.cuda_version}-{args.platform}-rendered.Dockerfile"
+
+    with open(f"{script_dir}/{filename}", "w") as f:
+        f.write(cleaned)
+
+    if args.show_result:
+        print("##############")
+        print("# Dockerfile #")
+        print("##############")
+        print(cleaned)
+        print("##############")
+
+    print(f"INFO: Generated Dockerfile written to {script_dir}/{filename}")
+
+
+def apply_variant(context, framework, device_key, variant):
+    """Overlay <framework>.variants.<variant>.<device_key> onto the device block."""
+    if not variant:
+        return context
+    try:
+        overlay = context[framework]["variants"][variant][device_key]
+    except KeyError:
+        raise ValueError(
+            f"context.yaml has no {framework}.variants.{variant}.{device_key} block"
+        ) from None
+    context = copy.deepcopy(context)
+    context[framework][device_key].update(overlay)
+    return context
+
+
+def main():
+    args = parse_args()
+    # Normalize platform to template variable ('amd64', 'arm64', or 'multi')
+    # and store it back so render() and validate_args() both see the normalized form.
+    args.platform = parse_platform(args.platform)
+    validate_args(args)
+    # Clear cuda version for non-cuda device
+    if args.device != "cuda":
+        args.cuda_version = ""
+    script_dir = Path(__file__).parent
+    with open(f"{script_dir}/context.yaml", "r") as f:
+        context = yaml.safe_load(f)
+    device_key = (
+        args.device + args.cuda_version if args.device == "cuda" else args.device
+    )
+    context = apply_variant(context, args.framework, device_key, args.variant)
+
+    render(args, context, script_dir)
+
+    if args.target == "local-dev":
+        print(
+            "INFO: Remember to add --build-arg values for USER_UID and USER_GID when building a local-dev image!"
+        )
+        print(
+            "      Recommendation: --build-arg USER_UID=$(id -u) --build-arg USER_GID=$(id -g)"
+        )
+
+
+if __name__ == "__main__":
+    main()

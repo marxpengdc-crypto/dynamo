@@ -1,0 +1,189 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package v1alpha1
+
+import (
+	"fmt"
+	"strings"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	"github.com/ai-dynamo/dynamo/deploy/operator/internal/consts"
+)
+
+// DynamoModelSpec defines the desired state of DynamoModel
+type DynamoModelSpec struct {
+	// ModelName is the full model identifier (e.g., "meta-llama/Llama-3.3-70B-Instruct-lora")
+	// +required
+	ModelName string `json:"modelName"`
+
+	// BaseModelName is the base model identifier that matches the service label
+	// This is used to discover endpoints via headless services
+	// +required
+	BaseModelName string `json:"baseModelName"`
+
+	// ModelType specifies the type of model (e.g., "base", "lora", "adapter")
+	// +kubebuilder:validation:Enum=base;lora;adapter
+	// +kubebuilder:default=base
+	// +optional
+	ModelType string `json:"modelType,omitempty"`
+
+	// Source specifies the model source location (only applicable for lora model type)
+	// +optional
+	Source *ModelSource `json:"source,omitempty"`
+}
+
+// ModelSource defines the source location of a model
+type ModelSource struct {
+	// URI is the model source URI
+	// Supported formats:
+	// - S3: s3://bucket/path/to/model
+	// - HuggingFace: hf://org/model@revision_sha
+	// - Local filesystem: file:///path/to/model
+	// +required
+	URI string `json:"uri"`
+}
+
+// EndpointInfo represents a single endpoint (pod) serving the model
+type EndpointInfo struct {
+	// Address is the full address of the endpoint (e.g., "http://10.0.1.5:9090")
+	// +required
+	Address string `json:"address"`
+
+	// PodName is the name of the pod serving this endpoint
+	// +optional
+	PodName string `json:"podName,omitempty"`
+
+	// Ready indicates whether this endpoint is ready to serve traffic.
+	// For LoRA models: true only if this endpoint's lifecycle request succeeded.
+	// For base models: always false (no probing performed).
+	// +required
+	Ready bool `json:"ready"`
+
+	// LoRAFallbackCovered indicates a legacy prefill endpoint that cannot manage
+	// LoRAs itself is covered by a capable prefill in the same topology during a
+	// rolling upgrade. It does not make this endpoint ready to serve the adapter.
+	// +optional
+	LoRAFallbackCovered bool `json:"loraFallbackCovered,omitempty"`
+}
+
+// DynamoModelStatus defines the observed state of DynamoModel
+type DynamoModelStatus struct {
+	// Endpoints is the current list of all endpoints for this model
+	// +optional
+	Endpoints []EndpointInfo `json:"endpoints,omitempty"`
+
+	// ReadyEndpoints is the count of endpoints that are ready
+	// +required
+	ReadyEndpoints int `json:"readyEndpoints"`
+
+	// LoRAFallbackCoveredEndpoints is the count of legacy prefill endpoints
+	// covered by a capable prefill during a rolling upgrade. These endpoints are
+	// excluded from ReadyEndpoints because they cannot serve the adapter directly.
+	// +optional
+	LoRAFallbackCoveredEndpoints int `json:"loraFallbackCoveredEndpoints,omitempty"`
+
+	// TotalEndpoints is the total count of endpoints
+	// +required
+	TotalEndpoints int `json:"totalEndpoints"`
+
+	// Conditions represents the latest available observations of the model's state
+	// +optional
+	Conditions []metav1.Condition `json:"conditions,omitempty"`
+}
+
+// +genclient
+// +kubebuilder:object:root=true
+// +kubebuilder:subresource:status
+// +kubebuilder:storageversion
+// +kubebuilder:printcolumn:name="BaseModel",type="string",JSONPath=".spec.baseModelName",description="Base model name"
+// +kubebuilder:printcolumn:name="Type",type="string",JSONPath=".spec.modelType",description="Model type"
+// +kubebuilder:printcolumn:name="Ready",type="integer",JSONPath=".status.readyEndpoints",description="Ready endpoints"
+// +kubebuilder:printcolumn:name="Total",type="integer",JSONPath=".status.totalEndpoints",description="Total endpoints"
+// +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
+// +kubebuilder:resource:shortName=dm
+// DynamoModel is the Schema for the dynamo models API
+type DynamoModel struct {
+	metav1.TypeMeta `json:",inline"`
+	// +optional
+	metav1.ObjectMeta `json:"metadata,omitempty"`
+
+	// +optional
+	Spec DynamoModelSpec `json:"spec,omitempty"`
+	// +optional
+	Status DynamoModelStatus `json:"status,omitempty"`
+}
+
+// +kubebuilder:object:root=true
+
+// DynamoModelList contains a list of DynamoModel
+type DynamoModelList struct {
+	metav1.TypeMeta `json:",inline"`
+	metav1.ListMeta `json:"metadata,omitempty"`
+	Items           []DynamoModel `json:"items"`
+}
+
+// IsLoRA returns true if this is a LoRA model (case-insensitive)
+func (m *DynamoModel) IsLoRA() bool {
+	return strings.EqualFold(m.Spec.ModelType, "lora")
+}
+
+// GetReadyEndpoints returns only the endpoints that are ready
+func (m *DynamoModel) GetReadyEndpoints() []EndpointInfo {
+	var ready []EndpointInfo
+	for _, ep := range m.Status.Endpoints {
+		if ep.Ready {
+			ready = append(ready, ep)
+		}
+	}
+	return ready
+}
+
+// HasEndpoints returns true if the model has any endpoints
+func (m *DynamoModel) HasEndpoints() bool {
+	return len(m.Status.Endpoints) > 0
+}
+
+// HasReadyEndpoints returns true if the model has any ready endpoints
+func (m *DynamoModel) HasReadyEndpoints() bool {
+	return m.Status.ReadyEndpoints > 0
+}
+
+// IsReady returns true if all endpoints are ready
+func (m *DynamoModel) IsReady() (bool, string) {
+	if m.Status.TotalEndpoints == 0 {
+		return false, "No endpoints configured"
+	}
+	effectiveReadyEndpoints := m.Status.ReadyEndpoints + m.Status.LoRAFallbackCoveredEndpoints
+	if effectiveReadyEndpoints == 0 {
+		return false, "No endpoints ready"
+	}
+	if effectiveReadyEndpoints < m.Status.TotalEndpoints {
+		return false, fmt.Sprintf("Only %d/%d endpoints ready", effectiveReadyEndpoints, m.Status.TotalEndpoints)
+	}
+	return true, ""
+}
+
+// GetState returns "ready" or "not_ready" based on endpoint status
+func (m *DynamoModel) GetState() string {
+	ready, _ := m.IsReady()
+	if ready {
+		return consts.ResourceStateReady
+	}
+	return consts.ResourceStateNotReady
+}

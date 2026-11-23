@@ -1,0 +1,1207 @@
+// SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+//! Prompt formatting (lib/llm side).
+//!
+//! The reusable chat-template / prompt-formatting engine lives in the
+//! standalone, runtime-free [`dynamo_renderer`] crate. This module holds only the
+//! lib/llm-local glue that can't live there:
+//!   * implements [`OAIChatLikeRequest`] for Dynamo's `Nv*` request wrappers,
+//!   * keeps media-IO config off the rendering trait via [`MediaRequestExt`]
+//!     (so `dynamo_renderer` need not depend on the media module),
+//!   * adapts a [`ModelDeploymentCard`] into a [`PromptFormatter`]
+//!     ([`prompt_formatter_from_mdc`]).
+//!
+//! Everything else imports from `dynamo_renderer` directly.
+
+use anyhow::{Context, Result};
+use minijinja::value::Value;
+
+use dynamo_renderer::{
+    ChatTemplate, ChatTemplateValue, ContextMixins, OAIChatLikeRequest, PromptFormatter,
+    PromptInput, RenderedPrompt, RenderedSegment, TextInput, TokenInput, kimi_k3_formatter_for,
+    may_be_fix_tool_schema, native_formatter_for,
+};
+
+use crate::model_card::{
+    ModelDeploymentCard, PromptFormatterArtifact, TekkenMetadata, TokenizerKind,
+};
+use crate::protocols::openai::{
+    chat_completions::NvCreateChatCompletionRequest, completions::NvCreateCompletionRequest,
+};
+
+/// lib/llm-local extension carrying multimodal media-IO config. Kept off
+/// [`OAIChatLikeRequest`] so `dynamo_renderer` stays free of the media module;
+/// the multimodal preprocessing path bounds on `OAIChatLikeRequest + MediaRequestExt`.
+///
+/// Opaque JSON: the frontend only interprets it when it owns decoding, so options
+/// belonging to the worker pass through untouched.
+pub trait MediaRequestExt {
+    fn media_io_kwargs(&self) -> Option<&serde_json::Value>;
+}
+
+/// Parse a JSON object string into a serde_json Map, preserving the exact
+/// spelling of numbers that cannot be round-tripped through f64 without loss.
+/// Numbers that survive f64 conversion unchanged are kept as `Value::Number`;
+/// numbers that would be corrupted (e.g. integers with >15 significant digits)
+/// are kept as `Value::String` so the original value is available to templates.
+/// Returns `None` when the top-level JSON value is not an object.
+fn parse_args_object(
+    s: &str,
+) -> anyhow::Result<Option<serde_json::Map<String, serde_json::Value>>> {
+    // First pass: parse the top-level value to check it is an object.
+    let top: serde_json::Value = serde_json::from_str(s)?;
+    let top_obj = match top {
+        serde_json::Value::Object(m) => m,
+        _ => return Ok(None),
+    };
+
+    // Second pass: re-parse each entry's value via its RawValue to detect
+    // numbers that serde_json would corrupt through f64.
+    // We use a raw string-to-rawvalue helper to get the exact bytes.
+    let mut out = serde_json::Map::with_capacity(top_obj.len());
+    for (k, cooked) in top_obj {
+        // For non-numbers, use the already-parsed value directly.
+        if !cooked.is_number() {
+            out.insert(k, cooked);
+            continue;
+        }
+        // For numbers: find the raw token in the source string so we can
+        // verify that serde_json's f64 representation matches the original.
+        // We do this by re-serializing the cooked number and comparing.
+        let cooked_str = cooked.to_string();
+        if let Some(raw_token) = extract_value_token(s, &k) {
+            let raw_trimmed = raw_token.trim();
+            if raw_trimmed != cooked_str.as_str() {
+                // Precision was lost (e.g. 30-digit integer → 1.23e+29).
+                // Keep the original spelling as a string.
+                out.insert(k, serde_json::Value::String(raw_trimmed.to_string()));
+                continue;
+            }
+        }
+        out.insert(k, cooked);
+    }
+    Ok(Some(out))
+}
+
+/// Extract the raw JSON token for `key` from a JSON object string `s`.
+/// Returns `None` when the key is not found or parsing fails.
+fn extract_value_token<'a>(s: &'a str, key: &str) -> Option<&'a str> {
+    // Build the escaped key as it appears in JSON.
+    let key_json = serde_json::to_string(key).ok()?;
+    // Find `"key":` in the source.
+    let needle = format!("{}:", key_json);
+    let start = s.find(needle.as_str())?;
+    let after_colon = s[start + needle.len()..].trim_start();
+    // Measure the extent of the JSON token.
+    let end = token_end(after_colon)?;
+    let source_offset = s.len() - s[start + needle.len()..].len()
+        + (after_colon.as_ptr() as usize - s[start + needle.len()..].as_ptr() as usize);
+    Some(&s[source_offset..source_offset + end])
+}
+
+/// Return the byte length of the first JSON token in `s`.
+fn token_end(s: &str) -> Option<usize> {
+    let s = s.trim_start();
+    let first = s.chars().next()?;
+    match first {
+        '"' => {
+            let mut i = 1;
+            let b = s.as_bytes();
+            while i < b.len() {
+                if b[i] == b'\\' {
+                    i += 2;
+                } else if b[i] == b'"' {
+                    return Some(i + 1);
+                } else {
+                    i += 1;
+                }
+            }
+            None
+        }
+        '{' | '[' => {
+            // Skip balanced braces/brackets — good enough for flat objects.
+            let (open, close) = if first == '{' {
+                (b'{', b'}')
+            } else {
+                (b'[', b']')
+            };
+            let mut depth = 0i32;
+            let mut in_str = false;
+            let mut escape = false;
+            for (i, &b) in s.as_bytes().iter().enumerate() {
+                if escape {
+                    escape = false;
+                    continue;
+                }
+                if in_str {
+                    if b == b'\\' {
+                        escape = true;
+                    } else if b == b'"' {
+                        in_str = false;
+                    }
+                } else {
+                    match b {
+                        b'"' => in_str = true,
+                        b if b == open => depth += 1,
+                        b if b == close => {
+                            depth -= 1;
+                            if depth == 0 {
+                                return Some(i + 1);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            None
+        }
+        _ => {
+            // Number, bool, null — ends at first delimiter.
+            let end = s
+                .find(|c: char| c == ',' || c == '}' || c == ']' || c.is_whitespace())
+                .unwrap_or(s.len());
+            if end == 0 { None } else { Some(end) }
+        }
+    }
+}
+
+/// Parse `tool_calls[*].function.arguments` from JSON string to object before
+/// handing messages to MiniJinja. Some chat templates (e.g. GLM-5.2) call
+/// `.items()` on arguments and require a dict; the OpenAI wire format carries
+/// arguments as a JSON string. This matches TRT-LLM's chat_utils.py behaviour.
+///
+/// Large integer values in arguments are preserved exactly because `dynamo-llm`
+/// enables the `serde_json/arbitrary_precision` feature.
+///
+/// Returns an error if any tool_call's arguments string contains invalid JSON,
+/// so callers can surface a 400-style error instead of fabricating empty args.
+pub(crate) fn normalize_tool_call_arguments(
+    messages_json: &mut serde_json::Value,
+) -> anyhow::Result<()> {
+    let Some(messages) = messages_json.as_array_mut() else {
+        return Ok(());
+    };
+    for message in messages {
+        let Some(tool_calls) = message
+            .get_mut("tool_calls")
+            .and_then(serde_json::Value::as_array_mut)
+        else {
+            continue;
+        };
+        for tc in tool_calls.iter_mut() {
+            let Some(args_str) = tc.pointer("/function/arguments").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            // Empty string is a valid no-argument call; normalise to {}.
+            if args_str.is_empty() {
+                if let Some(obj) = tc
+                    .get_mut("function")
+                    .and_then(serde_json::Value::as_object_mut)
+                {
+                    obj.insert(
+                        "arguments".to_string(),
+                        serde_json::Value::Object(serde_json::Map::new()),
+                    );
+                }
+                continue;
+            }
+            let value = match parse_args_object(args_str) {
+                Ok(Some(map)) => serde_json::Value::Object(map),
+                Ok(None) => {
+                    // Scalar or array — GLM's .items() would panic at render time.
+                    tracing::warn!(
+                        args_len = args_str.len(),
+                        "tool_call arguments parsed to a non-object; \
+                         substituting {{}} for template safety"
+                    );
+                    serde_json::Value::Object(serde_json::Map::new())
+                }
+                Err(e) => {
+                    anyhow::bail!(
+                        "tool_call arguments are not valid JSON (len={}): {e}",
+                        args_str.len()
+                    );
+                }
+            };
+            if let Some(obj) = tc
+                .get_mut("function")
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                obj.insert("arguments".to_string(), value);
+            }
+        }
+    }
+    Ok(())
+}
+
+impl OAIChatLikeRequest for NvCreateChatCompletionRequest {
+    fn model(&self) -> String {
+        self.inner.model.clone()
+    }
+
+    fn messages(&self) -> Value {
+        let messages_json = self.template_messages_json();
+        Value::from_serialize(&messages_json)
+    }
+
+    fn template_messages_json_override(&self) -> Option<serde_json::Value> {
+        self.responses_tools
+            .as_ref()
+            .filter(|context| !context.history_phases.is_empty())
+            .map(|_| self.template_messages_json())
+    }
+
+    fn typed_messages(&self) -> Option<&[dynamo_protocols::types::ChatCompletionRequestMessage]> {
+        Some(self.inner.messages.as_slice())
+    }
+
+    fn tools(&self) -> Option<Value> {
+        if let Some(tools) = self.declared_template_tools() {
+            return may_be_fix_tool_schema(tools);
+        }
+        let tools = self
+            .chat_template_tools
+            .as_deref()
+            .or(self.inner.tools.as_deref())?;
+        // Custom tools use the function schema before template-specific repair.
+        may_be_fix_tool_schema(
+            serde_json::to_value(
+                tools
+                    .iter()
+                    .map(|tool| tool.function_template_tool())
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap(),
+        )
+    }
+
+    fn template_tools(&self) -> Option<minijinja::value::Value> {
+        self.native_template_tools()
+    }
+
+    fn raw_tools(&self) -> Option<Value> {
+        self.inner.tools.as_ref().map(Value::from_serialize)
+    }
+
+    fn tool_choice(&self) -> Option<Value> {
+        self.inner
+            .tool_choice
+            .as_ref()
+            .map(|choice| Value::from_serialize(choice.function_template_choice()))
+    }
+
+    fn response_format(&self) -> Option<Value> {
+        self.inner
+            .response_format
+            .as_ref()
+            .map(Value::from_serialize)
+    }
+
+    fn should_add_generation_prompt(&self) -> bool {
+        // vLLM / HF: continue_final_message leaves the last turn open, which is
+        // incompatible with appending a new generation prompt. Validation already
+        // rejects the omitted/true add_generation_prompt combination; keep this
+        // guard so internal callers that skip ValidateRequest still match HF.
+        if self.common.continue_final_message == Some(true) {
+            return false;
+        }
+        self.common.add_generation_prompt.unwrap_or(true)
+    }
+
+    fn extract_text(&self) -> Option<TextInput> {
+        Some(TextInput::Single(String::new()))
+    }
+
+    fn chat_template_args(&self) -> Option<&std::collections::HashMap<String, serde_json::Value>> {
+        self.chat_template_args.as_ref()
+    }
+
+    fn mm_processor_kwargs(&self) -> Option<&serde_json::Value> {
+        self.inner.mm_processor_kwargs.as_ref()
+    }
+}
+
+impl MediaRequestExt for NvCreateChatCompletionRequest {
+    fn media_io_kwargs(&self) -> Option<&serde_json::Value> {
+        self.media_io_kwargs.as_ref()
+    }
+}
+
+impl OAIChatLikeRequest for NvCreateCompletionRequest {
+    fn model(&self) -> String {
+        self.inner.model.clone()
+    }
+    fn messages(&self) -> minijinja::value::Value {
+        let message = dynamo_protocols::types::ChatCompletionRequestMessage::User(
+            dynamo_protocols::types::ChatCompletionRequestUserMessage {
+                content: dynamo_protocols::types::ChatCompletionRequestUserMessageContent::Text(
+                    crate::protocols::openai::completions::prompt_to_string(&self.inner.prompt),
+                ),
+                name: None,
+            },
+        );
+
+        minijinja::value::Value::from_serialize(vec![message])
+    }
+
+    fn should_add_generation_prompt(&self) -> bool {
+        true
+    }
+
+    fn prompt_input_type(&self) -> PromptInput {
+        match &self.inner.prompt {
+            dynamo_protocols::types::Prompt::IntegerArray(_) => {
+                PromptInput::Tokens(TokenInput::Single(vec![]))
+            }
+            dynamo_protocols::types::Prompt::ArrayOfIntegerArray(_) => {
+                PromptInput::Tokens(TokenInput::Batch(vec![]))
+            }
+            dynamo_protocols::types::Prompt::String(_) => {
+                PromptInput::Text(TextInput::Single(String::new()))
+            }
+            dynamo_protocols::types::Prompt::StringArray(_) => {
+                PromptInput::Text(TextInput::Batch(vec![]))
+            }
+        }
+    }
+
+    fn extract_tokens(&self) -> Option<TokenInput> {
+        match &self.inner.prompt {
+            dynamo_protocols::types::Prompt::IntegerArray(tokens) => {
+                Some(TokenInput::Single(tokens.clone()))
+            }
+            dynamo_protocols::types::Prompt::ArrayOfIntegerArray(arrays) => {
+                Some(TokenInput::Batch(arrays.clone()))
+            }
+            _ => None,
+        }
+    }
+
+    fn extract_text(&self) -> Option<TextInput> {
+        match &self.inner.prompt {
+            dynamo_protocols::types::Prompt::String(text) => {
+                Some(TextInput::Single(text.to_string()))
+            }
+            dynamo_protocols::types::Prompt::StringArray(texts) => {
+                Some(TextInput::Batch(texts.to_vec()))
+            }
+            _ => None,
+        }
+    }
+}
+
+impl MediaRequestExt for NvCreateCompletionRequest {
+    fn media_io_kwargs(&self) -> Option<&serde_json::Value> {
+        None
+    }
+}
+
+/// Build a [`PromptFormatter`] from a [`ModelDeploymentCard`].
+///
+/// Mistral checkpoints with a `tekken.json` tokenizer, and model families whose
+/// HF repos ship no Jinja `chat_template`, get a native Rust formatter;
+/// everything else loads the
+/// HF `tokenizer_config.json` template (and any separate chat-template file)
+/// and builds via [`PromptFormatter::from_parts`].
+pub fn prompt_formatter_from_mdc(mdc: &ModelDeploymentCard) -> Result<PromptFormatter> {
+    // Mistral checkpoints with a tekken.json tokenizer get Mistral's own renderer.
+    // It builds each prompt exactly the way the mistral-common library does, which
+    // is also what stock vLLM uses for these checkpoints by default.
+    //
+    // The public mistralai/Mistral-Large-4-1T-A52B and
+    // mistralai/Mistral-Large-4-1T-A52B-NVFP4 also ship a Hugging Face
+    // chat_template.jinja and tokenizer.json. We don't use them, for two reasons:
+    // - The NVFP4 checkpoint has no config.json, so its card has no Hugging Face
+    //   tokenizer or template to use.
+    // - Their prompts can differ from mistral-common's. The template copies each
+    //   tool exactly as the client sent it, while mistral-common rewrites every
+    //   tool into one fixed shape, so a tool with `"strict": true`, no description,
+    //   or its keys in another order gives different tokens. And tokenizer.json
+    //   reads `[INST]` typed by a user as the real `[INST]` marker, while
+    //   mistral-common keeps it as plain text.
+    //
+    // A checkpoint that has config.json can still use its template: pass it as a
+    // custom chat template, and the card then skips tekken.json.
+    if let Some(checked_file) = mdc.tokenizer.as_ref().and_then(TokenizerKind::tekken_file) {
+        let metadata = TekkenMetadata::from_checked_file(checked_file)?;
+        let version = metadata
+            .version()
+            .context("tekken.json has no numeric version")?;
+        let formatter = dynamo_renderer::mistral::MistralFormatter::new(
+            version,
+            metadata.model_settings_builder(),
+        )?;
+        return Ok(PromptFormatter::OAI(std::sync::Arc::new(formatter)));
+    }
+
+    // Prefer the authoritative `model_type` from config.json — it's set by the
+    // model author and survives any `--served-model-name` rename. An empty
+    // `model_type` carries no signal — normalize to `None` so the display-name
+    // fallback still runs.
+    let model_type_lower = mdc
+        .model_info
+        .as_ref()
+        .and_then(|info| info.get_model_info().ok())
+        .map(|info| info.model_type().to_lowercase())
+        .filter(|s| !s.is_empty());
+    let display_name_lower = mdc.display_name.to_lowercase();
+
+    if let Some(formatter) = kimi_k3_formatter_for(
+        &model_type_lower,
+        &display_name_lower,
+        mdc.runtime_config.exclude_tools_when_tool_choice_none,
+    ) {
+        return Ok(formatter);
+    }
+
+    if let Some(formatter) = native_formatter_for(&model_type_lower, &display_name_lower) {
+        return Ok(formatter);
+    }
+
+    match mdc
+        .prompt_formatter
+        .as_ref()
+        .ok_or(anyhow::anyhow!("MDC does not contain a prompt formatter"))?
+    {
+        PromptFormatterArtifact::HfTokenizerConfigJson(checked_file) => {
+            let Some(file) = checked_file.path() else {
+                anyhow::bail!(
+                    "HfTokenizerConfigJson for {} is a URL, cannot load",
+                    mdc.display_name
+                );
+            };
+            let contents = std::fs::read_to_string(file).with_context(|| {
+                format!(
+                    "prompt_formatter_from_mdc fs:read_to_string '{}'",
+                    file.display()
+                )
+            })?;
+            let mut config: ChatTemplate = serde_json::from_str(&contents).inspect_err(|err| {
+                crate::log_json_err(&file.display().to_string(), &contents, err)
+            })?;
+
+            // Some HF models (e.g. Llama-4-Maverick) store the chat template in a
+            // separate file, or it may be a custom template provided via CLI flag.
+            match mdc.chat_template_file.as_ref() {
+                Some(PromptFormatterArtifact::HfChatTemplateJinja {
+                    file: checked_file, ..
+                }) => {
+                    let Some(path) = checked_file.path() else {
+                        anyhow::bail!(
+                            "HfChatTemplateJinja for {} is a URL, cannot load",
+                            mdc.display_name
+                        );
+                    };
+                    let chat_template = std::fs::read_to_string(path)
+                        .with_context(|| format!("fs:read_to_string '{}'", path.display()))?;
+                    config.chat_template = Some(ChatTemplateValue(either::Left(chat_template)));
+                }
+                Some(PromptFormatterArtifact::HfChatTemplateJson {
+                    file: checked_file, ..
+                }) => {
+                    let Some(path) = checked_file.path() else {
+                        anyhow::bail!(
+                            "HfChatTemplateJson for {} is a URL, cannot load",
+                            mdc.display_name
+                        );
+                    };
+                    let raw = std::fs::read_to_string(path)
+                        .with_context(|| format!("fs:read_to_string '{}'", path.display()))?;
+                    let wrapper: serde_json::Value = serde_json::from_str(&raw)
+                        .with_context(|| format!("Failed to parse '{}' as JSON", path.display()))?;
+                    let field = wrapper.get("chat_template").ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "'{}' does not contain a 'chat_template' field",
+                            path.display()
+                        )
+                    })?;
+                    let value = serde_json::from_value::<ChatTemplateValue>(field.clone())
+                        .with_context(|| {
+                            format!(
+                                "Failed to deserialize 'chat_template' in '{}'",
+                                path.display()
+                            )
+                        })?;
+                    config.chat_template = Some(value);
+                }
+                _ => {}
+            }
+            PromptFormatter::from_parts(
+                config,
+                mdc.prompt_context
+                    .clone()
+                    .map_or(ContextMixins::default(), |x| ContextMixins::new(&x)),
+                mdc.runtime_config.exclude_tools_when_tool_choice_none,
+            )
+        }
+        PromptFormatterArtifact::HfChatTemplateJinja { .. }
+        | PromptFormatterArtifact::HfChatTemplateJson { .. } => Err(anyhow::anyhow!(
+            "prompt_formatter should not have type HfChatTemplate*"
+        )),
+    }
+}
+
+const CONTINUE_FINAL_MESSAGE_NOT_FOUND: &str =
+    "Unable to continue the final message because it was not found in the rendered chat template.";
+
+/// HuggingFace `render_jinja_template` marker. Appended to last-message content
+/// before render so truncation uniquely identifies the final turn even when the
+/// template rewrites or repeats earlier text.
+pub(crate) const CONTINUE_FINAL_MESSAGE_TAG: &str = "CONTINUE_FINAL_MESSAGE_TAG ";
+
+pub(crate) struct FinalMessageTags {
+    pub start: String,
+    pub end: String,
+}
+
+impl FinalMessageTags {
+    pub fn new() -> Self {
+        let id = uuid::Uuid::new_v4().simple().to_string();
+        Self {
+            start: format!("DYNAMO_FINAL_MESSAGE_{id}_BEGIN"),
+            end: format!("DYNAMO_FINAL_MESSAGE_{id}_END"),
+        }
+    }
+}
+
+/// Append [`CONTINUE_FINAL_MESSAGE_TAG`] to the last message's text content.
+/// Array content uses the last non-empty `text` part, matching Transformers.
+pub(crate) fn append_continue_final_message_tag(
+    messages: &mut serde_json::Value,
+    tags: Option<&FinalMessageTags>,
+) -> Result<()> {
+    let Some(last) = messages.as_array_mut().and_then(|arr| arr.last_mut()) else {
+        anyhow::bail!(CONTINUE_FINAL_MESSAGE_NOT_FOUND);
+    };
+    match last.get_mut("content") {
+        Some(serde_json::Value::String(text)) if !text.is_empty() => {
+            if let Some(tags) = tags {
+                text.insert_str(text.len() - text.trim_start().len(), &tags.start);
+                text.push_str(&tags.end);
+            }
+            text.push_str(CONTINUE_FINAL_MESSAGE_TAG);
+            Ok(())
+        }
+        Some(serde_json::Value::Array(parts)) => {
+            if let Some(tags) = tags {
+                for part in parts.iter_mut() {
+                    if let Some(serde_json::Value::String(text)) = part.get_mut("text")
+                        && !text.is_empty()
+                    {
+                        text.insert_str(text.len() - text.trim_start().len(), &tags.start);
+                        break;
+                    }
+                }
+            }
+            for part in parts.iter_mut().rev() {
+                if let Some(serde_json::Value::String(text)) = part.get_mut("text") {
+                    if text.is_empty() {
+                        continue;
+                    }
+                    if let Some(tags) = tags {
+                        text.push_str(&tags.end);
+                    }
+                    text.push_str(CONTINUE_FINAL_MESSAGE_TAG);
+                    return Ok(());
+                }
+            }
+            anyhow::bail!(CONTINUE_FINAL_MESSAGE_NOT_FOUND);
+        }
+        _ => anyhow::bail!(CONTINUE_FINAL_MESSAGE_NOT_FOUND),
+    }
+}
+
+/// HuggingFace `apply_chat_template(continue_final_message=True)`: after render,
+/// drop the marker and any tokens after it so the prompt ends at the last
+/// message text.
+///
+/// The renderer must have seen [`CONTINUE_FINAL_MESSAGE_TAG`] in the last
+/// message. Searching for the raw last-message string cannot prove the match
+/// belongs to the final turn (a template may rewrite or repeat earlier copies).
+///
+/// When the renderer returned segment boundaries (Kimi K3 XTML), keep them so
+/// tokenization still uses `encode_segments` instead of flattening to plain text.
+/// Missing marker, empty content, or a template that dropped the marker is an
+/// invalid request rather than silently returning the closed prompt.
+pub(crate) fn apply_continue_final_message(prompt: RenderedPrompt) -> Result<RenderedPrompt> {
+    let rendered = prompt.as_str();
+    let tag = CONTINUE_FINAL_MESSAGE_TAG;
+    let tag_name = tag.trim_end();
+    let Some(tag_loc) = rendered.rfind(tag_name) else {
+        anyhow::bail!(CONTINUE_FINAL_MESSAGE_NOT_FOUND);
+    };
+    // Transformers: if the full tag (including trailing space) survived, cut
+    // at the tag. If the template trimmed that space, also rstrip the prefix.
+    let end = if rendered[tag_loc..].starts_with(tag) {
+        tag_loc
+    } else {
+        rendered[..tag_loc].trim_end().len()
+    };
+    Ok(truncate_rendered_prompt(prompt, end))
+}
+
+/// Recover the rendered content boundary without interpreting marker-looking body data.
+/// Preserve tokenization trust segments when removing the temporary render marker.
+pub(crate) fn resolve_final_message_boundary(
+    prompt: RenderedPrompt,
+    tags: &FinalMessageTags,
+    header_marker: &str,
+) -> Result<(RenderedPrompt, usize)> {
+    let rendered = prompt.as_str();
+    let mut bodies = Vec::new();
+    let mut removals = Vec::new();
+    for (start, _) in rendered.match_indices(&tags.start) {
+        let body_start = start + tags.start.len();
+        let end = body_start
+            + rendered[body_start..]
+                .find(&tags.end)
+                .ok_or_else(|| anyhow::anyhow!(CONTINUE_FINAL_MESSAGE_NOT_FOUND))?;
+        anyhow::ensure!(
+            !rendered[body_start..end].contains(&tags.start),
+            "Final-message markers were reordered by the chat template"
+        );
+        bodies.push(start..end + tags.end.len());
+        removals.push(start..body_start);
+        let mut end_marker_end = end + tags.end.len();
+        if rendered[end_marker_end..].starts_with(CONTINUE_FINAL_MESSAGE_TAG) {
+            end_marker_end += CONTINUE_FINAL_MESSAGE_TAG.len();
+        } else if rendered[end_marker_end..].starts_with(CONTINUE_FINAL_MESSAGE_TAG.trim_end()) {
+            end_marker_end += CONTINUE_FINAL_MESSAGE_TAG.trim_end().len();
+        }
+        removals.push(end..end_marker_end);
+    }
+    let last_body = bodies
+        .last()
+        .ok_or_else(|| anyhow::anyhow!(CONTINUE_FINAL_MESSAGE_NOT_FOUND))?;
+    // A template may repeat content before or within the final turn. Only controls
+    // outside all marked content copies can identify its actual rendered header.
+    let header_end = rendered[..last_body.start]
+        .rmatch_indices(header_marker)
+        .find(|(at, _)| !bodies.iter().any(|body| body.contains(at)))
+        .map(|(at, _)| at + header_marker.len())
+        .unwrap_or(0);
+    let header_end = header_end
+        - removals
+            .iter()
+            .filter(|range| range.end <= header_end)
+            .map(|range| range.len())
+            .sum::<usize>();
+    removals.sort_by_key(|range| range.start);
+    let remove_from = |text: &str, offset: usize| {
+        let mut text = text.to_string();
+        for range in removals.iter().rev() {
+            let from = range.start.saturating_sub(offset).min(text.len());
+            let to = range.end.saturating_sub(offset).min(text.len());
+            if from < to {
+                text.replace_range(from..to, "");
+            }
+        }
+        text
+    };
+    let rendered = if let Some(segments) = prompt.segments() {
+        let mut offset = 0;
+        let segments = segments
+            .iter()
+            .filter_map(|segment| {
+                let text = remove_from(&segment.text, offset);
+                offset += segment.text.len();
+                (!text.is_empty()).then_some(RenderedSegment {
+                    text,
+                    allow_special: segment.allow_special,
+                })
+            })
+            .collect();
+        RenderedPrompt::segmented(segments)
+    } else {
+        RenderedPrompt::text(remove_from(prompt.as_str(), 0))
+    };
+    Ok((rendered, header_end))
+}
+
+/// Truncate `prompt` to the first `end` bytes of `as_str()`, preserving
+/// `RenderedSegment` trust boundaries when they are present.
+fn truncate_rendered_prompt(prompt: RenderedPrompt, end: usize) -> RenderedPrompt {
+    let Some(segments) = prompt.segments() else {
+        return RenderedPrompt::text(prompt.as_str()[..end].to_string());
+    };
+    let mut out = Vec::new();
+    let mut offset = 0usize;
+    for seg in segments {
+        let next = offset + seg.text.len();
+        if next <= end {
+            if !seg.text.is_empty() {
+                out.push(seg.clone());
+            }
+            offset = next;
+            if offset == end {
+                break;
+            }
+            continue;
+        }
+        if offset < end {
+            let keep = end - offset;
+            if keep > 0 && keep <= seg.text.len() && seg.text.is_char_boundary(keep) {
+                out.push(RenderedSegment {
+                    text: seg.text[..keep].to_string(),
+                    allow_special: seg.allow_special,
+                });
+            }
+        }
+        break;
+    }
+    if out.is_empty() {
+        RenderedPrompt::text(String::new())
+    } else {
+        RenderedPrompt::segmented(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_tool_call_arguments;
+
+    #[test]
+    fn chat_allowed_tools_renders_catalog_and_constrains_generation_to_subset() {
+        use crate::protocols::openai::{
+            chat_completions::allowed_tools::AllowedToolsRequest, tools::get_json_schema_from_tools,
+        };
+        use dynamo_renderer::{ChatTemplate, ContextMixins, PromptFormatter};
+        use serde_json::json;
+
+        let template: ChatTemplate = serde_json::from_value(json!({
+            "chat_template": "{% for tool in tools %}{{ tool.function.name }} {% endfor %}"
+        }))
+        .unwrap();
+        let PromptFormatter::OAI(formatter) =
+            PromptFormatter::from_parts(template, ContextMixins::new(&[]), true).unwrap();
+        let wire: AllowedToolsRequest = serde_json::from_value(json!({
+            "model": "test",
+            "messages": [{"role": "user", "content": "Look it up"}],
+            "tools": [
+                {"type": "function", "function": {"name": "lookup"}},
+                {"type": "function", "function": {"name": "delete"}}
+            ],
+            "tool_choice": {"type": "allowed_tools", "allowed_tools": {
+                "mode": "required", "tools": [{"type": "function", "function": {"name": "lookup"}}]
+            }}
+        }))
+        .unwrap();
+        let (request, _) = wire.normalize().unwrap();
+        assert_eq!(formatter.render(&request).unwrap().trim(), "lookup delete");
+        let schema = get_json_schema_from_tools(
+            request.inner.tool_choice.as_ref(),
+            request.inner.tools.as_deref(),
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        let alternatives = schema["items"]["anyOf"].as_array().unwrap();
+        assert_eq!(alternatives.len(), 1);
+        assert_eq!(
+            alternatives[0]["properties"]["name"]["enum"],
+            json!(["lookup"])
+        );
+    }
+
+    #[test]
+    fn chat_tool_deferral_reaches_prompt_and_python_request() {
+        use crate::protocols::openai::chat_completions::NvCreateChatCompletionRequest;
+        use dynamo_renderer::{ChatTemplate, ContextMixins, PromptFormatter};
+        use serde_json::json;
+
+        let template = include_str!("../../tests/data/muse_spark_open_deferred_tools.jinja");
+        let config: ChatTemplate =
+            serde_json::from_value(json!({"chat_template": template})).unwrap();
+        let PromptFormatter::OAI(formatter) =
+            PromptFormatter::from_parts(config, ContextMixins::new(&[]), true).unwrap();
+
+        for stream in [false, true] {
+            for nested in [false, true] {
+                let mut tool = json!({"type": "function", "function": {
+                    "name": "lookup", "description": "Find support tickets",
+                    "parameters": {"type": "object", "properties": {
+                        "deferred_query": {"type": "string"}
+                    }}
+                }});
+                if nested {
+                    tool["function"]["defer_loading"] = json!(true);
+                } else {
+                    tool["defer_loading"] = json!(true);
+                }
+                let request: NvCreateChatCompletionRequest = serde_json::from_value(json!({
+                    "model": "muse_spark_open", "stream": stream,
+                    "messages": [{"role": "user", "content": "Find a ticket"}],
+                    "tools": [tool]
+                }))
+                .unwrap();
+                assert!(request.responses_tools.is_none());
+                let rendered = formatter.render(&request).unwrap();
+                assert!(rendered.contains("[deferred: use tool_search to load full schema]"));
+                assert!(!rendered.contains("deferred_query"), "{rendered}");
+                let wire = serde_json::to_value(request).unwrap();
+                assert_eq!(wire["tools"][0]["function"]["defer_loading"], json!(true));
+            }
+        }
+    }
+
+    fn make_tool_call_messages(arguments: &str) -> serde_json::Value {
+        serde_json::json!([{
+            "role": "assistant",
+            "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "function": { "name": "f", "arguments": arguments }
+            }]
+        }])
+    }
+
+    #[test]
+    fn final_message_start_removal_preserves_segments_and_repeated_content() {
+        use dynamo_renderer::{RenderedPrompt, RenderedSegment};
+        let tags = super::FinalMessageTags {
+            start: "BEGIN".into(),
+            end: "FINISH".into(),
+        };
+        let prompt = RenderedPrompt::segmented(vec![
+            RenderedSegment {
+                text: "éHEADERBE".into(),
+                allow_special: true,
+            },
+            RenderedSegment {
+                text: "GINfirstFINISHCONTINUE_FINAL_MESSAGE_TAG BEGINsecondFINISH".into(),
+                allow_special: false,
+            },
+        ]);
+        let (prompt, header_end) =
+            super::resolve_final_message_boundary(prompt, &tags, "HEADER").unwrap();
+        assert_eq!(header_end, "éHEADER".len());
+        assert_eq!(prompt.as_str(), "éHEADERfirstsecond");
+        let segments = prompt.segments().unwrap();
+        assert!(segments[0].allow_special);
+        assert!(!segments[1].allow_special);
+        assert!(super::resolve_final_message_boundary(prompt, &tags, "HEADER").is_err());
+        for malformed in ["HEADERBEGINunfinished", "HEADERBEGINBEGINnestedFINISH"] {
+            assert!(
+                super::resolve_final_message_boundary(
+                    RenderedPrompt::text(malformed.into()),
+                    &tags,
+                    "HEADER"
+                )
+                .is_err()
+            );
+        }
+    }
+
+    /// Regression: large integers must survive the string→object conversion
+    /// without being silently corrupted to an f64 approximation.
+    /// parse_args_object detects precision loss and falls back to Value::String,
+    /// so the original spelling is preserved for the MiniJinja template.
+    #[test]
+    fn normalize_preserves_large_integer() {
+        let big_int = "123456789012345678901234567890";
+        let mut msgs = make_tool_call_messages(&format!("{{\"id\": {big_int}}}"));
+        normalize_tool_call_arguments(&mut msgs).unwrap();
+        let id_slot = &msgs[0]["tool_calls"][0]["function"]["arguments"]["id"];
+        // parse_args_object stores it as Value::String when f64 would lose precision.
+        let preserved = id_slot
+            .as_str()
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| id_slot.to_string());
+        assert_eq!(
+            preserved, big_int,
+            "large integer must not be corrupted by f64 round-trip"
+        );
+    }
+
+    /// Empty arguments string is a valid no-argument call; must normalise to {}
+    /// without emitting a warning or returning an error.
+    #[test]
+    fn normalize_empty_string_becomes_empty_object() {
+        let mut msgs = make_tool_call_messages("");
+        normalize_tool_call_arguments(&mut msgs).unwrap();
+        assert_eq!(
+            msgs[0]["tool_calls"][0]["function"]["arguments"],
+            serde_json::json!({}),
+            "empty arguments string must normalise to an empty object"
+        );
+    }
+
+    /// Malformed JSON in arguments must return an error, not substitute {}.
+    #[test]
+    fn normalize_malformed_json_returns_error() {
+        let mut msgs = make_tool_call_messages("not-valid-json{");
+        let result = normalize_tool_call_arguments(&mut msgs);
+        assert!(
+            result.is_err(),
+            "malformed arguments JSON must return Err, not substitute {{}}"
+        );
+    }
+
+    /// Well-formed object arguments pass through unchanged.
+    #[test]
+    fn normalize_valid_object_passes_through() {
+        let mut msgs = make_tool_call_messages(r#"{"city": "Paris", "unit": "celsius"}"#);
+        normalize_tool_call_arguments(&mut msgs).unwrap();
+        assert_eq!(
+            msgs[0]["tool_calls"][0]["function"]["arguments"]["city"],
+            serde_json::json!("Paris")
+        );
+    }
+
+    // --- Multi-turn opt-in behaviour tests ---
+    //
+    // These guard the boundary between JsonString (default, GPT-OSS / Harmony
+    // path) and JsonObject (GLM-5.2 path).  The normalize function is the
+    // shared primitive; NormalizedArgsRequest calls it only when the model
+    // opts in; other models never call it.
+
+    /// GLM-5.2 (JsonObject mode): historical arguments must be a parsed object
+    /// so the chat template can call .items() on them.
+    #[test]
+    fn glm52_historical_arguments_are_object() {
+        let mut msgs =
+            make_tool_call_messages(r#"{"location": "San Francisco", "unit": "celsius"}"#);
+        normalize_tool_call_arguments(&mut msgs).unwrap();
+        let args = &msgs[0]["tool_calls"][0]["function"]["arguments"];
+        assert!(
+            args.is_object(),
+            "GLM-5.2 (JsonObject mode): arguments must be a JSON object, got: {args}"
+        );
+        assert_eq!(args["location"], serde_json::json!("San Francisco"));
+    }
+
+    /// GPT-OSS (JsonString mode, default): historical arguments must stay as
+    /// a raw JSON string so the Harmony parser can re-emit a structured call.
+    /// This test models the multi-turn scenario where the first tool call is
+    /// in conversation history and the second must be parsed correctly.
+    #[test]
+    fn gptoss_historical_arguments_remain_string() {
+        // Without normalization (JsonString default), arguments stay as-is.
+        let msgs = make_tool_call_messages(r#"{"location": "San Francisco", "unit": "celsius"}"#);
+        let args = &msgs[0]["tool_calls"][0]["function"]["arguments"];
+        assert!(
+            args.is_string(),
+            "GPT-OSS (JsonString mode): arguments must remain a JSON string, got: {args}"
+        );
+        // The raw string is preserved for the Harmony template to handle.
+        assert_eq!(
+            args.as_str().unwrap(),
+            r#"{"location": "San Francisco", "unit": "celsius"}"#
+        );
+    }
+
+    fn continue_rendered(
+        prompt: dynamo_renderer::RenderedPrompt,
+    ) -> dynamo_renderer::RenderedPrompt {
+        super::apply_continue_final_message(prompt).unwrap()
+    }
+
+    #[test]
+    fn continue_final_message_truncates_after_last_assistant_text() {
+        use dynamo_renderer::RenderedPrompt;
+
+        let rendered = continue_rendered(RenderedPrompt::text(format!(
+            "user text<|im_end|>LLM-Native Interaction{}<|im_end|><|im_start|>assistant",
+            super::CONTINUE_FINAL_MESSAGE_TAG
+        )));
+        assert_eq!(
+            rendered.as_str(),
+            "user text<|im_end|>LLM-Native Interaction"
+        );
+    }
+
+    #[test]
+    fn continue_final_message_rstrips_when_template_trims_tag_space() {
+        use dynamo_renderer::RenderedPrompt;
+
+        // Transformers: if the template drops the marker's trailing space, also
+        // rstrip the prefix (the template likely trimmed message trailing space).
+        let rendered = continue_rendered(RenderedPrompt::text(format!(
+            "hello world{}extra",
+            super::CONTINUE_FINAL_MESSAGE_TAG.trim_end()
+        )));
+        assert_eq!(rendered.as_str(), "hello world");
+    }
+
+    #[test]
+    fn continue_final_message_marker_survives_repeated_last_text() {
+        use dynamo_renderer::RenderedPrompt;
+
+        let rendered = continue_rendered(RenderedPrompt::text(format!(
+            "LLM-Native Interaction in the user turn. LLM-Native Interaction{}<|im_end|>",
+            super::CONTINUE_FINAL_MESSAGE_TAG
+        )));
+        assert_eq!(
+            rendered.as_str(),
+            "LLM-Native Interaction in the user turn. LLM-Native Interaction"
+        );
+    }
+
+    #[test]
+    fn continue_final_message_appends_tag_to_last_array_text_part() {
+        let mut messages = serde_json::json!([{
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "ignored"},
+                {"type": "text", "text": "Design"}
+            ]
+        }]);
+        super::append_continue_final_message_tag(&mut messages, None).unwrap();
+        assert_eq!(
+            messages[0]["content"][1]["text"].as_str().unwrap(),
+            format!("Design{}", super::CONTINUE_FINAL_MESSAGE_TAG)
+        );
+        assert_eq!(messages[0]["content"][0]["text"], "ignored");
+    }
+
+    #[test]
+    fn continue_final_message_appends_tag_to_developer_array_text_part() {
+        let mut messages = serde_json::json!([{
+            "role": "developer",
+            "content": [
+                {"type": "text", "text": "ignored"},
+                {"type": "text", "text": "Design"}
+            ]
+        }]);
+        super::append_continue_final_message_tag(&mut messages, None).unwrap();
+        assert_eq!(
+            messages[0]["content"][1]["text"].as_str().unwrap(),
+            format!("Design{}", super::CONTINUE_FINAL_MESSAGE_TAG)
+        );
+    }
+
+    #[test]
+    fn continue_final_message_continues_final_user_message() {
+        use dynamo_renderer::RenderedPrompt;
+
+        let rendered = continue_rendered(RenderedPrompt::text(format!(
+            "hello world{}extra",
+            super::CONTINUE_FINAL_MESSAGE_TAG
+        )));
+        assert_eq!(rendered.as_str(), "hello world");
+    }
+
+    /// Raw turns `same / previous / same`; rendered last turn is `SAME`.
+    /// Searching for `same` would cut at the first copy.
+    #[test]
+    fn continue_final_message_marker_survives_rewritten_final_turn() {
+        use dynamo_renderer::RenderedPrompt;
+
+        let rendered = continue_rendered(RenderedPrompt::text(format!(
+            "same|PREVIOUS|SAME{}|closed",
+            super::CONTINUE_FINAL_MESSAGE_TAG
+        )));
+        assert_eq!(rendered.as_str(), "same|PREVIOUS|SAME");
+    }
+
+    /// Whitespace-only last content must not match earlier structural spaces.
+    #[test]
+    fn continue_final_message_whitespace_only_does_not_match_structural_spaces() {
+        use dynamo_renderer::RenderedPrompt;
+
+        let mut messages = serde_json::json!([
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "   "}
+        ]);
+        super::append_continue_final_message_tag(&mut messages, None).unwrap();
+        assert_eq!(
+            messages[1]["content"].as_str().unwrap(),
+            format!("   {}", super::CONTINUE_FINAL_MESSAGE_TAG)
+        );
+
+        let rendered = continue_rendered(RenderedPrompt::text(format!(
+            "hello   world   {}extra",
+            super::CONTINUE_FINAL_MESSAGE_TAG
+        )));
+        assert_eq!(rendered.as_str(), "hello   world   ");
+    }
+
+    #[test]
+    fn continue_final_message_errors_when_marker_is_missing() {
+        use dynamo_renderer::RenderedPrompt;
+
+        let err =
+            super::apply_continue_final_message(RenderedPrompt::text("unchanged".to_string()))
+                .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("not found in the rendered chat template"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn continue_final_message_errors_when_final_content_is_empty() {
+        let mut messages = serde_json::json!([{"role": "assistant", "content": ""}]);
+        let err = super::append_continue_final_message_tag(&mut messages, None).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("not found in the rendered chat template"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn continue_final_message_preserves_segment_boundaries() {
+        use dynamo_renderer::{RenderedPrompt, RenderedSegment};
+
+        let rendered = continue_rendered(RenderedPrompt::segmented(vec![
+            RenderedSegment {
+                text: "<|im_start|>assistant\n".to_string(),
+                allow_special: true,
+            },
+            RenderedSegment {
+                text: format!(
+                    "LLM-Native Interaction{}",
+                    super::CONTINUE_FINAL_MESSAGE_TAG
+                ),
+                allow_special: false,
+            },
+            RenderedSegment {
+                text: "<|im_end|>".to_string(),
+                allow_special: true,
+            },
+            RenderedSegment {
+                text: "<|im_start|>assistant\n".to_string(),
+                allow_special: true,
+            },
+        ]));
+        assert_eq!(
+            rendered.as_str(),
+            "<|im_start|>assistant\nLLM-Native Interaction"
+        );
+        let segments = rendered
+            .segments()
+            .expect("Kimi-style prompts must keep segment boundaries");
+        assert_eq!(segments.len(), 2);
+        assert!(segments[0].allow_special);
+        assert_eq!(segments[0].text, "<|im_start|>assistant\n");
+        assert!(!segments[1].allow_special);
+        assert_eq!(segments[1].text, "LLM-Native Interaction");
+    }
+
+    #[test]
+    fn continue_final_message_truncates_inside_an_ordinary_segment() {
+        use dynamo_renderer::{RenderedPrompt, RenderedSegment};
+
+        let rendered = continue_rendered(RenderedPrompt::segmented(vec![
+            RenderedSegment {
+                text: "<ctrl>".to_string(),
+                allow_special: true,
+            },
+            RenderedSegment {
+                text: format!("hello world{}extra", super::CONTINUE_FINAL_MESSAGE_TAG),
+                allow_special: false,
+            },
+        ]));
+        assert_eq!(rendered.as_str(), "<ctrl>hello world");
+        let segments = rendered
+            .segments()
+            .expect("truncated prompt stays segmented");
+        assert_eq!(segments.len(), 2);
+        assert!(segments[0].allow_special);
+        assert_eq!(segments[1].text, "hello world");
+        assert!(!segments[1].allow_special);
+    }
+}

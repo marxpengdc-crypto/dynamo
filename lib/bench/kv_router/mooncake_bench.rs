@@ -1,0 +1,680 @@
+// SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+#[path = "mooncake_lower_tier.rs"]
+mod mooncake_lower_tier;
+#[path = "mooncake_open_loop.rs"]
+mod mooncake_open_loop;
+#[path = "mooncake_shared.rs"]
+mod mooncake_shared;
+
+use clap::{Parser, Subcommand};
+use dynamo_bench::kv_router_common::args::CommonArgs;
+use dynamo_bench::kv_router_common::issuer::pin_current_thread_to_cpus;
+use dynamo_bench::kv_router_common::issuer::validate_cpu_partition;
+use dynamo_bench::kv_router_common::replay::{
+    generate_replay_artifacts, generate_replay_artifacts_with_args, host_offload_mock_engine_args,
+};
+use dynamo_bench::kv_router_common::sweep::compute_sweep_durations;
+use dynamo_kv_indexer::host::{
+    ConcurrentRadixTreeCompressed, KvIndexerMetrics, PositionalIndexer, ThreadPoolIndexer,
+};
+use mooncake_lower_tier::LowerTierRun;
+use mooncake_open_loop::{
+    OpenLoopConfig, OpenLoopResult, RunProvenance, parse_cpu_list, prepare_mooncake_corpus,
+    prepare_open_loop_trial, run_open_loop,
+};
+use mooncake_shared::{
+    MooncakeBenchmarkConfig, MooncakeIndexerConfig, MooncakeIndexerKind, PreparedMooncakeBenchmark,
+    merge_worker_traces, prepare_scaled_benchmark,
+};
+use sha2::{Digest, Sha256};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+#[cfg(target_os = "linux")]
+const PRE_RUN_QUIESCENCE_MS: u64 = 5_000;
+#[cfg(not(target_os = "linux"))]
+const PRE_RUN_QUIESCENCE_MS: u64 = 0;
+
+/// Indexer backend selection and its backend-specific parameters.
+#[derive(Subcommand, Debug, Clone)]
+enum IndexerArgs {
+    /// Position-based nested map indexer with jump search.
+    NestedMap {
+        /// Number of positions to skip during jump search before scanning back.
+        #[clap(long, default_value = "8")]
+        jump_size: usize,
+
+        /// Number of OS threads that consume and apply KV cache events.
+        #[clap(long, default_value = "16")]
+        num_event_workers: usize,
+    },
+
+    /// Compressed concurrent radix tree indexer (compressed edges).
+    ConcurrentRadixTreeCompressed {
+        /// Number of OS threads that consume and apply KV cache events.
+        #[clap(long, default_value = "16")]
+        num_event_workers: usize,
+    },
+}
+
+impl IndexerArgs {
+    fn to_config(&self) -> MooncakeIndexerConfig {
+        match self {
+            IndexerArgs::NestedMap {
+                jump_size,
+                num_event_workers,
+            } => MooncakeIndexerConfig::nested_map(*jump_size, *num_event_workers),
+            IndexerArgs::ConcurrentRadixTreeCompressed { num_event_workers } => {
+                MooncakeIndexerConfig::concurrent_radix_tree_compressed(*num_event_workers)
+            }
+        }
+    }
+}
+
+/// The lower-tier (KVCR host tier) mode, CRTC only. Workers publish vLLM's CPU offload tier and,
+/// unless `--kvcr-blocks 0`, a KVCR DRAM tier copied from it; the router indexes both in its lower
+/// tier, and every lookup seeds the lower-tier walk with the CRTC device match.
+#[derive(clap::Args, Debug, Clone)]
+struct LowerTierArgs {
+    /// vLLM CPU offload tier capacity per worker, in blocks. Turns the lower-tier mode on.
+    #[clap(long)]
+    num_host_blocks: Option<usize>,
+
+    /// KVCR DRAM tier capacity per worker, in blocks (default: `--num-host-blocks`). 0 publishes
+    /// the CPU tier only.
+    #[clap(long)]
+    kvcr_blocks: Option<usize>,
+
+    /// KV cache bytes per token, which sets the mocker's device-to-host copy time.
+    #[clap(long, default_value = "131072")]
+    kv_cache_bytes_per_token: usize,
+}
+
+impl LowerTierArgs {
+    fn kvcr_blocks(&self) -> usize {
+        self.kvcr_blocks.or(self.num_host_blocks).unwrap_or(0)
+    }
+}
+
+#[derive(Parser, Debug)]
+#[clap(version, about, long_about = None)]
+struct Args {
+    #[clap(flatten)]
+    common: CommonArgs,
+
+    #[clap(flatten)]
+    lower_tier: LowerTierArgs,
+
+    /// Number of persistent logical query lanes.
+    #[clap(long, default_value = "128")]
+    query_lanes: usize,
+
+    /// Number of native event-issuer threads.
+    #[clap(long, default_value = "8")]
+    issuer_threads: usize,
+
+    /// Busy-spin interval after the absolute issuer sleep.
+    #[clap(long, default_value = "75")]
+    issuer_spin_us: u64,
+
+    /// Diagnostic threshold for reporting late issue operations. It is not a validity gate.
+    #[clap(long, default_value = "50")]
+    issue_lag_diagnostic_threshold_us: u64,
+
+    /// Comma-separated logical CPUs or ranges for parallel deadline issuers.
+    #[clap(long)]
+    issuer_cpus: Option<String>,
+
+    /// Logical CPU for the timed query issuer. The parent coordinator is parked
+    /// on this CPU while scoped issuer threads run.
+    #[clap(long)]
+    query_issuer_cpu: Option<usize>,
+
+    /// Comma-separated logical CPUs or ranges used by query and event workers.
+    #[clap(long)]
+    backend_cpus: Option<String>,
+
+    /// JSON output path for a benchmark result.
+    #[clap(long, default_value = "mooncake_result.json")]
+    result_json_output: String,
+
+    /// Comma-separated list of indexer names to benchmark and compare on the
+    /// same plot. Overrides the subcommand indexer when present. Valid names:
+    /// nested-map, concurrent-radix-tree-compressed.
+    #[clap(long, value_delimiter = ',')]
+    compare: Vec<String>,
+
+    /// Number of OS threads for event processing with `--compare` or when no
+    /// subcommand is given (the default concurrent-radix-tree-compressed run).
+    #[clap(long, default_value = "16")]
+    num_event_workers: usize,
+
+    /// Number of additional concurrent tokio tasks that issue find_matches in a
+    /// tight loop to stress the read path.  These tasks run alongside the normal
+    /// trace-replay workers.  Set to 0 (default) to disable.
+    #[clap(long, default_value = "0")]
+    find_matches_concurrency: usize,
+
+    /// Use approximate routing-decision writes instead of offline-generated KV events.
+    #[clap(long)]
+    approx: bool,
+
+    /// Number of independent benchmark trials to run over the same generated
+    /// benchmark input. Each trial builds a fresh indexer.
+    #[clap(long, default_value = "1")]
+    benchmark_runs: usize,
+
+    /// Keep live per-rank resident block counts on the event threads, as when a
+    /// selection policy reads `RESIDENT_BLOCKS` (concurrent-radix-tree-compressed only).
+    #[clap(long)]
+    track_resident_blocks: bool,
+
+    /// Also read every resident block counter in a loop from a thread pinned to this
+    /// CPU, as selections do. Implies `--track-resident-blocks`.
+    #[clap(long)]
+    resident_blocks_reader_cpu: Option<usize>,
+
+    /// Indexer backend to benchmark. Defaults to concurrent-radix-tree-compressed
+    /// with `--num-event-workers` event threads.
+    #[clap(subcommand)]
+    indexer: Option<IndexerArgs>,
+}
+
+impl Args {
+    fn get_indexer(&self) -> IndexerArgs {
+        self.indexer
+            .clone()
+            .unwrap_or(IndexerArgs::ConcurrentRadixTreeCompressed {
+                num_event_workers: self.num_event_workers,
+            })
+    }
+}
+
+fn validate_args(args: &Args) -> anyhow::Result<()> {
+    if args.common.test {
+        anyhow::bail!(
+            "mooncake_bench no longer supports --test; run `cargo test --package dynamo-bench --test mooncake_trace` instead"
+        );
+    }
+    if args.benchmark_runs == 0 {
+        anyhow::bail!("--benchmark-runs must be at least 1");
+    }
+    if args.common.sweep && args.benchmark_runs != 1 {
+        anyhow::bail!("--benchmark-runs is only supported outside --sweep mode");
+    }
+    if args.query_lanes == 0 {
+        anyhow::bail!("--query-lanes must be at least 1");
+    }
+    if args.issuer_threads == 0 {
+        anyhow::bail!("--issuer-threads must be at least 1");
+    }
+    if args.num_event_workers > u16::MAX as usize {
+        anyhow::bail!("--num-event-workers exceeds the u16 queue-ID space");
+    }
+    if args.approx {
+        anyhow::bail!("corrected Mooncake replay does not support --approx");
+    }
+    if args.find_matches_concurrency != 0 {
+        anyhow::bail!("corrected Mooncake replay does not support --find-matches-concurrency");
+    }
+    if !args.common.sweep && args.benchmark_runs != 1 {
+        anyhow::bail!("repetitions must use fresh processes; invoke one trial per process");
+    }
+    if args.lower_tier.num_host_blocks == Some(0) || args.lower_tier.kv_cache_bytes_per_token == 0 {
+        anyhow::bail!("--num-host-blocks and --kv-cache-bytes-per-token must be positive");
+    }
+    if args.lower_tier.kvcr_blocks.is_some() && args.lower_tier.num_host_blocks.is_none() {
+        anyhow::bail!("--kvcr-blocks needs --num-host-blocks");
+    }
+    if args.common.mooncake_trace_path.is_none() {
+        return Ok(());
+    }
+
+    for name in indexer_names(args) {
+        let config = if args.compare.is_empty() {
+            args.get_indexer().to_config()
+        } else {
+            MooncakeIndexerConfig::from_short_name(&name, args.num_event_workers)?
+        };
+        if !matches!(
+            config.kind,
+            MooncakeIndexerKind::NestedMap | MooncakeIndexerKind::ConcurrentRadixTreeCompressed
+        ) {
+            anyhow::bail!(
+                "corrected Mooncake replay supports only nested-map and concurrent-radix-tree-compressed; got {name}"
+            );
+        }
+        if args.lower_tier.num_host_blocks.is_some()
+            && config.kind != MooncakeIndexerKind::ConcurrentRadixTreeCompressed
+        {
+            anyhow::bail!(
+                "the lower-tier mode needs concurrent-radix-tree-compressed for device matches; got {name}"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn indexer_names(args: &Args) -> Vec<String> {
+    if args.compare.is_empty() {
+        vec![args.get_indexer().to_config().short_name().to_string()]
+    } else {
+        args.compare.clone()
+    }
+}
+
+fn indexer_config(args: &Args, name: &str) -> anyhow::Result<MooncakeIndexerConfig> {
+    if args.compare.is_empty() {
+        Ok(args.get_indexer().to_config())
+    } else {
+        MooncakeIndexerConfig::from_short_name(name, args.num_event_workers)
+    }
+}
+
+fn open_loop_config(args: &Args) -> anyhow::Result<OpenLoopConfig> {
+    let config = parse_open_loop_config(args)?;
+    validate_cpu_partition(
+        &config.issuer_cpus,
+        config.query_issuer_cpu,
+        &config.backend_cpus,
+    )?;
+    Ok(config)
+}
+
+fn parse_open_loop_config(args: &Args) -> anyhow::Result<OpenLoopConfig> {
+    let backend_cpus = args
+        .backend_cpus
+        .as_deref()
+        .map(parse_cpu_list)
+        .transpose()?
+        .unwrap_or_default();
+    let issuer_cpus = args
+        .issuer_cpus
+        .as_deref()
+        .map(parse_cpu_list)
+        .transpose()?
+        .unwrap_or_default();
+    let issuer_threads = if issuer_cpus.is_empty() {
+        args.issuer_threads
+    } else {
+        issuer_cpus.len()
+    };
+    Ok(OpenLoopConfig {
+        query_lanes: args.query_lanes,
+        issuer_threads,
+        spin_us: args.issuer_spin_us,
+        issue_lag_diagnostic_threshold_us: args.issue_lag_diagnostic_threshold_us,
+        pre_run_quiescence_ms: PRE_RUN_QUIESCENCE_MS,
+        issuer_cpus,
+        query_issuer_cpu: args.query_issuer_cpu,
+        backend_cpus,
+    })
+}
+
+async fn run_open_loop_for_config(
+    args: &Args,
+    config: &MooncakeIndexerConfig,
+    prepared: PreparedMooncakeBenchmark,
+    bench_config: MooncakeBenchmarkConfig,
+) -> anyhow::Result<OpenLoopResult> {
+    if config.num_event_workers > u16::MAX as usize {
+        anyhow::bail!("Mooncake event-worker count exceeds the u16 queue-ID space");
+    }
+    let corpus =
+        prepare_mooncake_corpus(prepared, bench_config.inference_worker_duplication_factor)?;
+    let trial = prepare_open_loop_trial(corpus, args.query_lanes)?;
+    quiesce_prepared_heap();
+    let metrics = Arc::new(KvIndexerMetrics::new_unregistered());
+    let open_config = parse_open_loop_config(args)?;
+    pin_current_thread_to_cpus(&open_config.backend_cpus)?;
+    let track_resident_blocks =
+        args.track_resident_blocks || args.resident_blocks_reader_cpu.is_some();
+    if track_resident_blocks && config.kind != MooncakeIndexerKind::ConcurrentRadixTreeCompressed {
+        anyhow::bail!("resident block tracking applies only to concurrent-radix-tree-compressed");
+    }
+
+    match config.kind {
+        MooncakeIndexerKind::NestedMap => {
+            let indexer = Arc::new(ThreadPoolIndexer::new_with_metrics(
+                PositionalIndexer::new(config.jump_size),
+                config.num_event_workers,
+                args.common.block_size,
+                Some(metrics),
+            ));
+            run_backend(config.short_name(), indexer, None, trial, open_config).await
+        }
+        MooncakeIndexerKind::ConcurrentRadixTreeCompressed => {
+            let indexer = Arc::new(ThreadPoolIndexer::new_with_metrics(
+                ConcurrentRadixTreeCompressed::new(),
+                config.num_event_workers,
+                args.common.block_size,
+                Some(Arc::clone(&metrics)),
+            ));
+            // The router's lower tier shares the primary's event-thread count and metrics.
+            let lower_tier = args.lower_tier.num_host_blocks.map(|_| {
+                LowerTierRun::crtc(
+                    config.num_event_workers,
+                    args.common.block_size,
+                    Some(metrics),
+                    args.lower_tier.kvcr_blocks() > 0,
+                )
+            });
+            let counts = track_resident_blocks.then(|| indexer.bench_track_resident_blocks());
+            let stop = Arc::new(AtomicBool::new(false));
+            let reader = counts
+                .zip(args.resident_blocks_reader_cpu)
+                .map(|(counts, cpu)| {
+                    let stop = stop.clone();
+                    let (pinned_tx, pinned_rx) = std::sync::mpsc::sync_channel(1);
+                    let handle = std::thread::spawn(move || {
+                        let pinned = pin_current_thread_to_cpus(&[cpu]);
+                        let failed = pinned.is_err();
+                        let _ = pinned_tx.send(pinned);
+                        if failed {
+                            return;
+                        }
+                        while !stop.load(Ordering::Relaxed) {
+                            std::hint::black_box(counts.bench_sum());
+                        }
+                    });
+                    (handle, pinned_rx)
+                });
+            // Don't start the trial until the reader is pinned, so a failed pin
+            // aborts here instead of producing a run with no reader.
+            if let Some((_, pinned_rx)) = &reader {
+                pinned_rx.recv().map_err(|_| {
+                    anyhow::anyhow!("resident block reader exited before pinning")
+                })??;
+            }
+            let result =
+                run_backend(config.short_name(), indexer, lower_tier, trial, open_config).await;
+            stop.store(true, Ordering::Relaxed);
+            if let Some((handle, _)) = reader {
+                handle
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("resident block reader panicked"))?;
+            }
+            result
+        }
+        MooncakeIndexerKind::RadixTree | MooncakeIndexerKind::BranchShardedCrtc => {
+            anyhow::bail!(
+                "{} is not supported by corrected Mooncake replay",
+                config.short_name()
+            )
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn quiesce_prepared_heap() {
+    // Corpus construction releases large, multi-threaded preparation arenas.
+    // Return their free pages and let reclamation settle before backend workers start.
+    unsafe {
+        libc::malloc_trim(0);
+    }
+    std::thread::sleep(std::time::Duration::from_millis(PRE_RUN_QUIESCENCE_MS));
+}
+
+#[cfg(not(target_os = "linux"))]
+fn quiesce_prepared_heap() {}
+
+async fn run_backend<T: dynamo_kv_indexer::host::SyncIndexer>(
+    backend_name: &str,
+    indexer: Arc<ThreadPoolIndexer<T>>,
+    lower_tier: Option<LowerTierRun<T>>,
+    trial: mooncake_open_loop::PreparedOpenLoopTrial,
+    open_config: OpenLoopConfig,
+) -> anyhow::Result<OpenLoopResult> {
+    let coordinator_cpus = open_config.backend_cpus.clone();
+    if let Some(cpu) = open_config.query_issuer_cpu {
+        pin_current_thread_to_cpus(&[cpu])?;
+    }
+    let result = run_open_loop(backend_name, indexer, lower_tier, trial, open_config).await;
+    // Restore the coordinator mask. Otherwise blocking-pool threads spawned while the
+    // next sweep or compare cell generates events inherit the single query-issuer CPU.
+    let restored = pin_current_thread_to_cpus(&coordinator_cpus);
+    let result = result?;
+    restored?;
+    Ok(result)
+}
+
+fn print_open_loop_result(result: &OpenLoopResult) {
+    println!(
+        "Offered logical throughput: {:.0} ops/s | achieved: {:.0} ops/s",
+        result.offered_logical_ops_per_sec, result.achieved_logical_ops_per_sec
+    );
+    println!(
+        "Offered block throughput: {:.0} block ops/s | achieved: {:.0} block ops/s",
+        result.offered_block_ops_per_sec, result.achieved_block_ops_per_sec
+    );
+    println!(
+        "Query service p50/p99: {:.1}/{:.1} us | queue p99: {:.1} us",
+        result.query_service.p50_ns as f64 / 1_000.0,
+        result.query_service.p99_ns as f64 / 1_000.0,
+        result.query_queue_wait.p99_ns as f64 / 1_000.0,
+    );
+    println!(
+        "generator_valid={} kept_up={} issue_span={:.3} ms drain={:.3} ms",
+        result.generator_valid,
+        result.kept_up,
+        result.issue_span_ns as f64 / 1e6,
+        result.drain_ns as f64 / 1e6,
+    );
+    if let Some(lower) = &result.lower_tier {
+        println!(
+            "Lower tier: query p50/p99 {:.1}/{:.1} us | {} of {} lookups hit | drain {:.3} ms | {} B per (block, owner)",
+            lower.query_service.p50_ns as f64 / 1_000.0,
+            lower.query_service.p99_ns as f64 / 1_000.0,
+            lower.hit_queries,
+            result.total_requests,
+            lower.drain_ns as f64 / 1e6,
+            lower
+                .bytes_per_membership
+                .map_or("?".to_string(), |bytes| format!("{bytes:.1}")),
+        );
+    }
+    if !result.backend_timing_report.is_empty() {
+        println!("{}", result.backend_timing_report);
+    }
+}
+
+fn open_loop_output_path(base: &str, backend: &str, duration_ms: Option<u64>) -> String {
+    let stem = base.trim_end_matches(".json");
+    match duration_ms {
+        Some(duration_ms) => format!("{stem}_{backend}_{duration_ms}ms.json"),
+        None => format!("{stem}_{backend}.json"),
+    }
+}
+
+fn write_open_loop_result(path: &str, result: &OpenLoopResult) -> anyhow::Result<()> {
+    std::fs::write(path, serde_json::to_string_pretty(result)?)?;
+    println!("Mooncake result written to {path}");
+    Ok(())
+}
+
+fn run_provenance(args: &Args, config: &MooncakeIndexerConfig) -> anyhow::Result<RunProvenance> {
+    let common = &args.common;
+    let file_sha256 = |path: &std::path::Path| -> anyhow::Result<String> {
+        let mut hasher = Sha256::new();
+        std::io::copy(&mut std::fs::File::open(path)?, &mut hasher)?;
+        Ok(format!("{:x}", hasher.finalize()))
+    };
+    let trace_sha256 = common
+        .mooncake_trace_path
+        .as_deref()
+        .map(|path| file_sha256(std::path::Path::new(path)))
+        .transpose()?;
+    let binary = std::env::current_exe().ok();
+    let binary_sha256 = binary.as_deref().map(file_sha256).transpose()?;
+    Ok(RunProvenance {
+        argv: std::env::args().collect(),
+        binary: binary.map(|path| path.display().to_string()),
+        binary_sha256,
+        trace_path: common.mooncake_trace_path.clone(),
+        trace_sha256,
+        trace_block_size: common.trace_block_size,
+        num_gpu_blocks: common.num_gpu_blocks,
+        num_unique_inference_workers: common.num_unique_inference_workers,
+        inference_worker_duplication_factor: common.inference_worker_duplication_factor,
+        trace_length_factor: common.trace_length_factor,
+        trace_duplication_factor: common.trace_duplication_factor,
+        trace_simulation_duration_ms: common.trace_simulation_duration_ms,
+        seed: common.seed,
+        jump_size: matches!(config.kind, MooncakeIndexerKind::NestedMap)
+            .then_some(config.jump_size),
+        issuer_spin_us: args.issuer_spin_us,
+        issue_lag_diagnostic_threshold_us: args.issue_lag_diagnostic_threshold_us,
+        num_host_blocks: args.lower_tier.num_host_blocks,
+        kvcr_blocks: args
+            .lower_tier
+            .num_host_blocks
+            .map(|_| args.lower_tier.kvcr_blocks()),
+        kv_cache_bytes_per_token: args
+            .lower_tier
+            .num_host_blocks
+            .map(|_| args.lower_tier.kv_cache_bytes_per_token),
+    })
+}
+
+fn benchmark_config(args: &Args, benchmark_duration_ms: u64) -> MooncakeBenchmarkConfig {
+    MooncakeBenchmarkConfig {
+        benchmark_duration_ms,
+        inference_worker_duplication_factor: args.common.inference_worker_duplication_factor,
+    }
+}
+
+async fn prepare_benchmark(
+    args: &Args,
+    benchmark_duration_ms: u64,
+) -> anyhow::Result<Option<PreparedMooncakeBenchmark>> {
+    let Some(path) = args.common.mooncake_trace_path.as_deref() else {
+        eprintln!("No mooncake_trace_path provided, skipping benchmark");
+        return Ok(None);
+    };
+
+    let traces = args.common.load_mooncake_trace(path)?;
+    let artifacts = match args.lower_tier.num_host_blocks {
+        Some(num_host_blocks) => {
+            let engine = host_offload_mock_engine_args(
+                args.common.num_gpu_blocks,
+                args.common.block_size as usize,
+                num_host_blocks,
+                args.lower_tier.kv_cache_bytes_per_token,
+            )?;
+            generate_replay_artifacts_with_args(
+                &traces,
+                engine,
+                args.common.trace_simulation_duration_ms,
+            )
+            .await?
+        }
+        None => {
+            generate_replay_artifacts(
+                &traces,
+                args.common.num_gpu_blocks,
+                args.common.block_size,
+                args.common.trace_simulation_duration_ms,
+            )
+            .await?
+        }
+    };
+    drop(traces);
+    let mut merged = merge_worker_traces(artifacts, args.common.block_size)?;
+    if args.lower_tier.num_host_blocks.is_some() && args.lower_tier.kvcr_blocks() > 0 {
+        merged = merged.with_kvcr_layer(args.lower_tier.kvcr_blocks())?;
+    }
+    Ok(Some(prepare_scaled_benchmark(
+        merged,
+        benchmark_duration_ms,
+    )))
+}
+
+async fn run_open_loop_repeated_mode(args: &Args, indexer_names: &[String]) -> anyhow::Result<()> {
+    for name in indexer_names {
+        let config = indexer_config(args, name)?;
+        // Record provenance before the run so it describes the inputs actually read.
+        let provenance = run_provenance(args, &config)?;
+        let bench_config = benchmark_config(args, args.common.benchmark_duration_ms);
+        let Some(prepared) = prepare_benchmark(args, bench_config.benchmark_duration_ms).await?
+        else {
+            return Ok(());
+        };
+        let mut result = run_open_loop_for_config(args, &config, prepared, bench_config).await?;
+        result.provenance = Some(provenance);
+        print_open_loop_result(&result);
+        let path = if indexer_names.len() == 1 {
+            args.result_json_output.clone()
+        } else {
+            open_loop_output_path(&args.result_json_output, config.short_name(), None)
+        };
+        write_open_loop_result(&path, &result)?;
+    }
+    Ok(())
+}
+
+async fn run_open_loop_sweep_mode(args: &Args, indexer_names: &[String]) -> anyhow::Result<()> {
+    let durations = compute_sweep_durations(
+        args.common.sweep_min_ms,
+        args.common.sweep_max_ms,
+        args.common.sweep_steps,
+    )?;
+
+    for name in indexer_names {
+        let config = indexer_config(args, name)?;
+        let provenance = run_provenance(args, &config)?;
+        for &duration_ms in durations.iter().rev() {
+            println!(
+                "\n=== Mooncake sweep: backend={} benchmark_duration_ms={} ===",
+                config.short_name(),
+                duration_ms
+            );
+            let bench_config = benchmark_config(args, duration_ms);
+            let Some(prepared) =
+                prepare_benchmark(args, bench_config.benchmark_duration_ms).await?
+            else {
+                return Ok(());
+            };
+            let mut result =
+                run_open_loop_for_config(args, &config, prepared, bench_config).await?;
+            result.provenance = Some(provenance.clone());
+            print_open_loop_result(&result);
+            let path = open_loop_output_path(
+                &args.result_json_output,
+                config.short_name(),
+                Some(duration_ms),
+            );
+            write_open_loop_result(&path, &result)?;
+        }
+    }
+    Ok(())
+}
+
+async fn async_main(args: Args) -> anyhow::Result<()> {
+    let indexer_names = indexer_names(&args);
+
+    if args.common.sweep {
+        run_open_loop_sweep_mode(&args, &indexer_names).await?;
+    } else {
+        run_open_loop_repeated_mode(&args, &indexer_names).await?;
+    }
+
+    Ok(())
+}
+
+fn main() -> anyhow::Result<()> {
+    let args = Args::parse();
+    validate_args(&args)?;
+    let config = open_loop_config(&args)?;
+
+    let mut runtime = tokio::runtime::Builder::new_multi_thread();
+    runtime.enable_all();
+    if !config.backend_cpus.is_empty() {
+        pin_current_thread_to_cpus(&config.backend_cpus)?;
+        runtime.worker_threads(config.backend_cpus.len());
+    }
+
+    let runtime = runtime.build()?;
+    runtime.block_on(async_main(args))
+}

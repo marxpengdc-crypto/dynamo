@@ -1,0 +1,210 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Native planner adapter subclasses (one per mode).
+
+Each subclass sets ``require_prefill`` / ``require_decode`` and overrides
+``_bootstrap_regression()`` and ``_apply_effects()``.  Everything else
+(connector, Prometheus, FPM subscribers, tick loop) is in ``NativePlannerBase``.
+"""
+
+import logging
+from typing import Optional
+
+from dynamo.planner.config.defaults import SubComponentType, TargetReplica
+from dynamo.planner.core.base import NativePlannerBase
+from dynamo.planner.core.types import PlannerEffects
+from dynamo.planner.monitoring.perf_metrics import (
+    PreDeploymentMetricsUnavailableError,
+    fetch_pre_deployment_metrics,
+)
+
+logger = logging.getLogger(__name__)
+
+
+def _log_missing_pre_deployment_data(component: str, error: Exception) -> None:
+    logger.warning(
+        "No pre-deployment data for %s; perf model will rely on native AIC "
+        "or live FPM tuning when available: %s",
+        component,
+        error,
+    )
+
+
+async def _emit_replica_targets(
+    planner: NativePlannerBase,
+    *,
+    num_prefill: Optional[int] = None,
+    num_decode: Optional[int] = None,
+) -> None:
+    """Publish predicted-replica gauges, then submit one scaling batch.
+
+    Callers pass only the roles their mode owns, so a single-role mode never
+    publishes, resolves, or scales the other role. ``None`` means "no target";
+    ``0`` is a real target. Gauges are set before any worker name is resolved,
+    so they are published even if ``_required_worker_info`` then raises, and
+    even in advisory mode (the advisory guard lives in
+    ``_apply_scaling_targets``). Prefill is ordered before decode.
+    """
+    if planner.prometheus_port != 0:
+        if num_prefill is not None:
+            planner.prometheus_metrics.predicted_num_prefill_replicas.set(num_prefill)
+        if num_decode is not None:
+            planner.prometheus_metrics.predicted_num_decode_replicas.set(num_decode)
+
+    targets: list[TargetReplica] = []
+    for component, desired in (
+        (SubComponentType.PREFILL, num_prefill),
+        (SubComponentType.DECODE, num_decode),
+    ):
+        if desired is not None:
+            targets.append(
+                TargetReplica(
+                    sub_component_type=component,
+                    component_name=planner._required_worker_info(component).k8s_name,
+                    desired_replicas=desired,
+                )
+            )
+    await planner._apply_scaling_targets(targets)
+
+
+class PrefillPlanner(NativePlannerBase):
+    """Prefill-only mode."""
+
+    require_prefill = True
+    require_decode = False
+
+    async def _bootstrap_regression(self) -> None:
+        # Always drive ``_install_benchmark_fpms`` even on fetch failure
+        # (fpms=None). The orchestrator path needs an empty-but-present
+        # regression installed so runtime FPM observation has somewhere
+        # to accumulate samples.
+        fpms = None
+        try:
+            worker_info = self._required_worker_info(SubComponentType.PREFILL)
+            fpms = await fetch_pre_deployment_metrics(
+                runtime=self.runtime,
+                namespace=self._runtime_namespace(),
+                worker_info=worker_info,
+                profile_results_dir=self.config.profile_results_dir,
+                component_type=SubComponentType.PREFILL,
+                aic_spec=self.config.aic_interpolation,
+            )
+        except PreDeploymentMetricsUnavailableError as e:
+            _log_missing_pre_deployment_data("prefill", e)
+        await self._install_benchmark_fpms(prefill_fpms=fpms)
+
+    async def _apply_effects(self, effects: PlannerEffects) -> None:
+        """Publish and submit the prefill target when one is present."""
+        if effects.scale_to is None or effects.scale_to.num_prefill is None:
+            return
+        await _emit_replica_targets(self, num_prefill=effects.scale_to.num_prefill)
+
+
+class DecodePlanner(NativePlannerBase):
+    """Decode-only mode."""
+
+    require_prefill = False
+    require_decode = True
+
+    async def _bootstrap_regression(self) -> None:
+        # See PrefillPlanner._bootstrap_regression for the rationale:
+        # install empty regression on fetch failure so runtime
+        # observations can still accumulate.
+        fpms = None
+        try:
+            worker_info = self._required_worker_info(SubComponentType.DECODE)
+            fpms = await fetch_pre_deployment_metrics(
+                runtime=self.runtime,
+                namespace=self._runtime_namespace(),
+                worker_info=worker_info,
+                profile_results_dir=self.config.profile_results_dir,
+                component_type=SubComponentType.DECODE,
+                aic_spec=self.config.aic_interpolation,
+            )
+        except PreDeploymentMetricsUnavailableError as e:
+            _log_missing_pre_deployment_data("decode", e)
+        await self._install_benchmark_fpms(decode_fpms=fpms)
+
+    async def _apply_effects(self, effects: PlannerEffects) -> None:
+        """Publish and submit the decode target when one is present."""
+        if effects.scale_to is None or effects.scale_to.num_decode is None:
+            return
+        await _emit_replica_targets(self, num_decode=effects.scale_to.num_decode)
+
+
+class AggPlanner(NativePlannerBase):
+    """Aggregated mode (single engine type handles both prefill and decode)."""
+
+    require_prefill = False
+    require_decode = True
+
+    async def _bootstrap_regression(self) -> None:
+        # See PrefillPlanner._bootstrap_regression for rationale.
+        fpms = None
+        try:
+            worker_info = self._required_worker_info(SubComponentType.DECODE)
+            fpms = await fetch_pre_deployment_metrics(
+                runtime=self.runtime,
+                namespace=self._runtime_namespace(),
+                worker_info=worker_info,
+                profile_results_dir=self.config.profile_results_dir,
+                component_type=SubComponentType.DECODE,
+                aic_spec=self.config.aic_interpolation,
+            )
+        except PreDeploymentMetricsUnavailableError as e:
+            _log_missing_pre_deployment_data("agg", e)
+        await self._install_benchmark_fpms(agg_fpms=fpms)
+
+    async def _apply_effects(self, effects: PlannerEffects) -> None:
+        """Publish and submit the aggregated worker target when one is present."""
+        if effects.scale_to is None or effects.scale_to.num_decode is None:
+            return
+        await _emit_replica_targets(self, num_decode=effects.scale_to.num_decode)
+
+
+class DisaggPlanner(NativePlannerBase):
+    """Disaggregated mode (separate prefill and decode engines)."""
+
+    require_prefill = True
+    require_decode = True
+
+    async def _bootstrap_regression(self) -> None:
+        # Collect per-component FPMs first (disagg has both prefill and
+        # decode to fetch independently), then hand the bundle to the
+        # single dual-path installer. Combining the two install calls
+        # lets the orchestrator path do one ``bootstrap_from_fpms``
+        # instead of two — and keeps the try/except granular so one
+        # component's missing benchmark doesn't tank the other.
+        prefill_fpms = None
+        decode_fpms = None
+        for component in [SubComponentType.PREFILL, SubComponentType.DECODE]:
+            try:
+                worker_info = self._required_worker_info(component)
+                fpms = await fetch_pre_deployment_metrics(
+                    runtime=self.runtime,
+                    namespace=self._runtime_namespace(),
+                    worker_info=worker_info,
+                    profile_results_dir=self.config.profile_results_dir,
+                    component_type=component,
+                    aic_spec=self.config.aic_interpolation,
+                )
+                if component == SubComponentType.PREFILL:
+                    prefill_fpms = fpms
+                else:
+                    decode_fpms = fpms
+            except PreDeploymentMetricsUnavailableError as e:
+                _log_missing_pre_deployment_data(component.value, e)
+        await self._install_benchmark_fpms(
+            prefill_fpms=prefill_fpms, decode_fpms=decode_fpms
+        )
+
+    async def _apply_effects(self, effects: PlannerEffects) -> None:
+        """Publish and submit the specified prefill and decode targets together."""
+        if effects.scale_to is None:
+            return
+        await _emit_replica_targets(
+            self,
+            num_prefill=effects.scale_to.num_prefill,
+            num_decode=effects.scale_to.num_decode,
+        )

@@ -1,0 +1,184 @@
+// SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+//! Unified Request Plane Server Interface
+//!
+//! This module defines a transport-agnostic interface for request plane servers.
+//! All transport implementations (TCP, NATS) implement this trait to provide
+//! a consistent interface for endpoint registration and management.
+
+use super::*;
+use crate::{SystemHealth, protocols::EndpointId};
+use anyhow::Result;
+use async_trait::async_trait;
+use parking_lot::Mutex;
+use std::sync::Arc;
+
+/// Unified interface for request plane servers
+///
+/// This trait abstracts over different transport mechanisms (TCP, NATS)
+/// providing a consistent interface for registering endpoints and managing server lifecycle.
+///
+/// # Design Principles
+///
+/// 1. **Transport Agnostic**: Implementations can be swapped without changing business logic
+/// 2. **Multiplexed**: All servers handle multiple endpoints on a single port/connection
+/// 3. **Async by Default**: All operations are async to support high concurrency
+/// 4. **Health Monitoring**: Servers provide health status for monitoring
+///
+/// # Example
+///
+/// ```ignore
+/// use dynamo_runtime::pipeline::network::ingress::RequestPlaneServer;
+///
+/// async fn register(server: &dyn RequestPlaneServer) -> Result<()> {
+///     server.register_endpoint(
+///         "generate".to_string(),
+///         handler,
+///         instance_id,
+///         "dynamo".to_string(),
+///         "backend".to_string(),
+///         system_health,
+///     ).await?;
+///     Ok(())
+/// }
+/// ```
+#[async_trait]
+pub trait RequestPlaneServer: Send + Sync {
+    /// Register an endpoint handler with the server
+    ///
+    /// # Arguments
+    ///
+    /// * `endpoint_name` - Name/path for routing (e.g., "generate", "health")
+    /// * `service_handler` - Handler that processes incoming requests
+    /// * `instance_id` - Unique instance identifier for this endpoint
+    /// * `namespace` - Service namespace (e.g., "dynamo")
+    /// * `component_name` - Component name (e.g., "backend", "frontend")
+    /// * `system_health` - Health tracking for this endpoint
+    ///
+    /// # Returns
+    ///
+    /// Returns `Ok(())` if registration succeeds, or an error if:
+    /// - Endpoint name is already registered
+    /// - Server is not running or has been stopped
+    /// - Transport-specific errors occur
+    async fn register_endpoint(
+        &self,
+        endpoint_name: String,
+        service_handler: Arc<dyn PushWorkHandler>,
+        instance_id: u64,
+        namespace: String,
+        component_name: String,
+        system_health: Arc<Mutex<SystemHealth>>,
+    ) -> Result<()>;
+
+    /// Unregister an endpoint by name and instance ID.
+    ///
+    /// Built-in servers return an error without removing a handler if multiple namespaces
+    /// or components match. Use [`Self::unregister_endpoint_instance`] to disambiguate.
+    /// An endpoint that is not registered is a no-op.
+    async fn unregister_endpoint(&self, endpoint_name: &str, instance_id: u64) -> Result<()>;
+
+    /// Unregister the handler with the namespace, component, name, and instance ID
+    /// used at registration. An endpoint that is not registered is a no-op.
+    ///
+    /// The default delegates to the name-based method for existing implementations.
+    /// Servers supporting same-named endpoints across components should override it.
+    async fn unregister_endpoint_instance(
+        &self,
+        endpoint_id: &EndpointId,
+        instance_id: u64,
+    ) -> Result<()> {
+        self.unregister_endpoint(&endpoint_id.name, instance_id)
+            .await
+    }
+
+    /// Get server bind address or identifier
+    ///
+    /// Returns a transport-specific address string:
+    /// - TCP: `"tcp://0.0.0.0:9999"`
+    /// - NATS: `"nats://localhost:4222"`
+    ///
+    /// Used for logging, debugging, and service discovery.
+    fn address(&self) -> String;
+
+    /// Get the transport name
+    ///
+    /// Returns a static string identifier for the transport type.
+    /// Used for logging and debugging.
+    ///
+    /// # Examples
+    ///
+    /// - `"tcp"` - Raw TCP transport
+    /// - `"nats"` - NATS messaging
+    fn transport_name(&self) -> &'static str;
+
+    /// Check if server is healthy and ready to accept requests
+    ///
+    /// Returns `true` if the server is operational and can handle requests.
+    /// This is a lightweight check that doesn't perform actual network I/O.
+    ///
+    /// Implementations should return `false` if:
+    /// - Server has been explicitly stopped
+    /// - Underlying transport is disconnected
+    /// - Server encountered a fatal error
+    fn is_healthy(&self) -> bool;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct LegacyServer {
+        removed: Mutex<Option<(String, u64)>>,
+    }
+
+    #[async_trait]
+    impl RequestPlaneServer for LegacyServer {
+        async fn register_endpoint(
+            &self,
+            _: String,
+            _: Arc<dyn PushWorkHandler>,
+            _: u64,
+            _: String,
+            _: String,
+            _: Arc<Mutex<SystemHealth>>,
+        ) -> Result<()> {
+            unreachable!()
+        }
+
+        async fn unregister_endpoint(&self, endpoint_name: &str, instance_id: u64) -> Result<()> {
+            *self.removed.lock() = Some((endpoint_name.to_string(), instance_id));
+            Ok(())
+        }
+
+        fn address(&self) -> String {
+            unreachable!()
+        }
+
+        fn transport_name(&self) -> &'static str {
+            unreachable!()
+        }
+
+        fn is_healthy(&self) -> bool {
+            unreachable!()
+        }
+    }
+
+    #[tokio::test]
+    async fn full_identity_cleanup_delegates_for_legacy_implementations() {
+        let server = LegacyServer::default();
+        let endpoint_id = EndpointId {
+            namespace: "test_namespace".into(),
+            component: "test_component".into(),
+            name: "generate".into(),
+        };
+        let plane: &dyn RequestPlaneServer = &server;
+        plane
+            .unregister_endpoint_instance(&endpoint_id, 0xa)
+            .await
+            .unwrap();
+        assert_eq!(*server.removed.lock(), Some(("generate".into(), 0xa)));
+    }
+}

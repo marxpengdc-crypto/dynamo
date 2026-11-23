@@ -1,0 +1,229 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+package controller
+
+import (
+	"fmt"
+
+	configv1alpha1 "github.com/ai-dynamo/dynamo/deploy/operator/api/config/v1alpha1"
+	lpxcontroller "github.com/ai-dynamo/dynamo/deploy/operator/internal/controller/lpx"
+	commoncontroller "github.com/ai-dynamo/dynamo/deploy/operator/internal/controller_common"
+	"github.com/ai-dynamo/dynamo/deploy/operator/internal/gpu"
+	"github.com/ai-dynamo/dynamo/deploy/operator/internal/modelendpoint"
+	"github.com/ai-dynamo/dynamo/deploy/operator/internal/secret"
+	corev1 "k8s.io/api/core/v1"
+	ctrl "sigs.k8s.io/controller-runtime"
+)
+
+type SetupOptions struct {
+	Config        *configv1alpha1.OperatorConfiguration
+	RuntimeConfig *commoncontroller.RuntimeConfig
+}
+
+type DynamoComponentDeploymentSetupOptions struct {
+	SetupOptions
+	DockerSecretRetriever DockerSecretRetriever
+}
+
+type DynamoGraphDeploymentSetupOptions struct {
+	SetupOptions
+	DockerSecretRetriever DockerSecretRetriever
+	SSHKeyManager         *secret.SSHKeyManager
+}
+
+type DynamoGraphDeploymentRequestSetupOptions struct {
+	SetupOptions
+	GPUDiscoveryCache       *gpu.GPUDiscoveryCache
+	GPUDiscovery            *gpu.GPUDiscovery
+	OperatorImage           string
+	OperatorImagePullPolicy corev1.PullPolicy
+}
+
+type DynamoGraphDeploymentRunSetupOptions struct {
+	SetupOptions
+	DockerSecretRetriever   DockerSecretRetriever
+	PlannerImage            string
+	DynamoVersion           string
+	OperatorImage           string
+	OperatorImagePullPolicy corev1.PullPolicy
+}
+
+type DynamoModelSetupOptions struct {
+	SetupOptions
+	ModelEndpointClient *modelendpoint.Client
+}
+
+func (o DynamoGraphDeploymentRequestSetupOptions) gpuDiscoveryCache() *gpu.GPUDiscoveryCache {
+	if o.GPUDiscoveryCache != nil {
+		return o.GPUDiscoveryCache
+	}
+	return gpu.NewGPUDiscoveryCache()
+}
+
+func (o DynamoGraphDeploymentRequestSetupOptions) gpuDiscovery() *gpu.GPUDiscovery {
+	if o.GPUDiscovery != nil {
+		return o.GPUDiscovery
+	}
+	return gpu.NewGPUDiscovery(gpu.ScrapeMetricsEndpoint)
+}
+
+func (o DynamoModelSetupOptions) modelEndpointClient() *modelendpoint.Client {
+	if o.ModelEndpointClient != nil {
+		return o.ModelEndpointClient
+	}
+	return modelendpoint.NewClient()
+}
+
+func SetupDynamoComponentDeployment(mgr ctrl.Manager, opts DynamoComponentDeploymentSetupOptions) error {
+	if err := (&DynamoComponentDeploymentReconciler{
+		Client:                mgr.GetClient(),
+		Recorder:              mgr.GetEventRecorder("dynamocomponentdeployment"),
+		Config:                opts.Config,
+		RuntimeConfig:         opts.RuntimeConfig,
+		DockerSecretRetriever: opts.DockerSecretRetriever,
+	}).SetupWithManager(mgr); err != nil {
+		return fmt.Errorf("unable to create DynamoComponentDeployment controller: %w", err)
+	}
+	return nil
+}
+
+func SetupDynamoGraphDeployment(mgr ctrl.Manager, opts DynamoGraphDeploymentSetupOptions) error {
+	if err := lpxcontroller.Setup(mgr, opts.Config, opts.RuntimeConfig, opts.DockerSecretRetriever); err != nil {
+		return err
+	}
+	if err := (&DynamoGraphDeploymentReconciler{
+		Client:                mgr.GetClient(),
+		Recorder:              mgr.GetEventRecorder("dynamographdeployment"),
+		Config:                opts.Config,
+		RuntimeConfig:         opts.RuntimeConfig,
+		RestConfig:            mgr.GetConfig(),
+		DockerSecretRetriever: opts.DockerSecretRetriever,
+		SSHKeyManager:         opts.SSHKeyManager,
+	}).SetupWithManager(mgr); err != nil {
+		return fmt.Errorf("unable to create DynamoGraphDeployment controller: %w", err)
+	}
+	return nil
+}
+
+func SetupDynamoGraphDeploymentScalingAdapter(mgr ctrl.Manager, opts SetupOptions) error {
+	if err := (&DynamoGraphDeploymentScalingAdapterReconciler{
+		Client:        mgr.GetClient(),
+		Scheme:        mgr.GetScheme(),
+		Recorder:      mgr.GetEventRecorder("dgdscalingadapter"),
+		Config:        opts.Config,
+		RuntimeConfig: opts.RuntimeConfig,
+	}).SetupWithManager(mgr); err != nil {
+		return fmt.Errorf("unable to create DGDScalingAdapter controller: %w", err)
+	}
+	return nil
+}
+
+func SetupDynamoGraphDeploymentRequest(mgr ctrl.Manager, opts DynamoGraphDeploymentRequestSetupOptions) error {
+	if err := (&DynamoGraphDeploymentRequestReconciler{
+		Client:                  mgr.GetClient(),
+		APIReader:               mgr.GetAPIReader(),
+		Recorder:                mgr.GetEventRecorder("dynamographdeploymentrequest"),
+		Config:                  opts.Config,
+		RuntimeConfig:           opts.RuntimeConfig,
+		GPUDiscoveryCache:       opts.gpuDiscoveryCache(),
+		GPUDiscovery:            opts.gpuDiscovery(),
+		OperatorImage:           opts.OperatorImage,
+		OperatorImagePullPolicy: opts.OperatorImagePullPolicy,
+	}).SetupWithManager(mgr); err != nil {
+		return fmt.Errorf("unable to create DynamoGraphDeploymentRequest controller: %w", err)
+	}
+	return nil
+}
+
+// SetupDynamoGraphDeploymentRequestV1beta2 registers the controller that turns native v1beta2 Requests
+// into Runs. It fails at startup, with a clear message, when the cluster does not serve the v1beta2 APIs.
+func SetupDynamoGraphDeploymentRequestV1beta2(mgr ctrl.Manager, opts SetupOptions) error {
+	if err := requireDGDRV1beta2API(mgr); err != nil {
+		return err
+	}
+	if err := (&DynamoGraphDeploymentRequestV1beta2Reconciler{
+		Client:        mgr.GetClient(),
+		APIReader:     mgr.GetAPIReader(),
+		Config:        opts.Config,
+		RuntimeConfig: opts.RuntimeConfig,
+	}).SetupWithManager(mgr); err != nil {
+		return fmt.Errorf("unable to create DynamoGraphDeploymentRequest v1beta2 controller: %w", err)
+	}
+	return nil
+}
+
+// SetupDynamoGraphDeploymentRunV1beta2 registers the controller that executes immutable
+// v1beta2 Runs as AISimulate Jobs and observes their lifecycle, and the controller that releases
+// the trace claims of deleted Runs.
+func SetupDynamoGraphDeploymentRunV1beta2(mgr ctrl.Manager, opts DynamoGraphDeploymentRunSetupOptions) error {
+	if err := (&DynamoGraphDeploymentRunV1beta2Reconciler{
+		Client:                  mgr.GetClient(),
+		Config:                  opts.Config,
+		RuntimeConfig:           opts.RuntimeConfig,
+		DockerSecretRetriever:   opts.DockerSecretRetriever,
+		PlannerImage:            opts.PlannerImage,
+		DynamoVersion:           opts.DynamoVersion,
+		OperatorImage:           opts.OperatorImage,
+		OperatorImagePullPolicy: opts.OperatorImagePullPolicy,
+	}).SetupWithManager(mgr); err != nil {
+		return fmt.Errorf("unable to create DynamoGraphDeploymentRun v1beta2 controller: %w", err)
+	}
+	if err := (&DynamoGraphDeploymentRunTraceClaimReconciler{
+		Client:        mgr.GetClient(),
+		Config:        opts.Config,
+		RuntimeConfig: opts.RuntimeConfig,
+	}).SetupWithManager(mgr); err != nil {
+		return fmt.Errorf("unable to create DynamoGraphDeploymentRun v1beta2 trace claim controller: %w", err)
+	}
+	return nil
+}
+
+func SetupDynamoModel(mgr ctrl.Manager, opts DynamoModelSetupOptions) error {
+	if err := (&DynamoModelReconciler{
+		Client:         mgr.GetClient(),
+		Recorder:       mgr.GetEventRecorder("dynamomodel"),
+		EndpointClient: opts.modelEndpointClient(),
+		Config:         opts.Config,
+		RuntimeConfig:  opts.RuntimeConfig,
+	}).SetupWithManager(mgr); err != nil {
+		return fmt.Errorf("unable to create DynamoModel controller: %w", err)
+	}
+	return nil
+}
+
+func SetupFailoverCascade(mgr ctrl.Manager) error {
+	if err := (&failoverCascadeReconciler{
+		Client:   mgr.GetClient(),
+		recorder: mgr.GetEventRecorder("gms-failover-cascade"),
+	}).setupWithManager(mgr); err != nil {
+		return fmt.Errorf("unable to create failover cascade controller: %w", err)
+	}
+	return nil
+}
+
+func SetupGMSPodReplacement(mgr ctrl.Manager, opts SetupOptions) error {
+	if err := (&gmsPodReplacementReconciler{
+		Client:        mgr.GetClient(),
+		config:        opts.Config,
+		runtimeConfig: opts.RuntimeConfig,
+	}).setupWithManager(mgr); err != nil {
+		return fmt.Errorf("unable to create GMS Pod replacement controller: %w", err)
+	}
+	return nil
+}
+
+func SetupTopologyLabel(mgr ctrl.Manager, opts SetupOptions) error {
+	if err := (&TopologyLabelReconciler{
+		Client:        mgr.GetClient(),
+		NodeReader:    mgr.GetAPIReader(),
+		Config:        opts.Config,
+		RuntimeConfig: opts.RuntimeConfig,
+		Recorder:      mgr.GetEventRecorder("topology-label"),
+	}).SetupWithManager(mgr); err != nil {
+		return fmt.Errorf("unable to create TopologyLabel controller: %w", err)
+	}
+	return nil
+}

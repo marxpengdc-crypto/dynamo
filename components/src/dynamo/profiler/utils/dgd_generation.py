@@ -1,0 +1,1207 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import argparse
+import json
+import logging
+import uuid
+from collections.abc import Iterable, Mapping
+from copy import deepcopy
+from functools import lru_cache
+from typing import Any, NoReturn, Optional
+
+import numpy as np
+import yaml
+from aisim_core.sdk.perf_database import get_latest_database_version
+
+from dynamo.common.ais_perf_model import AIS_OLD_INPUTS_REMOVE_IN, load_document
+from dynamo.common.configuration.utils import join_names
+from dynamo.common.utils.paths import get_workspace_dir
+from dynamo.mocker.args import build_mocker_parser, set_ais_perf_model_attributes
+from dynamo.mocker.config import old_ais_perf_inputs
+from dynamo.planner.config.aic_interpolation_spec import AICInterpolationSpec
+from dynamo.planner.config.backend_components import MockerComponentName
+from dynamo.planner.config.parallelization import (
+    PickedParallelConfig,
+    picked_to_aic_model_config_kwargs,
+)
+from dynamo.planner.config.planner_config import (
+    AISPerfModelSpec,
+    AISPerfModelValue,
+    PlannerConfig,
+    PlannerPreDeploymentSweepMode,
+    ais_perf_model_role_config,
+)
+from dynamo.profiler.utils.config import (
+    DgdPlannerComponentConfig,
+    get_component_dict,
+    get_main_container,
+    get_main_container_dict,
+    remove_all_argument_occurrences,
+    set_argument_value,
+    set_unique_env_value,
+)
+from dynamo.profiler.utils.config_modifiers.trtllm import enable_trtllm_chunked_prefill
+from dynamo.profiler.utils.dgd_template import load_dgd_template
+from dynamo.profiler.utils.profile_common import (
+    ProfilerOperationalConfig,
+    derive_planner_image,
+    is_kv_router_enabled,
+    is_mocker_enabled,
+    is_planner_enabled,
+    needs_mocker_ais_perf_model,
+    needs_profile_data,
+)
+
+logger = logging.getLogger(__name__)
+
+# ConfigMap name prefixes (a 4-char UUID suffix is appended at runtime
+# so that multiple deployments in the same namespace don't collide)
+PLANNER_CONFIG_PREFIX = "planner-config"
+PLANNER_PROFILE_DATA_PREFIX = "planner-profile-data"
+
+# Well-known mount paths inside pods
+PROFILE_DATA_MOUNT = f"{get_workspace_dir()}/profiling_results"
+PLANNER_CONFIG_MOUNT = f"{get_workspace_dir()}/planner_config"
+
+
+def _make_cm_name(prefix: str) -> str:
+    return f"{prefix}-{uuid.uuid4().hex[:4]}"
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+
+def assemble_final_config(
+    dgdr,
+    ops: ProfilerOperationalConfig,
+    dgd_config: dict | None,
+    best_prefill_config=None,
+    best_decode_config=None,
+    aic_spec: Optional[AICInterpolationSpec] = None,
+    ais_perf_model: Optional[AISPerfModelValue] = None,
+    resolved_backend: Optional[str] = None,
+) -> Any:
+    """Apply Dynamo features to the picked DGD config via composable layers.
+
+    1. **TRT-LLM runtime defaults** — enable chunked prefill on generated
+       TRT-LLM workers so their token budget may be smaller than the request ISL.
+    2. **Mocker** — swap the base to the mocker DGD template if enabled.
+    3. **vLLM self-benchmark** — when the resolved backend is vLLM, set
+       ``DYN_BENCHMARK_MODE`` on each worker so the ``get_perf_metrics``
+       endpoint is populated at runtime. The planner consumes this as
+       priority 1 of its bootstrap chain, superseding AIC and files.
+    4. **KV router** — configure the frontend for KV-cache-aware routing when
+       ``features.kvRouter.enabled`` is true.
+    5. **Planner** — inject the Planner service + planner-config ConfigMap.
+       When ``ais_perf_model`` is given, it is embedded so the planner can
+       initialize its direct AISimulate model with native identity. When
+       ``aic_spec`` is given (rapid mode), it is embedded so the planner can
+       run AIC interpolation at bootstrap if the endpoint is unavailable.
+    6. **Profile data** — attach interpolation-data ConfigMap when mocker
+       or planner-thorough is enabled. The ConfigMap is only emitted when
+       the picked config is disaggregated AND the interpolation NPZ files
+       were produced on disk; rapid-mode deployments never emit it (the
+       planner uses AIC in-process or ``get_perf_metrics`` instead), and
+       agg picks skip interpolation entirely.
+    """
+    if not dgd_config:
+        return dgd_config
+
+    mocker = is_mocker_enabled(dgdr)
+    planner = is_planner_enabled(dgdr)
+    kv_router = is_kv_router_enabled(dgdr)
+    profile = needs_profile_data(dgdr)
+
+    if not mocker and resolved_backend == "trtllm":
+        enable_trtllm_chunked_prefill(dgd_config)
+
+    if not mocker and not planner:
+        if kv_router:
+            enable_kv_router(dgd_config)
+        apply_runtime_version_override(dgdr, dgd_config)
+        return dgd_config
+
+    # Save picked config for auditing
+    dgd_config_path = f"{ops.output_dir}/picked_dgd_config.yaml"
+    with open(dgd_config_path, "w") as f:
+        yaml.safe_dump(dgd_config, f, sort_keys=False)
+
+    # Step 1: choose base config
+    if mocker:
+        logger.info("Mocker enabled — using mocker DGD as base.")
+        base = generate_mocker_config(dgdr, aic_spec=aic_spec)
+    else:
+        base = dgd_config
+
+    if kv_router:
+        enable_kv_router(base)
+
+    # Step 2: for vLLM deployments, turn on the per-worker self-benchmark so
+    # the get_perf_metrics endpoint is available to the planner. Mocker
+    # workers don't use DYN_BENCHMARK_MODE, so skip when mocker is active.
+    if not mocker and resolved_backend == "vllm":
+        enable_vllm_benchmark_mode(base)
+
+    # Steps 3-4: layer features, collecting ConfigMaps
+    config_maps: list[dict] = []
+
+    if planner:
+        planner_cfg = dgdr.features.planner if dgdr.features else None
+        if planner_cfg is not None:
+            enable_planner_worker_scaling_adapters(base, planner_cfg)
+        planner_cm = add_planner_to_config(
+            dgdr,
+            base,
+            best_prefill_mapping=best_prefill_config,
+            best_decode_mapping=best_decode_config,
+            aic_spec=aic_spec,
+            ais_perf_model=ais_perf_model,
+        )
+        config_maps.append(planner_cm)
+
+    if profile:
+        output_dir = ops.output_dir if not ops.dry_run else None
+        profile_cm = add_profile_data_to_config(base, output_dir, mocker_enabled=mocker)
+        if profile_cm:
+            config_maps.append(profile_cm)
+
+    apply_runtime_version_override(dgdr, base)
+    if config_maps:
+        return config_maps + [base]
+    return base
+
+
+def apply_runtime_version_override(dgdr, config_dict: dict) -> None:
+    """Apply the DGDR runtime version to every generated DGD component."""
+    override = dgdr.runtimeVersionOverride
+    if not override:
+        return
+
+    components = config_dict.get("spec", {}).get("components", [])
+    if not isinstance(components, list):
+        return
+    for component in components:
+        if isinstance(component, dict):
+            component["runtimeVersionOverride"] = override
+
+
+def enable_kv_router(config_dict: dict) -> None:
+    """Configure the generated frontend to use KV-cache-aware routing.
+
+    Sets ``DYN_ROUTER_MODE=kv`` on the frontend's main container rather than
+    editing its command/args. ``--router-mode`` reads ``DYN_ROUTER_MODE`` as its
+    env fallback, so this avoids reasoning about whether the module entrypoint
+    lives in ``command`` or ``args`` (e.g. the ``command``-form produced by the
+    PVC/model-path flow), and any explicit user ``--router-mode`` override still
+    wins because flags take precedence over env vars. Frontends with an
+    unexpected generated shape are left unchanged so this final assembly step
+    does not discard profiling results.
+    """
+    components = config_dict.get("spec", {}).get("components", [])
+    if not isinstance(components, list):
+        components = []
+
+    found_frontend = False
+    for component in components:
+        if not isinstance(component, dict) or component.get("type") != "frontend":
+            continue
+        found_frontend = True
+        container = get_main_container_dict(component)
+        if container is None:
+            logger.warning(
+                "Skipping KV router configuration for frontend %r because it has no main container",
+                component.get("name"),
+            )
+            continue
+        container["env"] = set_unique_env_value(
+            container.get("env"), "DYN_ROUTER_MODE", "kv"
+        )
+
+    if not found_frontend:
+        logger.warning(
+            "Skipping KV router configuration because the generated DGD has no frontend component"
+        )
+
+
+_VLLM_BENCHMARK_MODE_BY_COMPONENT_TYPE = {
+    "prefill": "prefill",
+    "decode": "decode",
+    "worker": "agg",
+}
+
+
+def enable_vllm_benchmark_mode(config_dict: dict) -> None:
+    """Set ``DYN_BENCHMARK_MODE`` on every typed vLLM worker.
+
+    The caller invokes this only for vLLM deployments. Worker roles are resolved
+    from the v1beta1 ``spec.components[].type`` field, so custom and legacy
+    component names receive the same benchmark mode as canonical names.
+
+    Mutates ``config_dict`` in place. The operation is idempotent: an existing
+    ``DYN_BENCHMARK_MODE`` entry is replaced with the role-correct value.
+    """
+    components = config_dict.get("spec", {}).get("components", [])
+    if not isinstance(components, list):
+        return
+
+    for component in components:
+        if not isinstance(component, dict):
+            continue
+        mode = _VLLM_BENCHMARK_MODE_BY_COMPONENT_TYPE.get(component.get("type"))
+        if mode is None:
+            continue
+        main_container = get_main_container_dict(component)
+        if main_container is None:
+            continue
+        env_list = main_container.get("env") or []
+        main_container["env"] = env_list
+        # Strip any existing DYN_BENCHMARK_MODE; append the type-derived value.
+        env_list[:] = [
+            entry
+            for entry in env_list
+            if not (
+                isinstance(entry, dict) and entry.get("name") == "DYN_BENCHMARK_MODE"
+            )
+        ]
+        env_list.append({"name": "DYN_BENCHMARK_MODE", "value": mode})
+        logger.info(
+            "Enabled vLLM self-benchmark on component %s (DYN_BENCHMARK_MODE=%s)",
+            component.get("name", "<unnamed>"),
+            mode,
+        )
+
+
+def generate_mocker_config(
+    dgdr, aic_spec: Optional[AICInterpolationSpec] = None
+) -> dict:
+    """Load the mocker DGD template and apply DGDR images and model paths.
+
+    When ``aic_spec`` is provided (planner-rapid with an AIC-supported backend),
+    inject ``--ais-perf-model`` with an inline config onto the prefill/decode
+    workers so each mocker pod pulls its latency model directly from the
+    AIConfigurator SDK at runtime — no NPZ round-trip through the profiler.
+
+    When ``overrides.dgd`` adds an argument that needs the old AIS worker
+    arguments, every worker keeps those instead, unless the override gives
+    ``--ais-perf-model`` a value.
+
+    Returns:
+        The mocker DGD config dict (no planner, no ConfigMaps).
+
+    Raises:
+        ValueError: ``overrides.dgd`` gives ``--ais-perf-model`` a value in a
+            ``command`` list while the workers get a generated value.
+    """
+    mocker_config = load_dgd_template("mocker", "disagg")
+
+    image = dgdr.image
+    if image:
+        components = mocker_config.get("spec", {}).get("components", [])
+        for component in components:
+            if not isinstance(component, dict):
+                continue
+            main_container = get_main_container_dict(component)
+            if main_container is not None:
+                main_container["image"] = image
+
+    model = dgdr.model
+    ais_workers = _mocker_ais_worker_picks(aic_spec)
+    inject_ais_args = _inject_mocker_ais_args
+    if ais_workers:
+        override = dgdr.overrides.dgd if dgdr.overrides is not None else None
+        _refuse_ais_perf_model_value_in_command(override)
+        names = _old_ais_override_arguments(override)
+        if names:
+            logger.warning(
+                "overrides.dgd sets %s: the generated mocker workers keep the old "
+                "AIS arguments (--ais-perf-model without a value plus --ais-* "
+                "flags), which are deprecated and will be removed in %s; to end "
+                "this, write --ais-perf-model VALUE in the override and remove its "
+                "old --ais-* arguments",
+                join_names(names),
+                AIS_OLD_INPUTS_REMOVE_IN,
+            )
+            inject_ais_args = _inject_mocker_ais_args_old_form
+    for worker_name in _mocker_worker_names():
+        component = get_component_dict(mocker_config, worker_name)
+        if component:
+            main_container = get_main_container_dict(component)
+            if main_container is None:
+                continue
+            args_list = main_container.get("args", [])
+            args_list = set_argument_value(args_list, "--model-path", model)
+            args_list = set_argument_value(args_list, "--model-name", model)
+            pick = ais_workers.get(worker_name) if ais_workers else None
+            if pick is not None and aic_spec is not None:
+                args_list = inject_ais_args(args_list, aic_spec, pick)
+            main_container["args"] = args_list
+
+    return mocker_config
+
+
+def enable_planner_worker_scaling_adapters(
+    config_dict: dict, planner_config: PlannerConfig
+) -> None:
+    """Opt worker components into DGDSA when Planner manages replicas."""
+    if planner_config.advisory:
+        return
+
+    components = config_dict.get("spec", {}).get("components", [])
+    if not isinstance(components, list):
+        return
+
+    target_subcomponents = _planner_scaling_subcomponents(planner_config.mode)
+    untyped_worker_count = sum(
+        1
+        for component in components
+        if isinstance(component, dict)
+        and component.get("type") == "worker"
+        and _infer_subcomponent_from_component_name(component.get("name", "")) is None
+    )
+
+    for component in components:
+        if not isinstance(component, dict):
+            continue
+        if not _is_planner_scalable_worker_component(
+            component,
+            target_subcomponents,
+            planner_config.mode,
+            untyped_worker_count,
+        ):
+            continue
+        scaling_adapter = component.setdefault("scalingAdapter", {})
+        if not isinstance(scaling_adapter, dict):
+            component["scalingAdapter"] = {"enabled": True}
+            continue
+        scaling_adapter["enabled"] = True
+
+
+def _is_planner_scalable_worker_component(
+    component: dict,
+    target_subcomponents: set[str],
+    planner_mode: str,
+    untyped_worker_count: int,
+) -> bool:
+    component_type = component.get("type")
+    if component_type in target_subcomponents:
+        return True
+    if component_type != "worker":
+        return False
+
+    inferred_type = _infer_subcomponent_from_component_name(component.get("name", ""))
+    if inferred_type is not None:
+        if inferred_type in target_subcomponents:
+            component["type"] = inferred_type
+            return True
+        return False
+
+    if planner_mode == "agg" and untyped_worker_count == 1:
+        component["type"] = "decode"
+        return True
+
+    return False
+
+
+def _planner_scaling_subcomponents(planner_mode: str) -> set[str]:
+    if planner_mode == "prefill":
+        return {"prefill"}
+    if planner_mode in {"decode", "agg"}:
+        return {"decode"}
+    if planner_mode == "disagg":
+        return {"prefill", "decode"}
+    return set()
+
+
+def _infer_subcomponent_from_component_name(component_name: str) -> Optional[str]:
+    normalized = component_name.lower()
+    if "prefill" in normalized:
+        return "prefill"
+    if "decode" in normalized:
+        return "decode"
+    return None
+
+
+def _mocker_ais_worker_picks(
+    aic_spec: Optional[AICInterpolationSpec],
+) -> Optional[dict[str, PickedParallelConfig]]:
+    if aic_spec is None:
+        return None
+    return {
+        MockerComponentName.prefill_worker_k8s_name: aic_spec.prefill_pick,
+        MockerComponentName.decode_worker_k8s_name: aic_spec.decode_pick,
+    }
+
+
+def _perf_model_config(
+    pick: PickedParallelConfig,
+    *,
+    model: str,
+    system: str,
+    backend: str,
+    backend_version: Optional[str] = None,
+    worker_type: Optional[str] = None,
+) -> dict[str, Any]:
+    """Return the perf model config of a worker deployed with ``pick``.
+
+    A key that would only repeat AISimulate's default is left out: ``pp`` of 1,
+    the MoE sizes of a dense pick and ``cp_size`` of 1.
+    """
+    config: dict[str, Any] = {"model": model, "system": system, "backend": backend}
+    if backend_version is not None:
+        config["backend_version"] = backend_version
+    if worker_type is not None:
+        config["worker_type"] = worker_type
+    config["tp"] = pick.tp
+    if pick.pp != 1:
+        config["pp"] = pick.pp
+    config["attention_dp"] = pick.dp
+    # Dense picks use (1, 1) as a sentinel, not an MoE topology.
+    if (pick.moe_tp, pick.moe_ep) != (1, 1):
+        config["moe_tp_size"] = pick.moe_tp
+        config["moe_ep_size"] = pick.moe_ep
+    # Like AIS's own compiler, spell CP out only above one so CP1
+    # identities stay byte-identical to configs written before CP.
+    if pick.cp > 1:
+        config["cp_size"] = pick.cp
+    return config
+
+
+def _inject_mocker_ais_args(
+    args_list: list,
+    aic_spec: AICInterpolationSpec,
+    pick: PickedParallelConfig,
+) -> list:
+    """Set ``--ais-perf-model`` to an inline config on one mocker worker's args list.
+
+    The mocker simulates vllm/sglang scheduling; for trtllm AIC data we keep
+    the default ``--engine-type`` and only name trtllm as the config's ``backend``.
+    """
+    config = _perf_model_config(
+        pick,
+        # The perf model follows the model the worker serves.
+        model=args_list[args_list.index("--model-path") + 1]
+        if "--model-path" in args_list
+        else aic_spec.hf_id,
+        system=aic_spec.system,
+        backend=aic_spec.backend,
+        backend_version=get_latest_database_version(
+            system=aic_spec.system, backend=aic_spec.backend
+        ),
+    )
+    args_list = set_argument_value(
+        args_list,
+        "--ais-perf-model",
+        json.dumps(config, sort_keys=True, separators=(",", ":")),
+    )
+    if aic_spec.backend in ("vllm", "sglang"):
+        args_list = set_argument_value(args_list, "--engine-type", aic_spec.backend)
+    return args_list
+
+
+def _inject_mocker_ais_args_old_form(
+    args_list: list,
+    aic_spec: AICInterpolationSpec,
+    pick: PickedParallelConfig,
+) -> list:
+    """Inject the deprecated ``--ais-*`` flags onto one mocker worker's args list.
+
+    The mocker simulates vllm/sglang scheduling; for trtllm AIC data we keep
+    the default ``--engine-type`` and only override ``--ais-backend`` so the
+    perf-model lookups point at the correct database.
+    """
+    kwargs = picked_to_aic_model_config_kwargs(pick)
+    if "--ais-perf-model" not in args_list:
+        args_list.append("--ais-perf-model")
+    args_list = set_argument_value(args_list, "--ais-backend", aic_spec.backend)
+    backend_version = get_latest_database_version(
+        system=aic_spec.system, backend=aic_spec.backend
+    )
+    if backend_version is not None:
+        args_list = set_argument_value(
+            args_list, "--ais-backend-version", backend_version
+        )
+    args_list = set_argument_value(args_list, "--ais-system", aic_spec.system)
+    args_list = set_argument_value(args_list, "--ais-tp-size", str(kwargs["tp_size"]))
+    for field in ("moe_tp_size", "moe_ep_size"):
+        flag = "--ais-" + field.replace("_", "-")
+        if kwargs["moe_tp_size"] * kwargs["moe_ep_size"] > 1:
+            args_list = set_argument_value(args_list, flag, str(kwargs[field]))
+        else:
+            # Dense picks use (1, 1) as a sentinel, not an MoE topology.
+            args_list = remove_all_argument_occurrences(args_list, flag)
+    args_list = set_argument_value(
+        args_list, "--ais-attention-dp-size", str(kwargs["attention_dp_size"])
+    )
+    if aic_spec.backend in ("vllm", "sglang"):
+        args_list = set_argument_value(args_list, "--engine-type", aic_spec.backend)
+    return args_list
+
+
+class _OverrideArguments(argparse.ArgumentParser):
+    """A parser for an argument list that a deployment override writes.
+
+    An error is a ``ValueError``, not an exit. A value is kept as written.
+    """
+
+    def error(self, message: str) -> NoReturn:
+        raise ValueError(message)
+
+    def exit(self, status: int = 0, message: Optional[str] = None) -> NoReturn:
+        raise ValueError(message or f"argument parsing exited with {status}")
+
+    def _get_value(self, action: argparse.Action, arg_string: str) -> Any:
+        return arg_string
+
+    def _check_value(self, action: argparse.Action, value: Any) -> None:
+        return None
+
+
+@lru_cache(maxsize=1)
+def _mocker_parser() -> argparse.ArgumentParser:
+    """Return the mocker's own parser; no default comes from this process."""
+    return build_mocker_parser({}, _OverrideArguments(add_help=False))
+
+
+def _read_as_mocker(args: list[str]) -> Optional[argparse.Namespace]:
+    """Return what a mocker reads from ``args``, or ``None`` when it rejects them.
+
+    What is not a mocker argument is skipped.
+    """
+    parser = _mocker_parser()
+    try:
+        namespace, _ = parser.parse_known_args(list(args))
+        # The variable of this process is not the worker's.
+        set_ais_perf_model_attributes(parser, namespace, None)
+    except ValueError:
+        return None
+    return namespace
+
+
+def _nested_value(value: Any, *keys: str) -> Any:
+    """Follow ``keys`` into nested mappings; ``None`` where a level is not one."""
+    for key in keys:
+        if not isinstance(value, Mapping):
+            return None
+        value = value.get(key)
+    return value
+
+
+def _override_argument_lists(
+    override: Any, keys: tuple[str, ...] = ("command", "args")
+) -> list[list[str]]:
+    """Return every argument list a DGD override writes for a service or component.
+
+    Both override versions are read; any other shape is skipped. Names are not
+    matched with the generated workers. ``keys`` are the container keys read.
+    """
+    containers: list[Any] = []
+    services = _nested_value(override, "spec", "services")
+    if isinstance(services, Mapping):
+        containers.extend(
+            _nested_value(service, "extraPodSpec", "mainContainer")
+            for service in services.values()
+        )
+    components = _nested_value(override, "spec", "components")
+    if isinstance(components, list):
+        for component in components:
+            pod_containers = _nested_value(
+                component, "podTemplate", "spec", "containers"
+            )
+            if isinstance(pod_containers, list):
+                containers.extend(pod_containers)
+    argument_lists = []
+    for container in containers:
+        for key in keys:
+            args = _nested_value(container, key)
+            if isinstance(args, list) and all(isinstance(arg, str) for arg in args):
+                argument_lists.append(args)
+    return argument_lists
+
+
+def _refuse_ais_perf_model_value_in_command(override: Any) -> None:
+    """Raise when an override's ``command`` list gives ``--ais-perf-model`` a value."""
+    for command in _override_argument_lists(override, keys=("command",)):
+        read = _read_as_mocker(command)
+        if read is not None and read.ais_perf_model_value is not None:
+            raise ValueError(
+                "overrides.dgd gives --ais-perf-model a value in a container's "
+                "command list; a generated mocker worker would use its generated "
+                "value instead, because the generated args come after the command. "
+                "Write --ais-perf-model VALUE in the container's args list"
+            )
+
+
+def _old_ais_override_arguments(override: Any) -> list[str]:
+    """Return the override arguments that need the old AIS worker arguments.
+
+    They are an old ``--ais-*`` flag, ``--extra-engine-args``, ``--model-path``
+    and a ``--ais-perf-model`` without a value; none if any list gives it one.
+    """
+    names: list[str] = []
+    for args in _override_argument_lists(override):
+        read = _read_as_mocker(args)
+        if read is None:
+            continue
+        if read.ais_perf_model_value is not None:
+            # A value anywhere makes every generated worker use the new
+            # argument: the mocker takes the last value typed and refuses an
+            # old flag next to it.
+            return []
+        found = old_ais_perf_inputs(read)
+        if read.extra_engine_args is not None:
+            found.append("--extra-engine-args")
+        if read.model_path is not None:
+            found.append("--model-path")
+        for name in found:
+            if name not in names:
+                names.append(name)
+    return names
+
+
+def add_planner_to_config(
+    dgdr,
+    config_dict: dict,
+    best_prefill_mapping=None,
+    best_decode_mapping=None,
+    aic_spec: Optional[AICInterpolationSpec] = None,
+    ais_perf_model: Optional[AISPerfModelValue] = None,
+) -> dict:
+    """Add a Planner component and its planner-config ConfigMap to *config_dict*.
+
+    The planner's ``profile_results_dir`` is always set to the well-known
+    mount path so the pod knows where to look when profile data is
+    mounted separately by :func:`add_profile_data_to_config`.
+
+    Args:
+        dgdr: DynamoGraphDeploymentRequestSpec.
+        config_dict: The base DGD config (real or mocker) — mutated in place.
+        best_prefill_mapping: Picked prefill parallel config.
+        best_decode_mapping: Picked decode parallel config.
+        aic_spec: AIC interpolation spec (rapid mode). When set, the planner
+            runs AIC in-process at bootstrap instead of reading NPZ files.
+        ais_perf_model: Canonical AIS forward-pass perf model identity for
+            real-time Planner engine queries.
+
+    Returns:
+        The ``planner_config_cm`` ConfigMap dict.
+    """
+    planner_cfg = _build_planner_config(
+        dgdr,
+        best_prefill_mapping,
+        best_decode_mapping,
+        aic_spec,
+        ais_perf_model,
+    )
+    planner_cfg.profile_results_dir = PROFILE_DATA_MOUNT
+
+    planner_component = DgdPlannerComponentConfig()
+    if dgdr.image:
+        get_main_container(planner_component).image = derive_planner_image(dgdr.image)
+
+    planner_dict = planner_component.model_dump(exclude_unset=False)
+
+    planner_config_cm_name = _make_cm_name(PLANNER_CONFIG_PREFIX)
+
+    # --- ConfigMap: planner config ---
+    planner_config_cm = {
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": {"name": planner_config_cm_name},
+        "data": {
+            "planner_config.json": planner_cfg.model_dump_json(),
+        },
+    }
+
+    # --- Mount planner-config ConfigMap into the planner component ---
+    pod_spec = planner_dict.setdefault("podTemplate", {}).setdefault("spec", {})
+    planner_volumes = pod_spec.get("volumes") or []
+    pod_spec["volumes"] = planner_volumes
+    mc_dict = get_main_container_dict(planner_dict)
+    if mc_dict is None:
+        raise ValueError("Generated Planner component has no main container")
+    mc_mounts = mc_dict.get("volumeMounts") or []
+    mc_dict["volumeMounts"] = mc_mounts
+
+    planner_volumes.append(
+        {
+            "name": planner_config_cm_name,
+            "configMap": {"name": planner_config_cm_name},
+        }
+    )
+    mc_mounts.append(
+        {
+            "name": planner_config_cm_name,
+            "mountPath": PLANNER_CONFIG_MOUNT,
+            "readOnly": True,
+        }
+    )
+
+    mc_args = mc_dict.get("args") or []
+    mc_dict["args"] = mc_args
+    mc_args.extend(["--config", f"{PLANNER_CONFIG_MOUNT}/planner_config.json"])
+
+    components = config_dict["spec"].setdefault("components", [])
+    components[:] = [
+        component
+        for component in components
+        if not (isinstance(component, dict) and component.get("name") == "Planner")
+    ]
+    components.append(planner_dict)
+
+    return planner_config_cm
+
+
+def add_profile_data_to_config(
+    config_dict: dict,
+    output_dir: str | None,
+    mocker_enabled: bool = False,
+) -> Optional[dict]:
+    """Create a profile-data ConfigMap and mount it into consumers in *config_dict*.
+
+    Consumers are auto-detected:
+    - The **Planner** component (if present) gets the volume mounted.
+    - **Mocker workers** (when *mocker_enabled*) get the volume mounted and
+      ``--planner-profile-data`` set.
+
+    Args:
+        config_dict: The DGD config dict — mutated in place.
+        output_dir: Directory containing profiling interpolation NPZ files.
+        mocker_enabled: Only inject ``--planner-profile-data`` into workers
+            when the mocker backend is active.  Non-mocker backends (vllm,
+            sglang, trtllm) do not recognise this argument.
+
+    Returns:
+        The ``profile_data_cm`` ConfigMap dict, or ``None`` if no profiling
+        data was found.
+    """
+    profiling_data = _load_profiling_data(output_dir) if output_dir else {}
+    if not profiling_data:
+        return None
+
+    profile_data_cm_name = _make_cm_name(PLANNER_PROFILE_DATA_PREFIX)
+
+    profile_cm_data: dict[str, str] = {}
+    # TODO: use enums
+    if profiling_data.get("prefill"):
+        profile_cm_data["prefill_raw_data.json"] = json.dumps(profiling_data["prefill"])
+    if profiling_data.get("decode"):
+        profile_cm_data["decode_raw_data.json"] = json.dumps(profiling_data["decode"])
+
+    profile_data_cm = {
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": {"name": profile_data_cm_name},
+        "data": profile_cm_data,
+    }
+
+    planner_component = get_component_dict(config_dict, "Planner")
+    if planner_component is not None:
+        _mount_volume_into_component(
+            planner_component, profile_data_cm_name, PROFILE_DATA_MOUNT
+        )
+
+    # Mount into mocker workers only when the mocker backend is active.
+    # Non-mocker backends (vllm, sglang, trtllm) share the same service
+    # names ("prefill", "decode") but do not accept --planner-profile-data.
+    if mocker_enabled:
+        for worker_name in _mocker_worker_names():
+            worker_component = get_component_dict(config_dict, worker_name)
+            if worker_component is not None:
+                main_container = get_main_container_dict(worker_component)
+                if main_container is None:
+                    continue
+                args_list = main_container.get("args", [])
+                args_list = set_argument_value(
+                    args_list, "--planner-profile-data", PROFILE_DATA_MOUNT
+                )
+                main_container["args"] = args_list
+                _mount_volume_into_component(
+                    worker_component, profile_data_cm_name, PROFILE_DATA_MOUNT
+                )
+
+    return profile_data_cm
+
+
+# ---------------------------------------------------------------------------
+# Private helpers
+# ---------------------------------------------------------------------------
+
+
+def _mocker_worker_names() -> list[str]:
+    return [
+        MockerComponentName.prefill_worker_k8s_name,
+        MockerComponentName.decode_worker_k8s_name,
+    ]
+
+
+def _mount_volume_into_component(
+    component: dict, cm_name: str, mount_path: str
+) -> None:
+    """Add a ConfigMap volume and main-container mount to a component."""
+    pod_spec = component.setdefault("podTemplate", {}).setdefault("spec", {})
+    volumes = pod_spec.get("volumes") or []
+    pod_spec["volumes"] = volumes
+    volumes.append(
+        {
+            "name": cm_name,
+            "configMap": {"name": cm_name},
+        }
+    )
+    main_container = get_main_container_dict(component)
+    if main_container is None:
+        raise ValueError(f"Component {component.get('name')!r} has no main container")
+    volume_mounts = main_container.get("volumeMounts") or []
+    main_container["volumeMounts"] = volume_mounts
+    volume_mounts.append(
+        {
+            "name": cm_name,
+            "mountPath": mount_path,
+            "readOnly": True,
+        }
+    )
+
+
+def _build_planner_config(
+    dgdr,
+    best_prefill_mapping,
+    best_decode_mapping,
+    aic_spec: Optional[AICInterpolationSpec] = None,
+    ais_perf_model: Optional[AISPerfModelValue] = None,
+) -> PlannerConfig:
+    """Build a PlannerConfig from the DGDR spec and picked parallel configs."""
+    if dgdr.features and dgdr.features.planner:
+        planner_cfg = dgdr.features.planner.model_copy(deep=True)
+    else:
+        planner_cfg = PlannerConfig()
+
+    if not planner_cfg.model_name:
+        planner_cfg.model_name = dgdr.model
+
+    if best_prefill_mapping is not None:
+        planner_cfg.prefill_engine_num_gpu = best_prefill_mapping.num_gpus
+
+    if best_decode_mapping is not None:
+        planner_cfg.decode_engine_num_gpu = best_decode_mapping.num_gpus
+
+    if aic_spec is not None:
+        planner_cfg.aic_interpolation = aic_spec
+    if ais_perf_model is not None:
+        planner_cfg.ais_perf_model = ais_perf_model
+
+    # Propagate SLA targets from spec.sla so the post-deployment planner enforces
+    # the same SLA used at sweep time. Without this, the planner silently uses
+    # SLAPlannerDefaults ttft_ms=500 / itl_ms=50.
+    #
+    # Gate on model_fields_set: run_profile() calls valid_dgdr_spec() first, which
+    # injects a defaulted SLASpec() (ttft=2000, itl=30) when spec.sla is omitted.
+    # Only values the user explicitly set are in model_fields_set, so a defaulted
+    # SLASpec falls through and keeps the prior planner defaults.
+    #
+    # Explicit user overrides on features.planner.{ttft_ms, itl_ms} take precedence.
+
+    sla = dgdr.sla
+    if (
+        sla is not None
+        and sla.e2eLatency is None
+        and ("ttft" in sla.model_fields_set or "itl" in sla.model_fields_set)
+    ):
+        explicit = (
+            dgdr.features.planner.model_fields_set
+            if dgdr.features and dgdr.features.planner
+            else set()
+        )
+        if "ttft_ms" not in explicit:
+            planner_cfg.ttft_ms = float(sla.ttft)
+        if "itl_ms" not in explicit:
+            planner_cfg.itl_ms = float(sla.itl)
+
+    return planner_cfg
+
+
+# The keys of a perf model config that say which deployment it describes.
+_IDENTITY_FIELDS = (
+    "model",
+    "system",
+    "backend",
+    "worker_type",
+    "tp",
+    "pp",
+    "attention_dp",
+    "moe_tp_size",
+    "moe_ep_size",
+    "cp_size",
+)
+# Of these, the ones that mean 1 where a config has no value for them.
+_ONE_WHEN_UNSET = ("pp", "moe_tp_size", "moe_ep_size", "cp_size")
+
+
+def _stated_configs(
+    value: AISPerfModelValue, roles: Iterable[str]
+) -> dict[str, dict[str, Any]]:
+    """Return what a user's ``ais_perf_model`` value states for each role.
+
+    A complete config comes checked and with every default. A config that
+    takes keys from a source comes with only the keys written next to it.
+    """
+    if isinstance(value, AISPerfModelSpec):
+        # A dataset profile is written under its worker type and nothing else.
+        return {role: value.roles.get(role, {"worker_type": role}) for role in roles}
+    document = load_document(value)
+    stated = {}
+    for role in roles:
+        entry = document.select(role)
+        stated[role] = (
+            entry if "from" in entry else ais_perf_model_role_config(role, entry)
+        )
+    return stated
+
+
+def build_ais_perf_model_spec(
+    dgdr,
+    best_prefill_pick: Optional[PickedParallelConfig],
+    best_decode_pick: Optional[PickedParallelConfig],
+    resolved_backend: str,
+    system: str,
+) -> Optional[AISPerfModelValue]:
+    """Build native AIS identity for the Planner's AISimulate integration.
+
+    This is intentionally independent from AIC interpolation. It does not
+    request a sweep; it only gives the Planner enough identity and parallelism
+    data to try native forward-pass estimation before falling back to
+    observed-FPM regression.
+
+    The result is a list with one perf model config per worker type of the
+    Planner mode. A value the user wrote is checked against the selected
+    deployment and returned as written. Fields a config takes from a source
+    are not compared; one warning names them.
+    """
+    planner = (
+        dgdr.features.planner  # type: ignore[union-attr]
+        if dgdr.features is not None and dgdr.features.planner is not None
+        else None
+    )
+    if (
+        not is_planner_enabled(dgdr)
+        or planner is None
+        or planner.optimization_target != "sla"
+    ):
+        return None
+    mode = planner.mode
+    picks = {}
+    if mode in ("prefill", "disagg"):
+        picks["prefill"] = best_prefill_pick
+    if mode in ("decode", "agg", "disagg"):
+        picks["aggregated" if mode == "agg" else "decode"] = best_decode_pick
+
+    written = planner.ais_perf_model
+    if written is not None:
+        # A message names a config the way its form writes it.
+        name, joiner = (
+            ("ais_perf_model.roles.{}", ".")
+            if isinstance(written, AISPerfModelSpec)
+            else ("ais_perf_model entry for {}", ": ")
+        )
+        stated = _stated_configs(written, picks)
+        not_compared: dict[str, list[str]] = {}
+        for role, pick in picks.items():
+            if pick is None:
+                raise ValueError(
+                    f"cannot validate {name.format(role)} without a selected deployment"
+                )
+            selected = _perf_model_config(
+                pick,
+                model=dgdr.model,
+                system=system,
+                backend=resolved_backend,
+                worker_type=role,
+            )
+            for field in _IDENTITY_FIELDS:
+                if field not in stated[role]:
+                    not_compared.setdefault(role, []).append(field)
+                    continue
+                authored, chosen = stated[role][field], selected.get(field)
+                if field in _ONE_WHEN_UNSET:
+                    authored = 1 if authored is None else authored
+                    chosen = 1 if chosen is None else chosen
+                if authored != chosen:
+                    raise ValueError(
+                        f"{name.format(role)}{joiner}{field}={authored!r} "
+                        f"conflicts with selected deployment {field}={chosen!r}"
+                    )
+        if not_compared:
+            logger.warning(
+                "ais_perf_model: the profiler does not read the source a config "
+                "takes keys from, so it did not compare these fields with the "
+                "selected deployment: %s. The Planner takes them from the source "
+                "without a comparison.",
+                "; ".join(
+                    f"{role}: {join_names(fields)}"
+                    for role, fields in not_compared.items()
+                ),
+            )
+        return deepcopy(written)
+
+    if resolved_backend not in ("trtllm", "vllm", "sglang"):
+        return None
+    selected_picks = {role: pick for role, pick in picks.items() if pick is not None}
+    if len(selected_picks) != len(picks):
+        return None
+
+    backend_version = get_latest_database_version(
+        system=system,
+        backend=resolved_backend,
+    )
+    if backend_version is None:
+        logger.warning(
+            "No AIS performance database is available for system=%s, backend=%s; "
+            "Planner will use FPM regression instead of native AIS estimates.",
+            system,
+            resolved_backend,
+        )
+        return None
+
+    return [
+        _perf_model_config(
+            pick,
+            model=dgdr.model,
+            system=system,
+            backend=resolved_backend,
+            backend_version=backend_version,
+            worker_type=role,
+        )
+        for role, pick in selected_picks.items()
+    ]
+
+
+def build_aic_interpolation_spec(
+    dgdr,
+    best_prefill_pick: Optional[PickedParallelConfig],
+    best_decode_pick: Optional[PickedParallelConfig],
+    isl: int,
+    osl: int,
+    sweep_max_context_length: int,
+    resolved_backend: str,
+    system: str,
+    prefill_interpolation_granularity: int,
+    decode_interpolation_granularity: int,
+) -> Optional[AICInterpolationSpec]:
+    """Build an ``AICInterpolationSpec`` for rapid-mode AIC consumers.
+
+    Consumed by both the planner (to bootstrap perf models in-process) and
+    the mocker (via ``--ais-perf-model`` flags injected into worker args).
+    Returns ``None`` when any of the following hold:
+
+    * neither a throughput-scaling Planner with a rapid sweep nor a mocker in
+      rapid mode needs it
+    * picks are missing
+    * ``resolved_backend`` is not one AIC supports
+
+    .. note::
+        The spec only carries ``prefill_pick`` + ``decode_pick``, so the
+        caller in ``profile_sla.py`` gates this on a disaggregated pick
+        (``is_disagg_config``). When rapid AIC picks an aggregated config
+        and the override to disagg fails, ``aic_spec`` is ``None`` and the
+        planner has no AIC fallback — it relies solely on the
+        ``get_perf_metrics`` endpoint (``DYN_BENCHMARK_MODE``).
+
+        TODO: extend ``AICInterpolationSpec`` with an ``agg_pick`` so
+        throughput-scaling on an aggregated deployment has a matching
+        AIC bootstrap path (planner + mocker + thorough NPZ). Tracking
+        via the wider agg+throughput-scaling rework.
+    """
+    planner = (
+        dgdr.features.planner  # type: ignore[union-attr]
+        if dgdr.features is not None and dgdr.features.planner is not None
+        else None
+    )
+    mocker_needs_aic = needs_mocker_ais_perf_model(dgdr)
+    planner_needs_aic = (
+        is_planner_enabled(dgdr)
+        and planner is not None
+        and planner.enable_throughput_scaling
+        and planner.pre_deployment_sweeping_mode == PlannerPreDeploymentSweepMode.Rapid
+    )
+    if not planner_needs_aic and not mocker_needs_aic:
+        return None
+    if best_prefill_pick is None or best_decode_pick is None:
+        logger.info(
+            "Rapid mode but picks are missing; skipping aic_interpolation spec."
+        )
+        return None
+    if resolved_backend not in ("trtllm", "vllm", "sglang"):
+        logger.info(
+            "Rapid mode but backend %r is not supported by AIC; skipping spec.",
+            resolved_backend,
+        )
+        return None
+
+    return AICInterpolationSpec(
+        hf_id=dgdr.model,
+        system=system,
+        backend=resolved_backend,
+        isl=isl,
+        osl=osl,
+        sweep_max_context_length=sweep_max_context_length,
+        prefill_interpolation_granularity=prefill_interpolation_granularity,
+        decode_interpolation_granularity=decode_interpolation_granularity,
+        prefill_pick=best_prefill_pick,
+        decode_pick=best_decode_pick,
+    )
+
+
+def _load_profiling_data(output_dir: str) -> dict:
+    """Load interpolation profiling data from NPZ files."""
+    result: dict = {}
+
+    prefill_npz = f"{output_dir}/selected_prefill_interpolation/raw_data.npz"
+    try:
+        with np.load(prefill_npz) as p_raw:
+            result["prefill"] = {
+                "prefill_isl": p_raw["prefill_isl"].tolist(),
+                "prefill_ttft": p_raw["prefill_ttft"].tolist(),
+                "prefill_thpt_per_gpu": p_raw["prefill_thpt_per_gpu"].tolist(),
+            }
+    except FileNotFoundError:
+        pass
+
+    decode_npz = f"{output_dir}/selected_decode_interpolation/raw_data.npz"
+    try:
+        with np.load(decode_npz) as d_raw:
+            max_kv_tokens = d_raw["max_kv_tokens"]
+            if hasattr(max_kv_tokens, "tolist"):
+                max_kv_tokens_val = max_kv_tokens.tolist()
+                if isinstance(max_kv_tokens_val, list):
+                    max_kv_tokens_val = (
+                        int(max_kv_tokens_val[0]) if max_kv_tokens_val else 0
+                    )
+                else:
+                    max_kv_tokens_val = int(max_kv_tokens_val)
+            else:
+                max_kv_tokens_val = int(max_kv_tokens)
+
+            result["decode"] = {
+                "x_kv_usage": d_raw["x_kv_usage"].tolist(),
+                "y_context_length": d_raw["y_context_length"].tolist(),
+                "z_itl": d_raw["z_itl"].tolist(),
+                "z_thpt_per_gpu": d_raw["z_thpt_per_gpu"].tolist(),
+                "max_kv_tokens": max_kv_tokens_val,
+            }
+    except FileNotFoundError:
+        pass
+
+    return result

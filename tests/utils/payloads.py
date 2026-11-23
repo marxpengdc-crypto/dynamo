@@ -1,0 +1,3795 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import base64
+import json
+import logging
+import math
+import re
+import shutil
+import struct
+import subprocess
+import tempfile
+import time
+import uuid
+import wave
+from copy import deepcopy
+from dataclasses import dataclass, field
+from fractions import Fraction
+from io import BytesIO
+from typing import Any, Callable, Dict, List, Optional, cast
+
+import psutil
+import requests
+
+from dynamo import prometheus_names  # type: ignore[attr-defined]
+from tests.utils.constants import DefaultPort
+from tests.utils.engine_metrics import EngineMetrics
+from tests.utils.http_checks import check_health_generate as check_health_generate
+from tests.utils.http_checks import check_models_api as check_models_api
+from tests.utils.prometheus import find_metric_samples, sum_metric_samples
+from tests.utils.router_nvext import (
+    RouterNvextExpectation,
+    parse_sse_json_chunks,
+    require_router_worker_id,
+    validate_router_nvext,
+)
+from tests.utils.sglang_generate import assert_native_stream
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class BasePayload:
+    """Generic payload body plus expectations and repeat count."""
+
+    body: Dict[str, Any]
+    expected_response: List[Any]  # Can be List[str] or List[List[str]] for alternatives
+    expected_log: List[str]
+    expected_status_code: int = field(default=200, kw_only=True)
+    # Number of times to send this exact request in sequence. Each call must
+    # pass validation independently. Use >1 for cache/repeatability tests
+    # (e.g., CachedTokensChatPayload asserts a cache hit on the 2nd+ call).
+    # Independent of max_attempts: repeat_count=N means "N independent
+    # successes required"; max_attempts=N means "at least one success out of
+    # N tries".
+    repeat_count: int = 1
+    timeout: int = 60
+
+    # Connection info
+    host: str = "localhost"
+    port: int = DefaultPort.FRONTEND.value
+    endpoint: str = ""
+    method: str = "POST"
+    # Optional additional ports used by specialized payloads (e.g. LoRA system/control-plane APIs).
+    # This is intentionally empty by default to preserve prior semantics.
+    system_ports: list[int] = field(default_factory=list)
+    # When True, the HTTP request is made with stream=True (for SSE responses).
+    http_stream: bool = False
+    # Maximum number of attempts for validation inside run_serve_deployment.
+    # ``1`` (default) means no retry — first validation failure surfaces
+    # immediately. Set >1 only when the test target is non-deterministic and
+    # you've confirmed via tests/README.md "Flaky Tests" that retry is the
+    # right mitigation; the underlying flakiness still needs a tracking ticket.
+    max_attempts: int = 1
+
+    def url(self) -> str:
+        ep = self.endpoint.lstrip("/")
+        return f"http://{self.host}:{self.port}/{ep}"
+
+    def with_model(self, model):
+        p = deepcopy(self)
+        if "model" not in p.body:
+            p.body = {**p.body, "model": model}
+        return p
+
+    def body_for_iteration(self, _iteration: int) -> Dict[str, Any]:
+        """Return the request body for one repeat_count iteration."""
+        return self.body
+
+    def bind_environment(self, env: dict[str, str]) -> None:
+        """Bind deployment-specific connection settings before requests run."""
+
+    def before_request(self) -> None:
+        """Prepare observations immediately before each HTTP request attempt."""
+
+    def response_handler(self, response: Any) -> str:
+        """Extract a text representation of the response for logging/validation."""
+        raise NotImplementedError("Subclasses must implement response_handler()")
+
+    def validate(self, response: Any, content: str) -> None:
+        """Default validation: ensure expected substrings appear in content.
+
+        If expected_response is a list of strings, ANY one of them matching is sufficient (OR logic).
+        This allows flexible validation where responses may vary but should contain at least one keyword.
+        """
+        if self.expected_response:
+            # Check if content is empty
+            if not content:
+                logger.error("VALIDATION FAILED - Response content is empty")
+                raise AssertionError(
+                    f"Expected content not found in response. Expected any of: {self.expected_response}. Actual content is empty."
+                )
+
+            # Check if ANY of the expected strings are found (OR logic) and count matches
+            found_keywords = []
+            for expected in self.expected_response:
+                if isinstance(expected, str) and expected.lower() in content.lower():
+                    found_keywords.append(expected)
+
+            if not found_keywords:
+                logger.error(
+                    f"VALIDATION FAILED - Actual content returned: {repr(content)}"
+                )
+                logger.error(
+                    f"Expected to find at least one of: {self.expected_response}"
+                )
+                logger.error(f"Matches found: 0/{len(self.expected_response)}")
+                raise AssertionError(
+                    f"Expected content not found in response. Expected at least one of: {self.expected_response}. Actual content: {repr(content)}"
+                )
+
+            logger.info(
+                f"SUCCESS: Found {len(found_keywords)}/{len(self.expected_response)} expected keywords: {found_keywords}"
+            )
+
+    def process_response(self, response: Any) -> str:
+        """Convenience: run response_handler then validate; return content."""
+        content = self.response_handler(response)
+        self.validate(response, content)
+        return content
+
+
+@dataclass
+class HttpErrorPayload(BasePayload):
+    """Payload that validates an expected HTTP error response."""
+
+    expected_status_code: int = field(default=400, kw_only=True)
+
+    def response_handler(self, response: Any) -> str:
+        return response.text
+
+
+@dataclass
+class HttpCancellationPayload(BasePayload):
+    """Disconnect an HTTP stream after its first content, before completion.
+
+    Follow this with a normal chat payload to verify public recovery behavior.
+    With metrics, also require early engine cleanup. Without metrics this does
+    not assert that the engine stopped generating or reclaimed resources.
+    """
+
+    metrics: EngineMetrics | None = field(kw_only=True)
+    endpoint: str = "/v1/chat/completions"
+    http_stream: bool = True
+    timeout: int = 30
+    _before: float | None = field(default=None, init=False, repr=False)
+    _completion_progress: float = field(default=0, init=False, repr=False)
+
+    def bind_environment(self, env: dict[str, str]) -> None:
+        if self.metrics is not None:
+            self.metrics.bind_environment(env)
+
+    def _sampling_params(self) -> dict:
+        return self.body
+
+    def _generated_content(self, chunk: dict) -> str:
+        for choice in chunk.get("choices", []):
+            assert choice.get("finish_reason") is None, (
+                "Generation finished before cancellation",
+                choice,
+            )
+            delta = choice.get("delta") or {}
+            content = delta.get("content") or delta.get("reasoning_content") or ""
+            if content:
+                return content
+        return ""
+
+    def before_request(self) -> None:
+        params = self._sampling_params()
+        if not self.http_stream or self.body.get("stream") is not True:
+            raise ValueError("Cancellation requires a streaming request")
+        if params.get("ignore_eos") is not True or params.get("n", 1) != 1:
+            raise ValueError("Cancellation requires ignore_eos=True and n=1")
+        max_tokens = params.get("max_tokens")
+        if type(max_tokens) is not int or max_tokens <= 1:
+            raise ValueError("Cancellation requires max_tokens > 1")
+        if self.max_attempts != 1:
+            raise ValueError("Cancellation checks must not retry failed assertions")
+        if self.metrics is not None:
+            self._completion_progress = self.metrics.completion_progress(max_tokens)
+            self.metrics.wait_for_scheduler()
+            self._before = self.metrics.progress()
+
+    def response_handler(self, response: requests.Response) -> str:
+        try:
+            if self.metrics is not None and self._before is None:
+                raise RuntimeError("before_request must run before cancellation")
+            response.raise_for_status()
+            deadline = time.monotonic() + self.timeout
+            content = ""
+            # Keep the stream iterator alive until the explicit response.close().
+            lines = response.iter_lines(chunk_size=1)
+            for line in lines:
+                assert time.monotonic() < deadline, "No content before cancellation"
+                if not line.startswith(b"data:"):
+                    continue
+                data = line[5:].strip()
+                assert data != b"[DONE]", "Generation finished before cancellation"
+                chunk = json.loads(data)
+                assert "error" not in chunk, chunk
+                content = self._generated_content(chunk)
+                if content:
+                    break
+            assert content, "Stream ended without generated content"
+            if self.metrics is not None:
+                self.metrics.wait_for_scheduler(is_active=True)
+        finally:
+            response.close()
+        if self.metrics is not None:
+            self.metrics.assert_cancelled(
+                before=self._before, completion_progress=self._completion_progress
+            )
+        return content
+
+
+def _listener_pid(port: int) -> int:
+    for conn in psutil.net_connections(kind="tcp"):
+        if (
+            conn.status == psutil.CONN_LISTEN
+            and conn.laddr
+            and conn.laddr.port == port
+            and conn.pid is not None
+        ):
+            return conn.pid
+    raise AssertionError(f"No process listens on port {port}")
+
+
+def _kill_tree(pid: int) -> None:
+    try:
+        parent = psutil.Process(pid)
+        processes = [parent, *parent.children(recursive=True)]
+    except psutil.NoSuchProcess:
+        return
+    for process in processes:
+        try:
+            process.kill()
+        except psutil.NoSuchProcess:
+            pass
+
+
+@dataclass
+class EngineFailurePayload(BasePayload):
+    """Kill the engine serving a chat stream; migration must finish the stream.
+
+    `workers` are launch-script worker indices N. The worker whose sidecar
+    (DYN_SYSTEM_PORT{N}) reports the in-flight request loses its engine
+    (DYN_ENGINE_GRPC_PORT{N}) to SIGKILL, and the sidecar stays up. The
+    deployment needs DYN_MIGRATION_LIMIT > 0, and DYN_LAUNCH_WAIT_ALL=1 so the
+    launch script outlives the engine. It loses that worker, so run it last.
+    """
+
+    workers: tuple[int, ...] = field(kw_only=True)
+    endpoint: str = "/v1/chat/completions"
+    http_stream: bool = True
+    timeout: int = 180
+    chunks_before_fault: int = 5
+    _system_ports: dict[int, int] = field(default_factory=dict, init=False)
+    _engine_ports: dict[int, int] = field(default_factory=dict, init=False)
+    _frontend_port: int = field(default=0, init=False)
+    _migrations_before: float = field(default=0, init=False)
+
+    def bind_environment(self, env: dict[str, str]) -> None:
+        self._frontend_port = int(env["DYN_HTTP_PORT"])
+        for index in self.workers:
+            self._system_ports[index] = int(env[f"DYN_SYSTEM_PORT{index}"])
+            self._engine_ports[index] = int(env[f"DYN_ENGINE_GRPC_PORT{index}"])
+
+    def _scrape(self, port: int, name: str, labels: dict[str, str]) -> float:
+        with requests.get(f"http://127.0.0.1:{port}/metrics", timeout=2) as response:
+            response.raise_for_status()
+            return sum_metric_samples(response.text, name, labels)
+
+    def _migrations(self) -> float:
+        return self._scrape(
+            self._frontend_port,
+            "dynamo_frontend_model_migration_total",
+            {"migration_type": "ongoing_request"},
+        )
+
+    def before_request(self) -> None:
+        self._migrations_before = self._migrations()
+
+    def _serving_worker(self) -> int:
+        deadline = time.monotonic() + 10
+        while True:
+            for index, port in self._system_ports.items():
+                inflight = self._scrape(
+                    port,
+                    "dynamo_component_inflight_requests",
+                    {"dynamo_endpoint": "generate"},
+                )
+                if inflight > 0:
+                    return index
+            assert time.monotonic() < deadline, "No worker reports the request"
+            time.sleep(0.05)
+
+    def response_handler(self, response: requests.Response) -> str:
+        try:
+            response.raise_for_status()
+            deadline = time.monotonic() + self.timeout
+            parts: list[str] = []
+            chunks = 0
+            finish_reason = None
+            usage = None
+            faulted = False
+            for line in response.iter_lines(chunk_size=1):
+                assert time.monotonic() < deadline, "Stream exceeded its deadline"
+                if not line.startswith(b"data:"):
+                    continue
+                data = line[5:].strip()
+                if data == b"[DONE]":
+                    break
+                chunk = json.loads(data)
+                assert "error" not in chunk, ("Stream failed after fault", chunk)
+                usage = chunk.get("usage") or usage
+                for choice in chunk.get("choices", []):
+                    delta = choice.get("delta") or {}
+                    content = delta.get("content") or delta.get("reasoning_content")
+                    if content:
+                        parts.append(content)
+                        chunks += 1
+                    finish_reason = choice.get("finish_reason") or finish_reason
+                if not faulted and chunks >= self.chunks_before_fault:
+                    engine_port = self._engine_ports[self._serving_worker()]
+                    _kill_tree(_listener_pid(engine_port))
+                    faulted = True
+        finally:
+            response.close()
+        assert faulted, "Stream ended before the fault was injected"
+        assert finish_reason == "length", f"Unexpected finish: {finish_reason}"
+        assert usage is not None, "Missing usage"
+        assert usage["completion_tokens"] == self.body["max_tokens"], usage
+        # The router may first retry the faulted worker, which is still
+        # registered, so more than one migration is fine.
+        assert self._migrations() > self._migrations_before, "Request did not migrate"
+        return "".join(parts)
+
+
+@dataclass
+class SGLangGenerateCancellationPayload(HttpCancellationPayload):
+    """Cancel native SGLang generation through the Dynamo HTTP frontend."""
+
+    endpoint: str = "/generate"
+
+    def with_model(self, model):
+        return deepcopy(self)
+
+    def _sampling_params(self) -> dict:
+        params = self.body["sampling_params"]
+        return {**params, "max_tokens": params["max_new_tokens"]}
+
+    def _generated_content(self, chunk: dict) -> str:
+        assert chunk["meta_info"].get("finish_reason") is None, chunk
+        # SGLang's Rust server omits output_ids from a chunk without tokens.
+        output_ids = chunk.get("output_ids", [])
+        return json.dumps(output_ids) if output_ids else ""
+
+
+@dataclass
+class SGLangGenerateRecoveryPayload(BasePayload):
+    """Validate native streaming output and engine progress after cancellation."""
+
+    metrics: EngineMetrics = field(kw_only=True)
+    endpoint: str = "/generate"
+    http_stream: bool = True
+    _before: float | None = field(default=None, init=False, repr=False)
+
+    def with_model(self, model):
+        return deepcopy(self)
+
+    def bind_environment(self, env: dict[str, str]) -> None:
+        self.metrics.bind_environment(env)
+
+    def before_request(self) -> None:
+        self.metrics.wait_for_scheduler()
+        self._before = self.metrics.progress()
+
+    def response_handler(self, response: requests.Response) -> str:
+        assert self._before is not None, "before_request must run before recovery"
+        events = []
+        is_finished = False
+        for line in response.iter_lines():
+            if not line.startswith(b"data:"):
+                continue
+            data = line[5:].strip()
+            assert not is_finished, "Response continued after [DONE]"
+            if data == b"[DONE]":
+                is_finished = True
+                continue
+            event = json.loads(data)
+            assert not event.get("error"), event
+            events.append(event)
+        assert is_finished, "Native stream ended without [DONE]"
+        output_ids = assert_native_stream(
+            events, prompt_tokens=len(self.body["input_ids"])
+        )
+        max_tokens = self.body["sampling_params"]["max_new_tokens"]
+        assert len(output_ids) == max_tokens, events
+        assert all(
+            event["meta_info"].get("finish_reason") is None for event in events[:-1]
+        ), events
+        assert events[-1]["meta_info"]["finish_reason"]["type"] == "length", events[-1]
+        self.metrics.wait_for_scheduler()
+        self.metrics.assert_recovered(before=self._before, max_tokens=max_tokens)
+        return json.dumps(events)
+
+
+@dataclass
+class ChatPayload(BasePayload):
+    """Payload for chat completions endpoint."""
+
+    endpoint: str = "/v1/chat/completions"
+    expected_num_choices: Optional[int] = None
+
+    @staticmethod
+    def extract_content(response):
+        """
+        Process chat completions API responses.
+        """
+        response.raise_for_status()
+        result = response.json()
+
+        assert (
+            "choices" in result
+        ), f"Missing 'choices' in response. Response keys: {list(result.keys())}"
+        assert len(result["choices"]) > 0, "Empty choices in response"
+        assert (
+            "message" in result["choices"][0]
+        ), f"Missing 'message' in first choice. Choice keys: {list(result['choices'][0].keys())}"
+
+        # Check for content in all possible fields where parsers might put output:
+        # 1. content - standard message content
+        # 2. reasoning_content - for models with reasoning parsers
+        # 3. refusal - when the model refuses to answer
+        # 4. tool_calls - for function/tool calling responses
+
+        message = result["choices"][0]["message"]
+
+        content = message.get("content", "")
+        reasoning_content = message.get("reasoning_content", "")
+        refusal = message.get("refusal", "")
+
+        tool_calls = message.get("tool_calls", [])
+        tool_content = ""
+        if tool_calls:
+            tool_content = ", ".join(
+                call.get("function", {}).get("arguments", "")
+                for call in tool_calls
+                if call.get("function", {}).get("arguments")
+            )
+
+        for field_content in [content, reasoning_content, refusal, tool_content]:
+            if field_content:
+                return field_content
+
+        raise AssertionError(
+            "All possible content fields are empty in message. "
+            f"Checked: content={repr(content)}, reasoning_content={repr(reasoning_content)}, "
+            f"refusal={repr(refusal)}, tool_calls={tool_calls}"
+        )
+
+    def response_handler(self, response: Any) -> str:
+        return ChatPayload.extract_content(response)
+
+    def validate(self, response: Any, content: str) -> None:
+        super().validate(response, content)
+
+        if self.expected_num_choices is None:
+            return
+
+        result = response.json()
+        choices = result.get("choices")
+        assert isinstance(choices, list), f"Missing choices list: {result}"
+        assert len(choices) == self.expected_num_choices, (
+            f"Expected {self.expected_num_choices} choices, "
+            f"got {len(choices)}: {result}"
+        )
+
+
+@dataclass
+class StopStringChatPayload(ChatPayload):
+    """End a chat completion on its single stop string.
+
+    Checks the finish reason and that the output ends at the stop string,
+    keeping it only with include_stop_str_in_output. With metrics, also
+    requires the engine to stop at the match instead of running to max_tokens.
+    """
+
+    metrics: EngineMetrics | None = field(default=None, kw_only=True)
+    _before: float | None = field(default=None, init=False, repr=False)
+    _completion_progress: float = field(default=0, init=False, repr=False)
+
+    def bind_environment(self, env: dict[str, str]) -> None:
+        if self.metrics is not None:
+            self.metrics.bind_environment(env)
+
+    def before_request(self) -> None:
+        if self.metrics is not None:
+            self._completion_progress = self.metrics.completion_progress(
+                self.body["max_tokens"]
+            )
+            self.metrics.wait_for_scheduler()
+            self._before = self.metrics.progress()
+
+    def validate(self, response: Any, content: str) -> None:
+        super().validate(response, content)
+        (stop,) = self.body["stop"]
+        choice = response.json()["choices"][0]
+        assert choice["finish_reason"] == "stop", choice
+        if self.body.get("include_stop_str_in_output") is True:
+            assert content.endswith(stop), f"Expected output to end with {stop!r}"
+        else:
+            assert stop not in content, f"Expected {stop!r} trimmed from output"
+        if self.metrics is not None:
+            assert self._before is not None, "before_request must run first"
+            self.metrics.assert_cancelled(
+                before=self._before, completion_progress=self._completion_progress
+            )
+
+
+def _validate_chat_token_usage(result: Dict[str, Any]) -> None:
+    usage = result.get("usage")
+    assert isinstance(usage, dict), f"Missing usage: {result!r}"
+    nvext = result.get("nvext") or {}
+    for kind in ("completion", "prompt"):
+        count = usage.get(f"{kind}_tokens")
+        assert type(count) is int and count > 0, usage
+        field = f"{kind}_token_ids"
+        token_ids = nvext.get(field)
+        assert isinstance(token_ids, list) and all(
+            type(token) is int and token >= 0 for token in token_ids
+        ), f"Missing or invalid {field}: {token_ids!r}"
+        assert (
+            len(token_ids) == count
+        ), f"{field} count does not match usage: {token_ids!r}, {usage!r}"
+    assert usage.get("total_tokens") == (
+        usage["prompt_tokens"] + usage["completion_tokens"]
+    ), f"Inconsistent total token usage: {usage!r}"
+
+
+@dataclass
+class DisaggregatedChatPayload(ChatPayload):
+    """Require a completed chat request served by distinct prefill and decode workers."""
+
+    expected_finish_reason: str | None = None
+    expected_completion_tokens: int | None = None
+
+    def validate(self, response: Any, content: str) -> None:
+        super().validate(response, content)
+        result = response.json()
+        choices = result["choices"]
+        if len(choices) != 1:
+            raise AssertionError(f"Expected one completion, got {choices!r}")
+        if not isinstance(content, str) or not content.strip():
+            raise AssertionError("Completion is empty")
+        if choices[0].get("finish_reason") not in {"stop", "length"}:
+            raise AssertionError(f"Unexpected finish reason: {choices[0]!r}")
+        if self.expected_finish_reason is not None:
+            assert (
+                choices[0]["finish_reason"] == self.expected_finish_reason
+            ), f"Expected finish reason {self.expected_finish_reason!r}: {choices[0]!r}"
+
+        usage = result.get("usage")
+        if not isinstance(usage, dict):
+            raise AssertionError(f"Missing usage: {result!r}")
+        prompt_tokens = usage.get("prompt_tokens")
+        completion_tokens = usage.get("completion_tokens")
+        if type(prompt_tokens) is not int or prompt_tokens <= 0:
+            raise AssertionError(f"Expected positive prompt usage: {usage!r}")
+        if type(completion_tokens) is not int or completion_tokens <= 1:
+            raise AssertionError(
+                f"Expected decode to generate more than the prefill token: {usage!r}"
+            )
+        if self.expected_completion_tokens is not None:
+            assert (
+                completion_tokens == self.expected_completion_tokens
+            ), f"Expected {self.expected_completion_tokens} completion tokens: {usage!r}"
+            _validate_chat_token_usage(result)
+        if self.body.get("logprobs"):
+            logprobs = (choices[0].get("logprobs") or {}).get("content")
+            _validate_chat_logprobs(logprobs)
+            assert [item["token_id"] for item in logprobs] == result["nvext"][
+                "completion_token_ids"
+            ], "Handoff logprobs do not match completion token positions"
+
+        workers = require_router_worker_id(result, context=type(self).__name__)
+        for role in ("prefill_worker_id", "decode_worker_id"):
+            if type(workers.get(role)) is not int or workers[role] < 0:
+                raise AssertionError(f"Expected a valid {role}: {dict(workers)!r}")
+        if workers["prefill_worker_id"] == workers["decode_worker_id"]:
+            raise AssertionError(
+                f"Expected distinct prefill and decode workers: {dict(workers)!r}"
+            )
+
+
+@dataclass
+class KvTransferPayload(DisaggregatedChatPayload):
+    """Require a fresh completed KV transfer for this frontend request."""
+
+    prefill_metrics: EngineMetrics = field(kw_only=True)
+    decode_metrics: EngineMetrics = field(kw_only=True)
+    transfer_metrics: EngineMetrics = field(kw_only=True)
+    _transfer_before: float | None = field(default=None, init=False, repr=False)
+
+    def bind_environment(self, env: dict[str, str]) -> None:
+        for metrics in (
+            self.prefill_metrics,
+            self.decode_metrics,
+            self.transfer_metrics,
+        ):
+            metrics.bind_environment(env)
+
+    def body_for_iteration(self, iteration: int) -> Dict[str, Any]:
+        body = deepcopy(super().body_for_iteration(iteration))
+        message = body["messages"][0]
+        message["content"] = f"Request {uuid.uuid4()}. " + message["content"]
+        return body
+
+    def before_request(self) -> None:
+        self.prefill_metrics.wait_for_scheduler()
+        self.decode_metrics.wait_for_scheduler()
+        self._transfer_before = self.transfer_metrics.transfer_progress()
+
+    def validate(self, response: Any, content: str) -> None:
+        super().validate(response, content)
+        assert (
+            self._transfer_before is not None
+        ), "Missing pre-request transfer baseline"
+        self.transfer_metrics.wait_for_transfer(before=self._transfer_before)
+        self.decode_metrics.wait_for_scheduler()
+        self.prefill_metrics.wait_for_scheduler()
+
+
+_KV_ROUTING_PROMPTS = (
+    "Amber rabbits explore quiet meadows. " * 96,
+    "Violet submarines navigate distant oceans. " * 96,
+)
+
+
+@dataclass
+class _KvRoutingPayload(ChatPayload):
+    """Warm two routing targets, then require their cached prefixes to route back."""
+
+    routed_workers: tuple[int, ...] = field(kw_only=True)
+    _env: dict[str, str] = field(default_factory=dict, init=False, repr=False)
+    _targets: list[tuple[int, int]] = field(
+        default_factory=list, init=False, repr=False
+    )
+
+    def bind_environment(self, env: dict[str, str]) -> None:
+        self._env = env
+
+    def _generate_instances(self, counts: dict[str, int]) -> dict[str, list[int]]:
+        """Return frontend-discovered generate instance IDs once each component has its count."""
+        deadline = time.monotonic() + 60
+        instances: dict[str, list[int]] = {component: [] for component in counts}
+        while time.monotonic() < deadline:
+            try:
+                response = requests.get(
+                    f"http://{self.host}:{self.port}/health?instances=true", timeout=5
+                )
+                if response.status_code == 200:
+                    health = response.json()
+                    instances = {
+                        component: sorted(
+                            {
+                                instance["instance_id"]
+                                for instance in health["instances"]
+                                if instance["namespace"] == self._env["DYN_NAMESPACE"]
+                                and instance["endpoint"] == "generate"
+                                and instance["component"] == component
+                            }
+                        )
+                        for component in counts
+                    }
+                    if all(
+                        len(instances[component]) >= count
+                        for component, count in counts.items()
+                    ):
+                        break
+            except requests.RequestException:
+                pass
+            time.sleep(0.25)
+        for component, count in counts.items():
+            assert len(instances[component]) == count, instances
+        return instances
+
+    def _stored_event_counts(self) -> dict[int, tuple[float, float]]:
+        """Read each routed worker's received and accepted Stored-event counters."""
+        metric_name = (
+            f"{prometheus_names.name_prefix.COMPONENT}_"
+            f"{prometheus_names.kv_publisher.ZMQ_EVENTS_TOTAL}"
+        )
+        counts = {}
+        for worker in self.routed_workers:
+            port = self._env[f"DYN_SYSTEM_PORT{worker}"]
+            response = requests.get(f"http://{self.host}:{port}/metrics", timeout=5)
+            response.raise_for_status()
+            received, accepted = (
+                sum_metric_samples(
+                    response.text, metric_name, {"stage": stage, "event_type": "stored"}
+                )
+                for stage in ("received", "accepted")
+            )
+            counts[worker] = (received, accepted)
+        return counts
+
+    def _send_routed(
+        self,
+        prompt: str,
+        *,
+        headers: dict[str, str] | None = None,
+        is_query_only: bool = False,
+    ) -> tuple[Any, dict[str, Any], bool]:
+        """Send one streamed request and return its router selection, nvext and text flag."""
+        response = requests.post(
+            self.url(),
+            json={
+                "model": self.body["model"],
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 8,
+                "temperature": 0,
+                "stream": True,
+                "nvext": {
+                    "extra_fields": ["worker_id", "timing"],
+                    "annotations": ["query_instance_id:"] if is_query_only else [],
+                },
+            },
+            headers=headers,
+            timeout=30,
+        )
+        assert response.status_code == 200, response.text
+        assert "data: [DONE]" in response.text, response.text
+        nvext: dict[str, Any] = {}
+        has_generated_text = False
+        for chunk in parse_sse_json_chunks(response.text):
+            assert "error" not in chunk, chunk
+            nvext.update(chunk.get("nvext") or {})
+            for choice in chunk.get("choices", []):
+                delta = choice.get("delta") or {}
+                has_generated_text |= any(
+                    delta.get(name)
+                    for name in ("content", "reasoning_content", "reasoning")
+                )
+        return require_router_worker_id({"nvext": nvext}), nvext, has_generated_text
+
+    @staticmethod
+    def _hit_rate(nvext: dict[str, Any], has_generated_text: bool) -> float:
+        assert has_generated_text, "Request completed without generating text"
+        hit_rate = nvext.get("timing", {}).get("kv_hit_rate")
+        assert isinstance(hit_rate, (int, float)), nvext
+        assert 0 <= hit_rate <= 1, nvext
+        return hit_rate
+
+    def _send(self, prompt: str, target: tuple[int, int] | None = None):
+        raise NotImplementedError
+
+    def _warm_and_wait_for_kv_events(self) -> None:
+        """Warm each target with its prompt until its Stored events reach the router."""
+        targets = self._targets
+        baselines = self._stored_event_counts()
+        for prompt, target in zip(_KV_ROUTING_PROMPTS, targets):
+            selected, _ = self._send(prompt, target)
+            assert selected == target, (selected, target)
+        deadline = time.monotonic() + 60
+        observed: list[tuple[tuple[int, int], float]] = []
+        counts: dict[int, tuple[float, float]] = {}
+        while time.monotonic() < deadline:
+            # Pinned completions expose timing without warming the other target.
+            observed = [
+                self._send(prompt, target)
+                for prompt, target in zip(_KV_ROUTING_PROMPTS, targets)
+            ]
+            counts = self._stored_event_counts()
+            if all(
+                selected == expected and hit_rate >= 0.5
+                for (selected, hit_rate), expected in zip(observed, targets)
+            ) and all(
+                all(
+                    current > baseline
+                    for current, baseline in zip(counts[worker], baselines[worker])
+                )
+                for worker in self.routed_workers
+            ):
+                return
+            time.sleep(0.1)
+        raise AssertionError(
+            f"KV events did not converge: expected targets={targets}, "
+            f"routing={observed}, Stored counters={counts}, baselines={baselines}"
+        )
+
+    def _assert_prefixes_route_to_cache(self) -> None:
+        for prompt_index in (0, 0, 1, 0, 1, 1):
+            selected, hit_rate = self._send(_KV_ROUTING_PROMPTS[prompt_index])
+            expected = self._targets[prompt_index]
+            assert selected == expected, (prompt_index, selected, self._targets)
+            assert hit_rate >= 0.5, (prompt_index, selected, hit_rate)
+
+
+@dataclass
+class KvRoutingPayload(_KvRoutingPayload):
+    """Require engine KV events to route repeated prefixes to the cached worker or DP rank."""
+
+    block_size: int = field(kw_only=True)
+    dp_ranks: tuple[int, ...] = field(default=(0,), kw_only=True)
+
+    def _send(
+        self,
+        prompt: str,
+        target: tuple[int, int] | None = None,
+        *,
+        is_query_only: bool = False,
+    ) -> tuple[tuple[int, int], float | None]:
+        headers = None
+        if target is not None:
+            headers = {
+                "x-dynamo-worker-instance-id": str(target[0]),
+                "x-dynamo-dp-rank": str(target[1]),
+            }
+        selected, nvext, has_generated_text = self._send_routed(
+            prompt, headers=headers, is_query_only=is_query_only
+        )
+        selected_target = (selected["prefill_worker_id"], selected["prefill_dp_rank"])
+        assert selected_target in self._targets, selected
+        assert (
+            selected["decode_worker_id"],
+            selected["decode_dp_rank"],
+        ) == selected_target, selected
+        if is_query_only:
+            assert not has_generated_text, nvext
+            assert len(nvext.get("token_ids", [])) >= self.block_size * 4, nvext
+            return selected_target, None
+        return selected_target, self._hit_rate(nvext, has_generated_text)
+
+    def final_validation(self) -> None:
+        assert len(self.routed_workers) * len(self.dp_ranks) == 2
+        workers = self._generate_instances({"backend": len(self.routed_workers)})
+        self._targets = [
+            (worker_id, rank)
+            for worker_id in workers["backend"]
+            for rank in self.dp_ranks
+        ]
+        for prompt in _KV_ROUTING_PROMPTS:
+            self._send(prompt, is_query_only=True)
+        self._warm_and_wait_for_kv_events()
+        for prompt, target in zip(_KV_ROUTING_PROMPTS, self._targets):
+            selected, _ = self._send(prompt, is_query_only=True)
+            assert selected == target, (selected, target)
+        self._assert_prefixes_route_to_cache()
+
+
+@dataclass
+class DisaggregatedKvRoutingPayload(_KvRoutingPayload):
+    """Require routing to the cached prefill worker and a fresh KV transfer to decode."""
+
+    # vLLM counts KV transfers on decode engines and SGLang on prefill engines.
+    transfer_metrics: tuple[EngineMetrics, ...] = field(kw_only=True)
+    _decode_ids: list[int] = field(default_factory=list, init=False, repr=False)
+
+    def bind_environment(self, env: dict[str, str]) -> None:
+        super().bind_environment(env)
+        for metrics in self.transfer_metrics:
+            metrics.bind_environment(env)
+
+    def _transfer_total(self) -> float:
+        return sum(metrics.transfer_progress() for metrics in self.transfer_metrics)
+
+    def _send(
+        self, prompt: str, target: tuple[int, int] | None = None
+    ) -> tuple[tuple[int, int], float]:
+        # Keep the cached prefix while forcing at least one fresh KV block.
+        prompt += f"\nRequest {uuid.uuid4()}. " + "Continue counting. " * 32
+        headers = None
+        if target is not None:
+            headers = {
+                "x-dynamo-prefill-instance-id": str(target[0]),
+                "x-dynamo-prefill-dp-rank": str(target[1]),
+            }
+        # Pinned requests warm both prefill engines; routed requests must transfer.
+        before = None if target is not None else self._transfer_total()
+        selected, nvext, has_generated_text = self._send_routed(prompt, headers=headers)
+        selected_target = (selected["prefill_worker_id"], selected["prefill_dp_rank"])
+        assert selected_target in self._targets, selected
+        assert selected["decode_worker_id"] in self._decode_ids, selected
+        if before is not None:
+            deadline = time.monotonic() + 10
+            while self._transfer_total() <= before:
+                assert time.monotonic() < deadline, (
+                    "No completed KV transfer for routed request",
+                    selected,
+                )
+                time.sleep(0.05)
+        return selected_target, self._hit_rate(nvext, has_generated_text)
+
+    def final_validation(self) -> None:
+        assert len(self.routed_workers) == 2
+        workers = self._generate_instances({"prefill": 2, "backend": 2})
+        self._decode_ids = workers["backend"]
+        assert set(workers["prefill"]).isdisjoint(self._decode_ids), workers
+        self._targets = [(worker_id, 0) for worker_id in workers["prefill"]]
+        self._warm_and_wait_for_kv_events()
+        self._assert_prefixes_route_to_cache()
+
+
+class OmittedMaxTokensChatPayload(ChatPayload):
+    """Require more output than SGLang's 128-token default when `max_tokens` is omitted."""
+
+    def validate(self, response: Any, content: str) -> None:
+        super().validate(response, content)
+        usage = response.json()["usage"]
+        assert usage["completion_tokens"] > 128, usage
+
+
+class RouterNvextChatPayload(ChatPayload):
+    """Chat payload that validates structured router metadata in nvext."""
+
+    def __init__(
+        self,
+        *args,
+        router_nvext_expectation: RouterNvextExpectation | None = None,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self.router_nvext_expectation = router_nvext_expectation
+
+    def validate(self, response: Any, content: str) -> None:
+        super().validate(response, content)
+        validate_router_nvext(
+            response.json(),
+            self.router_nvext_expectation,
+            context=type(self).__name__,
+        )
+
+
+def _validate_chat_logprobs(content_logprobs) -> None:
+    assert content_logprobs, "Missing or empty requested output logprobs"
+    for item in content_logprobs:
+        candidates = item["top_logprobs"]
+        for entry in [item, *candidates]:
+            value = entry["logprob"]
+            assert math.isfinite(value) and value <= 0, f"Invalid logprob: {entry!r}"
+            assert isinstance(entry["token"], str), f"Invalid token: {entry!r}"
+            assert "bytes" in entry, f"Missing token bytes: {entry!r}"
+            if entry["bytes"] is not None:
+                assert isinstance(
+                    entry["bytes"], list
+                ), f"Invalid token bytes: {entry!r}"
+
+
+@dataclass
+class ChatPayloadWithLogprobs(ChatPayload):
+    """Chat payload that validates logprobs in response."""
+
+    def validate(self, response: Any, content: str) -> None:
+        """Validate response contains logprobs fields."""
+        super().validate(response, content)
+
+        result = response.json()
+        choice = result["choices"][0]
+
+        # Validate logprobs field exists
+        assert "logprobs" in choice, "Missing 'logprobs' in choice"
+
+        logprobs_data = choice["logprobs"]
+        requested_top_logprobs = self.body.get("top_logprobs") or 0
+        if requested_top_logprobs > 0:
+            assert (
+                logprobs_data is not None
+            ), "Expected logprobs for top_logprobs request"
+        if logprobs_data is not None:
+            assert "content" in logprobs_data, "Missing 'content' in logprobs"
+            content_logprobs = logprobs_data["content"]
+            if requested_top_logprobs > 0:
+                assert (
+                    content_logprobs
+                ), "Expected logprobs content for top_logprobs request"
+
+            if content_logprobs:
+                # Validate structure of logprobs
+                for item in content_logprobs:
+                    assert "token" in item, "Missing 'token' in logprobs content"
+                    assert "logprob" in item, "Missing 'logprob' in logprobs content"
+                    assert (
+                        "top_logprobs" in item
+                    ), "Missing 'top_logprobs' in logprobs content"
+
+                    if requested_top_logprobs > 0:
+                        assert item[
+                            "top_logprobs"
+                        ], "Expected top_logprobs alternatives"
+
+                    # Sanity check: logprob should be valid (not nan/inf/positive)
+                    logprob_val = item["logprob"]
+                    assert not math.isnan(logprob_val), "logprob is NaN"
+                    assert not math.isinf(logprob_val), "logprob is infinite"
+                    assert (
+                        logprob_val <= 0
+                    ), f"logprob should be <= 0, got {logprob_val}"
+
+                    # Validate bytes field is populated for the selected token
+                    assert "bytes" in item, "Missing 'bytes' in logprobs content item"
+                    token_str = item["token"]
+                    if token_str:
+                        assert (
+                            item["bytes"] is not None
+                        ), f"'bytes' should be populated for non-empty token {token_str!r}"
+                        assert isinstance(
+                            item["bytes"], list
+                        ), f"'bytes' should be a list, got {type(item['bytes'])}"
+
+                    # Validate top_logprobs entries have token, logprob, and bytes
+                    for top_lp in item["top_logprobs"]:
+                        assert (
+                            "token" in top_lp
+                        ), "Missing 'token' in top_logprobs entry"
+                        assert (
+                            "logprob" in top_lp
+                        ), "Missing 'logprob' in top_logprobs entry"
+                        assert (
+                            "bytes" in top_lp
+                        ), "Missing 'bytes' in top_logprobs entry"
+                        if top_lp["token"]:
+                            assert (
+                                top_lp["bytes"] is not None
+                            ), f"'bytes' should be populated for top_logprob token {top_lp['token']!r}"
+
+                logger.info(
+                    f"Logprobs validation passed: found {len(content_logprobs)} tokens with logprobs"
+                )
+
+
+@dataclass
+class StreamingChatPayload(BasePayload):
+    """Validate a complete chat SSE stream, including requested token metadata."""
+
+    endpoint: str = "/v1/chat/completions"
+    http_stream: bool = True
+    expected_finish_reason: str | None = None
+    expected_completion_tokens: int | None = None
+    min_token_chunks: int = 0
+
+    def process_response(self, response: Any) -> str:
+        try:
+            return super().process_response(response)
+        finally:
+            response.close()
+
+    def response_handler(self, response: Any) -> str:
+        response.raise_for_status()
+        content_parts = []
+        output_logprobs = []
+        completion_ids = []
+        terminal_nvext = {}
+        finish_reason = None
+        usage = None
+        is_done = False
+        token_chunks = 0
+        fields = self.body.get("nvext", {}).get("extra_fields", [])
+        deadline = time.monotonic() + self.timeout
+        for line in response.iter_lines(chunk_size=1):
+            assert (
+                time.monotonic() < deadline
+            ), f"Chat stream exceeded its {self.timeout}s deadline"
+            if isinstance(line, bytes):
+                line = line.decode("utf-8")
+            if not line.startswith("data:"):
+                continue
+            assert not is_done, "Received data after [DONE]"
+            data = line[5:].strip()
+            if data == "[DONE]":
+                is_done = True
+                continue
+            chunk = json.loads(data)
+            assert "error" not in chunk, f"Stream error: {chunk!r}"
+            choices = chunk["choices"]
+            nvext = chunk.get("nvext") or {}
+            chunk_ids = nvext.get("completion_token_ids") or []
+            chunk_logprobs = []
+            completion_ids.extend(chunk_ids)
+            if choices:
+                assert finish_reason is None, "Received choices after terminal chunk"
+                assert len(choices) == 1 and choices[0]["index"] == 0, chunk
+                choice = choices[0]
+                content_parts.append(choice["delta"].get("content") or "")
+                logprobs = choice.get("logprobs") or {}
+                chunk_logprobs = logprobs.get("content") or []
+                output_logprobs.extend(chunk_logprobs)
+                finish_reason = choice.get("finish_reason")
+                if finish_reason is not None:
+                    terminal_nvext = nvext
+                else:
+                    assert (
+                        nvext.get("prompt_logprobs") is None
+                    ), "Prompt logprobs must appear only on the terminal chunk"
+            if chunk_ids or chunk_logprobs:
+                token_chunks += 1
+            if "completion_token_ids" in fields and self.body.get("logprobs"):
+                assert [
+                    item["token_id"] for item in chunk_logprobs
+                ] == chunk_ids, "Output logprobs do not match this chunk's completion token positions"
+            if chunk.get("usage") is not None:
+                assert finish_reason is not None, "Usage arrived before completion"
+                assert usage is None, "Duplicate terminal usage"
+                usage = chunk["usage"]
+
+        assert is_done, "Stream ended without [DONE]"
+        assert (
+            token_chunks >= self.min_token_chunks
+        ), f"Expected at least {self.min_token_chunks} token-bearing chunks, got {token_chunks}"
+        assert finish_reason in {
+            "stop",
+            "length",
+        }, f"Missing or unexpected finish reason: {finish_reason!r}"
+        if self.expected_finish_reason is not None:
+            assert finish_reason == self.expected_finish_reason
+        content = "".join(content_parts)
+        assert content.strip(), "Stream returned no content"
+        if self.body.get("stream_options", {}).get("include_usage"):
+            assert usage is not None, "Missing terminal usage"
+            for key in ("prompt_tokens", "completion_tokens"):
+                assert type(usage[key]) is int and usage[key] > 0, usage
+            assert usage["total_tokens"] == (
+                usage["prompt_tokens"] + usage["completion_tokens"]
+            ), usage
+            if self.expected_completion_tokens is not None:
+                assert usage["completion_tokens"] == self.expected_completion_tokens
+        if self.body.get("logprobs"):
+            _validate_chat_logprobs(output_logprobs)
+            if (self.body.get("top_logprobs") or 0) > 0:
+                assert all(
+                    item["top_logprobs"] for item in output_logprobs
+                ), "Expected top_logprobs alternatives"
+        if "completion_token_ids" in fields:
+            assert completion_ids, "Missing requested completion token IDs"
+            assert all(type(token) is int and token >= 0 for token in completion_ids)
+            if usage is not None:
+                assert len(completion_ids) == usage["completion_tokens"]
+            if self.body.get("logprobs") and self.body.get(
+                "return_tokens_as_token_ids"
+            ):
+                for item in output_logprobs:
+                    assert item["token"] == f"token_id:{item['token_id']}"
+                    candidates = item["top_logprobs"]
+                    for entry in candidates:
+                        assert entry["token"].startswith("token_id:")
+                        assert int(entry["token"].removeprefix("token_id:")) >= 0
+                        if entry["token"] == item["token"]:
+                            assert entry["logprob"] == item["logprob"]
+        if "prompt_token_ids" in fields:
+            prompt_ids = terminal_nvext.get("prompt_token_ids")
+            assert prompt_ids, "Missing requested prompt token IDs"
+            assert all(type(token) is int and token >= 0 for token in prompt_ids)
+            if usage is not None:
+                assert (
+                    len(prompt_ids) == usage["prompt_tokens"]
+                ), "Incorrect prompt usage"
+        if "prompt_logprobs" in fields:
+            prompt_ids = terminal_nvext.get("prompt_token_ids")
+            prompt_logprobs = terminal_nvext.get("prompt_logprobs")
+            assert prompt_ids, "Missing requested prompt token IDs"
+            assert prompt_logprobs, "Missing requested prompt logprobs"
+            assert len(prompt_logprobs) == len(prompt_ids)
+            if usage is not None:
+                assert len(prompt_ids) == usage["prompt_tokens"]
+            assert prompt_logprobs[0] is None, "First prompt token must have no logprob"
+            for token, entries in zip(prompt_ids[1:], prompt_logprobs[1:], strict=True):
+                assert entries and str(token) in entries, "Missing prompt token logprob"
+                assert len(entries) >= (self.body.get("prompt_logprobs") or 0)
+                for candidate, entry in entries.items():
+                    assert (
+                        int(candidate) >= 0
+                    ), f"Invalid prompt token ID: {candidate!r}"
+                    value = entry["logprob"]
+                    assert math.isfinite(value) and -9999 < value <= 0, entry
+                    if entry.get("rank") is not None:
+                        assert type(entry["rank"]) is int and entry["rank"] > 0, entry
+        return content
+
+
+def _validate_single_tool_call(call: Dict[str, Any], arguments: Dict[str, Any]) -> None:
+    assert call.get("type") == "function", f"Not a function call: {call}"
+    assert call.get("id"), f"Tool call has no id: {call}"
+    assert (
+        json.loads(call["function"]["arguments"]) == arguments
+    ), f"Wrong arguments: {call}"
+
+
+def _one_value(values: List[Any]) -> Any:
+    # Later stream deltas may repeat a tool call's id, type, or name, but never change it.
+    distinct = {value for value in values if value is not None}
+    assert len(distinct) == 1, f"Expected one value, got {distinct}"
+    return distinct.pop()
+
+
+@dataclass
+class ToolCallingChatPayload(ChatPayload):
+    """ChatPayload that validates tool calls in the response."""
+
+    def __init__(
+        self,
+        *args,
+        expected_tool_name: Optional[str] = None,
+        expected_arguments: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self.expected_tool_name = expected_tool_name
+        self.expected_arguments = expected_arguments
+
+    def validate(self, response, content: str) -> None:
+        """Validate that tool calls exist in the response.
+
+        Skips the parent's expected_response substring check because tool call
+        responses produce structured JSON arguments, not natural-language text.
+        The expected_response keywords are instead matched against the
+        concatenated tool call arguments so callers can still assert that the
+        model "understood" the input (e.g. expected_response=["purple"]).
+        """
+        response_data = response.json()
+        choices = response_data.get("choices", [])
+        assert choices, "Response missing choices"
+
+        message = choices[0].get("message", {})
+        tool_calls = message.get("tool_calls", [])
+
+        assert tool_calls, "Expected model to generate tool calls but none found"
+        logger.info(f"Tool calls detected: {len(tool_calls)} call(s)")
+
+        # Validate tool call structure
+        all_args = []
+        for i, tc in enumerate(tool_calls):
+            assert "function" in tc, f"Tool call {i} missing 'function' field"
+            function = tc.get("function", {})
+            assert "name" in function, f"Tool call {i} missing function name"
+            assert "arguments" in function, f"Tool call {i} missing function arguments"
+            args_str = function.get("arguments", "")
+            all_args.append(args_str)
+            logger.info(
+                f"  [{i}] Function: {function.get('name')}, Args: {args_str[:100]}..."
+            )
+
+        # If expected tool name is provided, validate it
+        if self.expected_tool_name:
+            tool_names = [tc.get("function", {}).get("name") for tc in tool_calls]
+            assert (
+                self.expected_tool_name in tool_names
+            ), f"Expected tool '{self.expected_tool_name}' not found. Available tools: {tool_names}"
+            logger.info(f"Expected tool '{self.expected_tool_name}' was called")
+
+        # Check expected_response keywords against tool call arguments (OR logic)
+        if self.expected_response:
+            combined_args = " ".join(all_args).lower()
+            found = [kw for kw in self.expected_response if kw.lower() in combined_args]
+            if not found:
+                logger.error(
+                    f"VALIDATION FAILED - Expected to find at least one of "
+                    f"{self.expected_response} in tool call arguments"
+                )
+                logger.error(f"Tool call arguments: {combined_args}")
+                raise AssertionError(
+                    f"Expected content not found in tool call arguments. "
+                    f"Expected at least one of: {self.expected_response}. "
+                    f"Tool call arguments: {combined_args}"
+                )
+            else:
+                logger.info(f"Found expected keywords in tool args: {found}")
+
+        if self.expected_arguments is not None:
+            assert len(tool_calls) == 1, f"Expected one tool call, got {tool_calls}"
+            assert not (message.get("content") or "").strip(), f"Content: {message}"
+            _validate_single_tool_call(tool_calls[0], self.expected_arguments)
+
+
+@dataclass
+class StreamingToolCallingChatPayload(BasePayload):
+    expected_tool_name: str = field(kw_only=True)
+    expected_arguments: Dict[str, Any] = field(kw_only=True)
+    expected_finish_reason: str = field(kw_only=True)
+    endpoint: str = "/v1/chat/completions"
+    http_stream: bool = True
+
+    def response_handler(self, response: Any) -> str:
+        response.raise_for_status()
+        text = response.content.decode("utf-8")
+        events = [
+            line[5:].strip() for line in text.splitlines() if line.startswith("data:")
+        ]
+        assert events[-1:] == ["[DONE]"], "Stream did not end with [DONE]"
+        chunks = parse_sse_json_chunks(text)
+        assert not any("error" in chunk for chunk in chunks), chunks
+        choices = [choice for chunk in chunks for choice in chunk["choices"]]
+        assert all(choice["index"] == 0 for choice in choices), choices
+        deltas = [choice.get("delta") or {} for choice in choices]
+        content = "".join(delta.get("content") or "" for delta in deltas)
+        assert not content.strip(), f"Unexpected content: {content!r}"
+        parts = [part for delta in deltas for part in delta.get("tool_calls") or []]
+        assert {part["index"] for part in parts} == {0}, f"Not one tool call: {parts}"
+        functions = [part.get("function") or {} for part in parts]
+        call = {
+            "id": _one_value([part.get("id") for part in parts]),
+            "type": _one_value([part.get("type") for part in parts]),
+            "function": {
+                "name": _one_value([function.get("name") for function in functions]),
+                "arguments": "".join(f.get("arguments") or "" for f in functions),
+            },
+        }
+        assert call["function"]["name"] == self.expected_tool_name, call
+        _validate_single_tool_call(call, self.expected_arguments)
+        finish_reasons = [choice.get("finish_reason") for choice in choices]
+        assert finish_reasons[-1:] == [self.expected_finish_reason], finish_reasons[-1:]
+        assert not any(finish_reasons[:-1]), f"Choices after the end: {finish_reasons}"
+        return call["function"]["arguments"]
+
+
+@dataclass
+class GuidedDecodingChatPayload(ChatPayload):
+    """ChatPayload that validates a json_schema response_format produces valid JSON."""
+
+    def __init__(
+        self,
+        *args,
+        required_keys: Optional[List[str]] = None,
+        expected_json: Optional[Dict[str, Any]] = None,
+        expected_finish_reason: Optional[str] = None,
+        needs_token_ids: bool = False,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self.required_keys = required_keys or []
+        self.expected_json = expected_json
+        self.expected_finish_reason = expected_finish_reason
+        self.needs_token_ids = needs_token_ids
+
+    def validate(self, response, content: str) -> None:
+        try:
+            parsed = json.loads(content)
+        except (json.JSONDecodeError, TypeError) as e:
+            raise AssertionError(
+                "Guided decoding response is not valid JSON — grammar backend "
+                f"likely disabled. Content: {content!r}"
+            ) from e
+
+        assert isinstance(parsed, dict), (
+            "Guided decoding response should be a JSON object, "
+            f"got {type(parsed).__name__}: {content!r}"
+        )
+
+        for key in self.required_keys:
+            assert key in parsed, (
+                f"Guided decoding response missing required key {key!r}. "
+                f"Parsed: {parsed}"
+            )
+
+        if self.expected_json is not None:
+            assert json.dumps(parsed, sort_keys=True) == json.dumps(
+                self.expected_json, sort_keys=True
+            ), f"Expected JSON {self.expected_json!r}, got {parsed!r}"
+        if self.needs_token_ids:
+            _validate_chat_token_usage(response.json())
+        elif self.expected_json is not None:
+            usage = response.json().get("usage")
+            assert usage, "Missing structured-output usage"
+            for key in ("prompt_tokens", "completion_tokens"):
+                assert type(usage[key]) is int and usage[key] > 0, usage
+            assert usage["total_tokens"] == (
+                usage["prompt_tokens"] + usage["completion_tokens"]
+            ), usage
+        if self.expected_finish_reason is not None:
+            assert response.json()["choices"][0]["finish_reason"] == (
+                self.expected_finish_reason
+            )
+
+        logger.info("Guided decoding validation passed: %s", parsed)
+
+
+@dataclass
+class CachedTokensChatPayload(ChatPayload):
+    """
+    Chat payload that validates cached tokens are populated in repeated requests.
+
+    Used for testing KV router cache-aware routing where repeated identical prompts
+    should result in cached tokens being reported in the usage field.
+
+    Validates that usage.prompt_tokens_details.cached_tokens > 0 for requests
+    after the first one (since identical prompts should hit the prefix cache).
+    """
+
+    def __init__(
+        self,
+        body: dict,
+        repeat_count: int = 3,
+        expected_response: Optional[List[str]] = None,
+        expected_log: Optional[List[str]] = None,
+        timeout: int = 60,
+        min_cached_tokens: int = 1,
+        min_routing_total_blocks: int = 0,
+        router_nvext_expectation: RouterNvextExpectation | None = None,
+        require_rust_processor_init: bool = False,
+        require_vllm_mm_processor_init: bool = False,
+        min_avg_kv_hit_rate: float = 0.0,
+    ):
+        # MM-aware routing checks: piggyback on engine_process.validate_expected_logs.
+        log_patterns: List[str] = list(expected_log or [])
+        if require_rust_processor_init:
+            log_patterns.append(r"MM-aware KV routing enabled")
+        if require_vllm_mm_processor_init:
+            log_patterns.append(r"\[mm-routing\] Transfer mode:")
+        if min_routing_total_blocks > 0:
+            # The regex below gates by digit-count, so the threshold must
+            # be a power of 10 (1, 10, 100, ...). Reject any non-conforming
+            # value at construction time — otherwise the assertion would
+            # under-enforce (e.g. min_routing_total_blocks=25 would still
+            # only require 2-digit counts ≥10, not ≥25).
+            n_str = str(min_routing_total_blocks)
+            if n_str[0] != "1" or any(c != "0" for c in n_str[1:]):
+                raise ValueError(
+                    f"min_routing_total_blocks must be a power of 10 "
+                    f"(1, 10, 100, ...); got {min_routing_total_blocks}"
+                )
+            min_digits = len(n_str)
+            log_patterns.append(
+                rf"\[ROUTING\].*with\s+\d+/[1-9]\d{{{min_digits - 1},}}\s+blocks overlap"
+            )
+        super().__init__(
+            body=body,
+            repeat_count=repeat_count,
+            expected_response=expected_response or [],
+            expected_log=log_patterns,
+            timeout=timeout,
+        )
+        self.min_cached_tokens = min_cached_tokens
+        self._request_count = 0
+        self._cached_tokens_found = False
+        self.router_nvext_expectation = router_nvext_expectation
+        # Asserts the post-R1 mean of router_kv_hit_rate >= threshold. Catches
+        # router/worker hash divergence (overlap=0) that cached_tokens alone
+        # can miss via load-balance luck on vLLM's per-worker prefix cache.
+        #
+        # TODO(mm-routing): this field + _metrics_baseline + the kv_hit_rate
+        # delta assertion in final_validation() are router-metric-specific
+        # logic accreting onto a general-purpose Cached*Payload base. If
+        # more strong-gate metrics get added (decode-imbalance, routing-
+        # block-count, etc.), move into a RouterMetricsAssertion
+        # mixin/subclass.
+        self.min_avg_kv_hit_rate = min_avg_kv_hit_rate
+        # Require new router_kv_hit_rate observations on R2+. A subclass may
+        # drop the floor at run time and keep this check.
+        self.require_kv_hit_rate_observations = min_avg_kv_hit_rate > 0
+        self._metrics_baseline: Optional[tuple[float, float]] = None
+
+    def validate(self, response: Any, content: str) -> None:
+        """Validate response and check for cached tokens on repeated requests."""
+        # First run the standard content validation
+        super().validate(response, content)
+
+        self._request_count += 1
+        result = response.json()
+        validate_router_nvext(
+            result,
+            self.router_nvext_expectation,
+            context=f"{type(self).__name__} request {self._request_count}",
+        )
+
+        # Check usage field for cached tokens
+        # Expected structure: usage.prompt_tokens_details.cached_tokens
+        usage = result.get("usage")
+        prompt_tokens_details = (usage or {}).get("prompt_tokens_details") or {}
+        cached_tokens = prompt_tokens_details.get("cached_tokens", 0) or 0
+        prompt_tokens = (usage or {}).get("prompt_tokens")
+
+        logger.info(
+            f"Request {self._request_count}: prompt_tokens={prompt_tokens}, "
+            f"cached_tokens={cached_tokens}, prompt_tokens_details={prompt_tokens_details}"
+        )
+
+        # On repeats we expect a cache hit. Require usage with prompt_tokens > 0
+        # so a backend that reports no usage fails instead of passing by default.
+        # An absent cached_tokens field is a legit miss (vLLM/SGLang omit it when
+        # cached==0), so treat it as a soft miss below, not a hard error.
+        if self._request_count > 1 and self.min_cached_tokens > 0:
+            if usage is None or prompt_tokens is None or prompt_tokens <= 0:
+                raise AssertionError(
+                    f"Request {self._request_count}: response carried no usage "
+                    f"evidence (usage={usage!r}); cannot validate cached tokens. "
+                    f"Expected a usage block with prompt_tokens > 0."
+                )
+            if cached_tokens >= self.min_cached_tokens:
+                self._cached_tokens_found = True
+                logger.info(
+                    f"✓ Request {self._request_count}: Cached tokens validation PASSED - "
+                    f"found {cached_tokens} cached tokens (min required: {self.min_cached_tokens})"
+                )
+            else:
+                logger.warning(
+                    f"Request {self._request_count}: cached_tokens={cached_tokens} "
+                    f"(expected >= {self.min_cached_tokens})"
+                )
+
+        # Snapshot after R1 so the delta in final_validation isolates R2+.
+        if (
+            self._metrics_baseline is None
+            and self._request_count == 1
+            and self.require_kv_hit_rate_observations
+        ):
+            self._metrics_baseline = self._scrape_router_kv_hit_rate()
+
+    def _scrape_router_kv_hit_rate(self) -> Optional[tuple[float, float]]:
+        """Return ``(sum, count)`` for ``router_kv_hit_rate`` from the
+        frontend /metrics endpoint, or ``None`` if the endpoint is
+        unreachable. The component MetricsHierarchy auto-prepends
+        ``dynamo_component_`` to the exported name.
+        """
+        url = f"http://localhost:{self.port}/metrics"
+        try:
+            text = requests.get(url, timeout=5).text
+        except requests.RequestException as e:
+            # Narrow to HTTP/network errors per .ai/python-guidelines.md:
+            # we expect transient endpoint flakes here (timeout, connection
+            # refused while the frontend is still binding /metrics) and
+            # the strong gate has its own `is None` guard. Programming
+            # errors propagate so they surface at test-time instead of
+            # being swallowed.
+            logger.warning("Failed to scrape %s: %s", url, e)
+            return None
+        # Compose from canonical constants so a metric rename in
+        # prometheus_names cascades here instead of silently breaking
+        # the kv_hit_rate strong gate.
+        full = (
+            f"{prometheus_names.name_prefix.COMPONENT}_"
+            f"{prometheus_names.router.KV_HIT_RATE}"
+        )
+        return (
+            sum_metric_samples(text, f"{full}_sum"),
+            sum_metric_samples(text, f"{full}_count"),
+        )
+
+    def final_validation(self) -> None:
+        """Assert cached_tokens >= min_cached_tokens on at least one repeat
+        (only when min_cached_tokens > 0), and (if set) new router_kv_hit_rate
+        observations with a post-R1 mean >= min_avg_kv_hit_rate.
+        """
+        # Only assert cached tokens when a positive threshold is set; a caller
+        # validating purely via the router metric passes min_cached_tokens=0.
+        if self.min_cached_tokens > 0:
+            if self.repeat_count > 1 and not self._cached_tokens_found:
+                raise AssertionError(
+                    f"Expected cached_tokens >= {self.min_cached_tokens} in "
+                    f"prompt_tokens_details for at least one repeated request, "
+                    f"but none found after {self._request_count} requests. "
+                    f"Verify that prefix caching is enabled and working correctly."
+                )
+            logger.info(
+                "✓ Final validation PASSED: cached_tokens found in repeated requests"
+            )
+
+        if not self.require_kv_hit_rate_observations:
+            return
+        if self._metrics_baseline is None:
+            raise AssertionError(
+                "router_kv_hit_rate check set but no metrics baseline captured "
+                "(R1 validate() didn't run or /metrics was unreachable)."
+            )
+        after = self._scrape_router_kv_hit_rate()
+        if after is None:
+            raise AssertionError(
+                "router_kv_hit_rate scrape failed at final_validation; "
+                "/metrics endpoint unreachable from test."
+            )
+        bsum, bcount = self._metrics_baseline
+        asum, acount = after
+        d_sum, d_count = asum - bsum, acount - bcount
+        if d_count <= 0:
+            raise AssertionError(
+                f"router_kv_hit_rate: no new observations between R1 and final "
+                f"(baseline_count={bcount}, after_count={acount}); "
+                f"MM-routing likely not engaging on repeat requests."
+            )
+        avg = d_sum / d_count
+        if self.min_avg_kv_hit_rate <= 0:
+            logger.info(
+                f"✓ router_kv_hit_rate: {d_count} new observations over R2+ "
+                f"(mean {avg:.3f}, no floor)"
+            )
+            return
+        if avg < self.min_avg_kv_hit_rate:
+            raise AssertionError(
+                f"router_kv_hit_rate: mean over R2+ ({avg:.3f}) below required "
+                f"min ({self.min_avg_kv_hit_rate}). delta_n={d_count}, "
+                f"delta_sum={d_sum:.3f}. Router-side block hashes did not "
+                f"match the worker — MM-aware routing degraded silently."
+            )
+        logger.info(
+            f"✓ router_kv_hit_rate: mean over R2+ = {avg:.3f} "
+            f"(>= {self.min_avg_kv_hit_rate})"
+        )
+
+
+@dataclass
+class ClearKVBlocksPayload(ChatPayload):
+    """Warm the prefix cache, clear it through the system server, and infer.
+
+    The two warm-up requests happen before the request driven by the regular
+    serve-test harness. The second warm-up must report a cache hit; the harness
+    request then proves the clear removed that prefix without breaking serving.
+    """
+
+    def __init__(
+        self,
+        body: dict,
+        system_port: int = DefaultPort.SYSTEM1.value,
+        timeout: int = 60,
+    ):
+        super().__init__(
+            body=body,
+            repeat_count=1,
+            expected_response=[],
+            expected_log=[],
+            timeout=timeout,
+        )
+        self.system_ports = [system_port]
+        self._cleared = False
+
+    @staticmethod
+    def _cached_tokens(response: Any, phase: str) -> int:
+        result = response.json()
+        usage = result.get("usage")
+        prompt_tokens = (usage or {}).get("prompt_tokens")
+        if usage is None or prompt_tokens is None or prompt_tokens <= 0:
+            raise AssertionError(
+                f"{phase}: response carried no prompt-token usage evidence: "
+                f"{usage!r}"
+            )
+        details = usage.get("prompt_tokens_details")
+        if not isinstance(details, dict) or "cached_tokens" not in details:
+            raise AssertionError(
+                f"{phase}: response did not report cached_tokens: {usage!r}"
+            )
+        cached_tokens = details["cached_tokens"]
+        if not isinstance(cached_tokens, int):
+            raise AssertionError(
+                f"{phase}: cached_tokens was not an integer: {cached_tokens!r}"
+            )
+        return cached_tokens
+
+    def _warm_then_clear(self) -> None:
+        if self._cleared:
+            return
+
+        inference_url = super().url()
+        warm_responses = []
+        for request_number in (1, 2):
+            response = requests.post(
+                inference_url,
+                json=self.body,
+                timeout=self.timeout,
+            )
+            response.raise_for_status()
+            ChatPayload.extract_content(response)
+            warm_responses.append(response)
+            logger.info(
+                "KV-clear warm-up request %d reported %d cached tokens",
+                request_number,
+                self._cached_tokens(response, f"warm-up request {request_number}"),
+            )
+
+        second_cached_tokens = self._cached_tokens(
+            warm_responses[1], "second warm-up request"
+        )
+        if second_cached_tokens <= 0:
+            raise AssertionError(
+                "Second warm-up request did not report cached tokens; "
+                "prefix caching is not active"
+            )
+
+        clear_url = (
+            f"http://{self.host}:{self.system_ports[0]}"
+            "/engine/control/clear_kv_blocks"
+        )
+        response = requests.post(clear_url, json={}, timeout=self.timeout)
+        response.raise_for_status()
+        result = response.json()
+        expected = {"status": "success", "message": "KV cache cleared"}
+        if result != expected:
+            raise AssertionError(f"Unexpected clear_kv_blocks response: {result}")
+        self._cleared = True
+
+    def url(self) -> str:
+        self._warm_then_clear()
+        return super().url()
+
+    def validate(self, response: Any, content: str) -> None:
+        super().validate(response, content)
+        cached_tokens = self._cached_tokens(response, "first post-clear request")
+        if cached_tokens != 0:
+            raise AssertionError(
+                "First post-clear request unexpectedly reused "
+                f"{cached_tokens} cached tokens"
+            )
+
+
+@dataclass
+class LoraTestChatPayload(ChatPayload):
+    """
+    Chat payload that loads a LoRA adapter before sending inference requests.
+
+    This payload first loads the specified LoRA adapter via the system API,
+    then sends chat completion requests using the LoRA model.
+    """
+
+    def __init__(
+        self,
+        body: dict,
+        lora_name: str,
+        s3_uri: str,
+        system_port: int = DefaultPort.SYSTEM1.value,
+        repeat_count: int = 1,
+        expected_response: Optional[list] = None,
+        expected_log: Optional[list] = None,
+        timeout: int = 60,
+    ):
+        super().__init__(
+            body=body,
+            repeat_count=repeat_count,
+            expected_response=expected_response or [],
+            expected_log=expected_log or [],
+            timeout=timeout,
+        )
+        self.system_ports = [system_port]
+        self.lora_name = lora_name
+        self.s3_uri = s3_uri
+        self._lora_loaded = False
+
+    def _ensure_lora_loaded(self) -> None:
+        """Ensure the LoRA adapter is loaded before making inference requests"""
+        if not self._lora_loaded:
+            # Import the load_lora_adapter function
+            # Note: This import is done here to avoid circular dependencies
+            from tests.serve.lora_utils import load_lora_adapter
+
+            load_lora_adapter(
+                system_port=self.system_ports[0],
+                lora_name=self.lora_name,
+                s3_uri=self.s3_uri,
+                timeout=self.timeout,
+            )
+
+            # Wait for the LoRA model to appear in /v1/models
+            models_url = f"http://{self.host}:{self.port}/v1/models"
+            start_time = time.time()
+
+            logger.info(
+                f"Waiting for LoRA model '{self.lora_name}' to appear in /v1/models..."
+            )
+
+            while time.time() - start_time < self.timeout:
+                try:
+                    response = requests.get(models_url, timeout=5)
+                    if response.status_code == 200:
+                        data = response.json()
+                        models = data.get("data", [])
+                        model_ids = [m.get("id", "") for m in models]
+
+                        if self.lora_name in model_ids:
+                            logger.info(
+                                f"LoRA model '{self.lora_name}' is now available"
+                            )
+                            self._lora_loaded = True
+                            return
+
+                        logger.debug(
+                            f"Available models: {model_ids}, waiting for '{self.lora_name}'..."
+                        )
+                except requests.RequestException as e:
+                    logger.debug(f"Error checking /v1/models: {e}")
+
+                time.sleep(1)
+
+            raise RuntimeError(
+                f"Timeout: LoRA model '{self.lora_name}' did not appear in /v1/models within {self.timeout}s"
+            )
+
+    def url(self) -> str:
+        """Load LoRA before first request, then return URL"""
+        self._ensure_lora_loaded()
+        return super().url()
+
+
+@dataclass
+class ElasticEPScalePayload(ChatPayload):
+    """Scales the vLLM data-parallel size live, then verifies the worker still
+    serves a chat request post-scale.
+
+    POSTs ``/engine/control/scale_elastic_ep`` on the worker's system port
+    before the chat request (mirroring LoraTestChatPayload's admin-then-infer
+    pattern), so a single payload exercises both the scale control and that
+    generation survives the reconfigure. Requires a worker started with the Ray
+    DP backend + ePLB (see ``examples/backends/vllm/launch/elastic_ep.sh``).
+    """
+
+    def __init__(
+        self,
+        body: dict,
+        new_data_parallel_size: int,
+        system_port: int = DefaultPort.SYSTEM1.value,
+        repeat_count: int = 1,
+        expected_response: Optional[list] = None,
+        expected_log: Optional[list] = None,
+        timeout: int = 300,
+    ):
+        super().__init__(
+            body=body,
+            repeat_count=repeat_count,
+            expected_response=expected_response or [],
+            expected_log=expected_log or [],
+            timeout=timeout,
+        )
+        self.system_ports = [system_port]
+        self.new_data_parallel_size = new_data_parallel_size
+        self._scaled = False
+
+    def _ensure_scaled(self) -> None:
+        """Drive the scale control once before the first chat request."""
+        if self._scaled:
+            return
+        scale_url = (
+            f"http://{self.host}:{self.system_ports[0]}"
+            "/engine/control/scale_elastic_ep"
+        )
+        logger.info(
+            "Scaling elastic EP to data_parallel_size=%s via %s",
+            self.new_data_parallel_size,
+            scale_url,
+        )
+        response = requests.post(
+            scale_url,
+            json={"new_data_parallel_size": self.new_data_parallel_size},
+            timeout=self.timeout,
+        )
+        response.raise_for_status()
+        result = response.json()
+        if result.get("status") != "ok":
+            raise RuntimeError(f"scale_elastic_ep failed: {result}")
+        if result.get("new_data_parallel_size") != self.new_data_parallel_size:
+            raise RuntimeError(f"unexpected scale_elastic_ep result: {result}")
+        self._scaled = True
+
+    def url(self) -> str:
+        """Scale before the first chat request, then return the chat URL."""
+        self._ensure_scaled()
+        return super().url()
+
+
+@dataclass
+class CompletionPayload(BasePayload):
+    """Payload for completions endpoint."""
+
+    endpoint: str = "/v1/completions"
+
+    @staticmethod
+    def extract_text(response):
+        """
+        Process completions API responses.
+        """
+        response.raise_for_status()
+        result = response.json()
+        assert "choices" in result, "Missing 'choices' in response"
+        assert len(result["choices"]) > 0, "Empty choices in response"
+        assert "text" in result["choices"][0], "Missing 'text' in first choice"
+        return result["choices"][0]["text"]
+
+    def response_handler(self, response: Any) -> str:
+        return CompletionPayload.extract_text(response)
+
+
+@dataclass
+class ImagesPayload(BasePayload):
+    """Payload for the image-generation endpoint (raw-media / DiffusionEngine).
+
+    Targets ``/v1/images/generations`` and validates the OpenAI-shaped
+    response: a non-empty ``data`` list whose first item carries either a
+    ``b64_json`` or a ``url``.
+    """
+
+    endpoint: str = "/v1/images/generations"
+
+    @staticmethod
+    def extract_image(response):
+        response.raise_for_status()
+        result = response.json()
+        assert "data" in result, "Missing 'data' in image response"
+        assert len(result["data"]) > 0, "Empty 'data' in image response"
+        item = result["data"][0]
+        # Return whichever representation the engine produced — either is a
+        # valid image result.
+        return item.get("b64_json") or item.get("url") or ""
+
+    def response_handler(self, response: Any) -> str:
+        return ImagesPayload.extract_image(response)
+
+
+@dataclass
+class ImagesAccountingPayload(ImagesPayload):
+    """Image-generation payload that also checks the accounting the sample
+    diffusion engine reports: every requested image in ``data``, null token
+    ``usage``, and ``nvext.usage`` counting the images returned and echoing
+    the step count the request asked for."""
+
+    def validate(self, response: Any, content: str) -> None:
+        super().validate(response, content)
+        result = response.json()
+        requested = int(self.body.get("n", 1))
+        assert (
+            len(result["data"]) == requested
+        ), f"Expected {requested} images in 'data': {len(result['data'])}"
+        assert (
+            result.get("usage") is None
+        ), f"Token usage must stay null without backend token counts: {result['usage']!r}"
+        assert result.get("size") == "1x1", f"Unexpected size: {result.get('size')!r}"
+        assert (
+            result.get("output_format") == "png"
+        ), f"Unexpected output_format: {result.get('output_format')!r}"
+        expected = {"output_images": requested, "input_images": 0}
+        requested_steps = (self.body.get("nvext") or {}).get("num_inference_steps")
+        if requested_steps is not None:
+            expected["num_inference_steps"] = requested_steps
+        accounting = (result.get("nvext") or {}).get("usage")
+        assert accounting == expected, f"Unexpected nvext.usage: {accounting!r}"
+
+
+@dataclass
+class CompletionPayloadWithLogprobs(CompletionPayload):
+    """Completion payload that validates logprobs in response."""
+
+    def validate(self, response: Any, content: str) -> None:
+        """Validate response contains logprobs fields."""
+        super().validate(response, content)
+
+        result = response.json()
+        choice = result["choices"][0]
+
+        # Validate logprobs field exists
+        assert "logprobs" in choice, "Missing 'logprobs' in choice"
+
+        logprobs_data = choice["logprobs"]
+        requested_logprobs = self.body.get("logprobs") or 0
+        if requested_logprobs > 0:
+            assert logprobs_data is not None, "Expected logprobs for logprobs request"
+        if logprobs_data is not None:
+            assert (
+                "token_logprobs" in logprobs_data
+            ), "Missing 'token_logprobs' in logprobs"
+            assert "tokens" in logprobs_data, "Missing 'tokens' in logprobs"
+
+            token_logprobs = logprobs_data["token_logprobs"]
+            tokens = logprobs_data["tokens"]
+            if requested_logprobs > 0:
+                assert token_logprobs, "Expected token_logprobs for logprobs request"
+                top_logprobs = logprobs_data.get("top_logprobs")
+                assert top_logprobs, "Expected top_logprobs alternatives"
+                assert len(top_logprobs) == len(
+                    tokens
+                ), "Expected alternatives for each token"
+                assert all(
+                    top_logprobs
+                ), "Expected non-empty top_logprobs for each token"
+
+            if token_logprobs:
+                assert len(token_logprobs) == len(
+                    tokens
+                ), "Mismatch between token_logprobs and tokens length"
+
+                # Sanity check: each logprob should be valid (not nan/inf/positive)
+                for i, logprob_val in enumerate(token_logprobs):
+                    if logprob_val is not None:  # First token can be None
+                        assert not math.isnan(
+                            logprob_val
+                        ), f"logprob at index {i} is NaN"
+                        assert not math.isinf(
+                            logprob_val
+                        ), f"logprob at index {i} is infinite"
+                        assert (
+                            logprob_val <= 0
+                        ), f"logprob at index {i} should be <= 0, got {logprob_val}"
+
+                # Completions top_logprobs follow the OpenAI legacy format: one
+                # {token: logprob} map per generated token (unlike chat's records).
+                top_logprobs_list = logprobs_data.get("top_logprobs") or []
+                for i, token_top_lps in enumerate(top_logprobs_list):
+                    if not token_top_lps:
+                        continue
+                    assert isinstance(
+                        token_top_lps, dict
+                    ), f"top_logprobs[{i}] should be a token->logprob map, got {type(token_top_lps).__name__}"
+                    # The sampled token can appear in addition to the top-k.
+                    requested_logprobs = self.body.get("logprobs")
+                    if requested_logprobs is not None:
+                        assert len(token_top_lps) <= requested_logprobs + 1, (
+                            f"Too many entries in top_logprobs[{i}]: "
+                            f"expected at most {requested_logprobs + 1}"
+                        )
+                    for token, logprob in token_top_lps.items():
+                        assert math.isfinite(
+                            logprob
+                        ), f"top_logprobs[{i}][{token!r}] is not finite"
+                        assert (
+                            logprob <= 0
+                        ), f"top_logprobs[{i}][{token!r}] should be <= 0, got {logprob}"
+
+                logger.info(
+                    f"✓ Logprobs validation passed: found {len(token_logprobs)} tokens with logprobs"
+                )
+
+
+@dataclass
+class ResponsesPayload(BasePayload):
+    """Payload for the Responses API endpoint (/v1/responses).
+
+    For full compliance testing, use the OpenResponses bun CLI:
+      bun run test:compliance --base-url http://localhost:<port>/v1 --api-key test --model <model>
+    See https://www.openresponses.org/compliance
+    """
+
+    endpoint: str = "/v1/responses"
+
+    @staticmethod
+    def extract_content(response):
+        """Extract text content from a Responses API response."""
+        response.raise_for_status()
+        result = response.json()
+
+        assert (
+            result.get("object") == "response"
+        ), f"Expected object='response', got {result.get('object')}"
+        assert result.get("id", "").startswith(
+            "resp_"
+        ), f"Expected id to start with 'resp_', got {result.get('id')}"
+        assert (
+            result.get("status") == "completed"
+        ), f"Expected status='completed', got {result.get('status')}"
+
+        output = result.get("output", [])
+        assert len(output) > 0, "Response output is empty"
+
+        msg = output[0]
+        assert (
+            msg.get("type") == "message"
+        ), f"Expected output[0].type='message', got {msg.get('type')}"
+        assert (
+            msg.get("role") == "assistant"
+        ), f"Expected role='assistant', got {msg.get('role')}"
+
+        content_parts = msg.get("content", [])
+        assert len(content_parts) > 0, "Message content is empty"
+        assert (
+            content_parts[0].get("type") == "output_text"
+        ), f"Expected content[0].type='output_text', got {content_parts[0].get('type')}"
+
+        return content_parts[0].get("text", "")
+
+    def response_handler(self, response: Any) -> str:
+        return ResponsesPayload.extract_content(response)
+
+
+@dataclass
+class ResponsesStreamPayload(BasePayload):
+    """Streaming payload for the Responses API endpoint (/v1/responses).
+
+    Validates SSE event structure and lifecycle ordering.
+    """
+
+    endpoint: str = "/v1/responses"
+    http_stream: bool = True
+
+    @staticmethod
+    def extract_content(response):
+        """Parse SSE stream and validate event structure."""
+        import json
+
+        response.raise_for_status()
+
+        events: list[tuple[str, Any]] = []
+        event_type = ""
+        for line in response.iter_lines(decode_unicode=True):
+            if not line:
+                continue
+            if line.startswith("event: "):
+                event_type = line[len("event: ") :]
+            elif line.startswith("data: "):
+                data_str = line[len("data: ") :]
+                if data_str == "[DONE]":
+                    events.append(("done", None))
+                else:
+                    events.append((event_type, json.loads(data_str)))
+
+        event_types = [e[0] for e in events]
+
+        # Validate lifecycle event ordering
+        assert len(event_types) >= 2, f"Too few events: {event_types}"
+        assert (
+            event_types[0] == "response.created"
+        ), f"First event should be response.created, got {event_types[0]}"
+        assert (
+            event_types[1] == "response.in_progress"
+        ), f"Second event should be response.in_progress, got {event_types[1]}"
+
+        non_done = [e for e in event_types if e != "done"]
+        assert (
+            non_done[-1] == "response.completed"
+        ), f"Last real event should be response.completed, got {non_done[-1]}"
+
+        # Validate text content events
+        assert "response.output_item.added" in event_types, "Missing output_item.added"
+        assert (
+            "response.content_part.added" in event_types
+        ), "Missing content_part.added"
+        assert "response.output_text.delta" in event_types, "Missing output_text.delta"
+        assert "response.output_text.done" in event_types, "Missing output_text.done"
+        assert "response.content_part.done" in event_types, "Missing content_part.done"
+        assert "response.output_item.done" in event_types, "Missing output_item.done"
+
+        # Verify text deltas concatenate to the final text
+        deltas = [e[1]["delta"] for e in events if e[0] == "response.output_text.delta"]
+        done_events = [e for e in events if e[0] == "response.output_text.done"]
+        assert (
+            len(done_events) == 1
+        ), f"Expected 1 output_text.done, got {len(done_events)}"
+        full_text = "".join(deltas)
+        assert (
+            done_events[0][1]["text"] == full_text
+        ), "Concatenated deltas don't match output_text.done text"
+
+        return full_text
+
+    def response_handler(self, response: Any) -> str:
+        return ResponsesStreamPayload.extract_content(response)
+
+
+def _validate_responses_logprobs(entries: Any, top_logprobs: int) -> None:
+    """Check `output_text.logprobs` entries from the Responses API."""
+    assert entries, "Expected output_text logprobs when include requests them"
+    for entry in entries:
+        assert isinstance(entry["token"], str), f"Invalid token: {entry!r}"
+        value = entry["logprob"]
+        assert math.isfinite(value) and value <= 0, f"Invalid logprob: {entry!r}"
+        # Output parts carry `bytes`; the text stream events do not.
+        if "bytes" in entry:
+            assert isinstance(entry["bytes"], list), f"Invalid token bytes: {entry!r}"
+        assert (
+            len(entry["top_logprobs"]) <= top_logprobs
+        ), f"More alternatives than requested: {entry!r}"
+        for top in entry["top_logprobs"]:
+            assert isinstance(top["token"], str), f"Invalid top token: {top!r}"
+            assert math.isfinite(top["logprob"]) and top["logprob"] <= 0
+
+
+@dataclass
+class ResponsesPayloadWithLogprobs(ResponsesPayload):
+    """Non-streaming Responses payload that requests and validates output logprobs.
+
+    One score per generated token must reach `output_text.logprobs`, so the entry
+    count is checked against `usage.output_tokens`.
+    """
+
+    def validate(self, response: Any, content: str) -> None:
+        super().validate(response, content)
+        result = response.json()
+        top_logprobs = self.body.get("top_logprobs") or 0
+        assert (
+            result.get("top_logprobs") == top_logprobs
+        ), f"top_logprobs echo mismatch: {result.get('top_logprobs')} != {top_logprobs}"
+        text_part = result["output"][0]["content"][0]
+        entries = text_part.get("logprobs")
+        _validate_responses_logprobs(entries, top_logprobs)
+        output_tokens = result["usage"]["output_tokens"]
+        assert (
+            len(entries) == output_tokens
+        ), f"Expected {output_tokens} logprob entries, got {len(entries)}"
+        logger.info(
+            "Responses logprobs validation passed: %d entries, top_logprobs=%d",
+            len(entries),
+            top_logprobs,
+        )
+
+
+@dataclass
+class ResponsesStreamPayloadWithLogprobs(ResponsesStreamPayload):
+    """Streaming Responses payload that validates logprobs on text events.
+
+    Every `output_text.delta` carries a logprobs array; `output_text.done` and the
+    completed output carry the full record, which starts with the concatenated delta
+    scores and may end with scores that arrived after the last delta (hidden EOS).
+    """
+
+    def response_handler(self, response: Any) -> str:
+        response.raise_for_status()
+        events: list[tuple[str, Any]] = []
+        event_type = ""
+        for line in response.iter_lines(decode_unicode=True):
+            if not line:
+                continue
+            if line.startswith("event: "):
+                event_type = line[len("event: ") :]
+            elif line.startswith("data: "):
+                data_str = line[len("data: ") :]
+                if data_str != "[DONE]":
+                    events.append((event_type, json.loads(data_str)))
+
+        top_logprobs = self.body.get("top_logprobs") or 0
+        deltas = [e for t, e in events if t == "response.output_text.delta"]
+        assert deltas, "Missing output_text.delta events"
+        assert all(
+            isinstance(d.get("logprobs"), list) for d in deltas
+        ), "Every output_text.delta must carry a logprobs array"
+        delta_tokens = [lp["token"] for d in deltas for lp in d["logprobs"]]
+        assert delta_tokens, "No logprobs on any output_text.delta"
+
+        done_events = [e for t, e in events if t == "response.output_text.done"]
+        assert (
+            len(done_events) == 1
+        ), f"Expected 1 output_text.done, got {len(done_events)}"
+        done_entries = done_events[0]["logprobs"]
+        _validate_responses_logprobs(done_entries, top_logprobs)
+        done_tokens = [lp["token"] for lp in done_entries]
+        assert (
+            done_tokens[: len(delta_tokens)] == delta_tokens
+        ), "output_text.done logprobs must start with the delta logprobs"
+
+        completed = [e for t, e in events if t == "response.completed"]
+        assert (
+            len(completed) == 1
+        ), f"Expected 1 response.completed, got {len(completed)}"
+        final = completed[0]["response"]
+        assert final.get("top_logprobs") == top_logprobs, "top_logprobs echo mismatch"
+        final_entries = final["output"][0]["content"][0]["logprobs"]
+        assert [lp["token"] for lp in final_entries] == done_tokens
+        output_tokens = final["usage"]["output_tokens"]
+        assert (
+            len(done_tokens) == output_tokens
+        ), f"Expected {output_tokens} logprob entries, got {len(done_tokens)}"
+        logger.info(
+            "Responses stream logprobs validation passed: %d on deltas, %d total",
+            len(delta_tokens),
+            len(done_tokens),
+        )
+        return "".join(d["delta"] for d in deltas)
+
+
+@dataclass
+class AnthropicMessagesPayload(BasePayload):
+    """Payload for the Anthropic Messages API endpoint (/v1/messages)."""
+
+    endpoint: str = "/v1/messages"
+
+    @staticmethod
+    def extract_content(response):
+        """Extract text content from an Anthropic Messages API response."""
+        response.raise_for_status()
+        result = response.json()
+
+        assert (
+            result.get("type") == "message"
+        ), f"Expected type='message', got {result.get('type')}"
+        assert result.get("id", "").startswith(
+            "msg_"
+        ), f"Expected id to start with 'msg_', got {result.get('id')}"
+        assert (
+            result.get("role") == "assistant"
+        ), f"Expected role='assistant', got {result.get('role')}"
+        assert result.get("stop_reason") in (
+            "end_turn",
+            "max_tokens",
+            "stop_sequence",
+            "tool_use",
+        ), f"Unexpected stop_reason: {result.get('stop_reason')}"
+
+        content = result.get("content", [])
+        assert len(content) > 0, "Response content is empty"
+        assert (
+            content[0].get("type") == "text"
+        ), f"Expected content[0].type='text', got {content[0].get('type')}"
+
+        usage = result.get("usage", {})
+        assert "input_tokens" in usage, "Missing input_tokens in usage"
+        assert "output_tokens" in usage, "Missing output_tokens in usage"
+
+        return content[0].get("text", "")
+
+    def response_handler(self, response: Any) -> str:
+        return AnthropicMessagesPayload.extract_content(response)
+
+
+@dataclass
+class AnthropicMessagesStreamPayload(BasePayload):
+    """Streaming payload for the Anthropic Messages API endpoint (/v1/messages).
+
+    Validates SSE event structure and lifecycle ordering per the Anthropic streaming spec.
+    """
+
+    endpoint: str = "/v1/messages"
+    http_stream: bool = True
+
+    @staticmethod
+    def extract_content(response):
+        """Parse SSE stream and validate Anthropic event structure."""
+        import json
+
+        response.raise_for_status()
+
+        events = []
+        event_type = ""
+        for line in response.iter_lines(decode_unicode=True):
+            if not line:
+                continue
+            if line.startswith("event: "):
+                event_type = line[len("event: ") :]
+            elif line.startswith("data: "):
+                data_str = line[len("data: ") :]
+                events.append((event_type, json.loads(data_str)))
+
+        event_types = [e[0] for e in events]
+
+        # Validate lifecycle event ordering
+        assert len(event_types) >= 3, f"Too few events: {event_types}"
+        assert (
+            event_types[0] == "message_start"
+        ), f"First event should be message_start, got {event_types[0]}"
+        assert (
+            event_types[-1] == "message_stop"
+        ), f"Last event should be message_stop, got {event_types[-1]}"
+
+        # Validate message_start structure
+        msg_start = events[0][1]
+        assert msg_start.get("type") == "message_start", "message_start missing type"
+        message = msg_start.get("message", {})
+        assert message.get("id", "").startswith(
+            "msg_"
+        ), "message id should start with msg_"
+        assert message.get("role") == "assistant", "message role should be assistant"
+
+        # Validate required event types
+        assert "content_block_start" in event_types, "Missing content_block_start"
+        assert "content_block_delta" in event_types, "Missing content_block_delta"
+        assert "content_block_stop" in event_types, "Missing content_block_stop"
+        assert "message_delta" in event_types, "Missing message_delta"
+
+        # Validate message_delta has stop_reason
+        delta_events = [e for e in events if e[0] == "message_delta"]
+        assert (
+            len(delta_events) == 1
+        ), f"Expected 1 message_delta, got {len(delta_events)}"
+        delta_body = delta_events[0][1].get("delta", {})
+        assert delta_body.get("stop_reason") in (
+            "end_turn",
+            "max_tokens",
+            "stop_sequence",
+            "tool_use",
+        ), f"Unexpected stop_reason in message_delta: {delta_body.get('stop_reason')}"
+
+        # Collect text deltas
+        deltas = []
+        for e_type, e_data in events:
+            if e_type == "content_block_delta":
+                delta = e_data.get("delta", {})
+                if delta.get("type") == "text_delta":
+                    deltas.append(delta.get("text", ""))
+
+        return "".join(deltas)
+
+    def response_handler(self, response: Any) -> str:
+        return AnthropicMessagesStreamPayload.extract_content(response)
+
+
+@dataclass
+class EmbeddingPayload(BasePayload):
+    """Payload for embeddings endpoint."""
+
+    endpoint: str = "/v1/embeddings"
+
+    @staticmethod
+    def extract_embeddings(response):
+        """
+        Process embeddings API responses.
+
+        Accepts both shapes from the OpenAI spec:
+        - ``encoding_format="float"`` (default) -- each ``data[].embedding``
+          is a JSON array of floats.
+        - ``encoding_format="base64"`` -- each ``data[].embedding`` is a
+          base64-encoded string of little-endian f32 bytes. The string
+          is decoded here so the dimension count in the summary string
+          stays comparable across both shapes.
+        """
+        response.raise_for_status()
+        result = response.json()
+        assert "object" in result, "Missing 'object' in response"
+        assert (
+            result["object"] == "list"
+        ), f"Expected object='list', got {result['object']}"
+        assert "data" in result, "Missing 'data' in response"
+        assert len(result["data"]) > 0, "Empty data in response"
+
+        # Extract embedding vectors and validate structure
+        embeddings = []
+        for item in result["data"]:
+            assert "object" in item, "Missing 'object' in embedding item"
+            assert (
+                item["object"] == "embedding"
+            ), f"Expected object='embedding', got {item['object']}"
+            assert "embedding" in item, "Missing 'embedding' vector in item"
+            raw = item["embedding"]
+            if isinstance(raw, str):
+                # base64: decode to a float list so downstream dimension
+                # checks are uniform.
+                decoded = base64.b64decode(raw)
+                assert (
+                    len(decoded) % 4 == 0
+                ), f"base64 payload not f32-aligned: {len(decoded)} bytes"
+                count = len(decoded) // 4
+                vec = list(struct.unpack(f"<{count}f", decoded))
+            elif isinstance(raw, list):
+                vec = raw
+            else:
+                raise AssertionError(
+                    f"Embedding should be a list of floats or a base64 "
+                    f"string, got {type(raw).__name__}"
+                )
+            assert len(vec) > 0, "Embedding vector should not be empty"
+            embeddings.append(vec)
+
+        # Return a summary string for validation
+        return f"Generated {len(embeddings)} embeddings with dimension {len(embeddings[0])}"
+
+    def response_handler(self, response: Any) -> str:
+        return EmbeddingPayload.extract_embeddings(response)
+
+
+@dataclass
+class ClassifyPayload(BasePayload):
+    """Payload for the ``/v1/classify`` endpoint."""
+
+    endpoint: str = "/v1/classify"
+    expected_prompt_tokens: Optional[int] = None
+
+    def response_handler(self, response: Any) -> str:
+        response.raise_for_status()
+        result = response.json()
+        assert (
+            result.get("object") == "list"
+        ), f"Expected object='list', got {result.get('object')}"
+        assert result.get("data"), "Empty classification data"
+
+        for index, item in enumerate(result["data"]):
+            assert item.get("index") == index
+            probs = item.get("probs")
+            assert isinstance(probs, list) and probs, "probs must be a non-empty list"
+            assert item.get("num_classes") == len(probs)
+            assert all(isinstance(prob, (int, float)) for prob in probs)
+            assert item.get("label") is None or isinstance(item["label"], str)
+
+        usage = result.get("usage")
+        assert isinstance(usage, dict), "Missing usage in classification response"
+        assert usage.get("prompt_tokens") == usage.get("total_tokens")
+        assert usage.get("completion_tokens") == 0
+        if self.expected_prompt_tokens is not None:
+            assert usage.get("prompt_tokens") == self.expected_prompt_tokens
+
+        return f"Classified {len(result['data'])} inputs"
+
+
+@dataclass
+class PoolingPayload(BasePayload):
+    """Payload for JSON and binary ``/v1/pooling`` responses."""
+
+    endpoint: str = "/v1/pooling"
+    expected_prompt_tokens: Optional[int] = None
+
+    # Tasks whose output is one vector per token, so the response must stay a
+    # matrix. Validating only ``data[0]`` would accept a flattened vector here,
+    # which is the exact regression these cases exist to catch.
+    _TOKEN_WISE_TASKS = frozenset(("token_embed", "token_classify"))
+
+    _DTYPE_WIDTHS = {
+        "float32": 4,
+        "float16": 2,
+        "bfloat16": 2,
+        "fp8_e4m3": 1,
+        "fp8_e5m2": 1,
+    }
+
+    def _validate_json_data(self, data: Any) -> None:
+        assert isinstance(data, list) and data, "pooling data must be non-empty"
+
+        if self.body.get("task") in self._TOKEN_WISE_TASKS:
+            self._validate_token_wise_data(data)
+            return
+
+        self._validate_sequence_wise_data(data)
+
+    @staticmethod
+    def _validate_sequence_wise_data(data: Any) -> None:
+        """Require a flat numeric vector: exactly one vector per input.
+
+        Sequence-level tasks (``embed``, ``classify``) return one vector per
+        input, which the worker enforces itself. Accepting a matrix here and
+        validating only ``data[0]`` would let a rank regression pass while
+        clients can no longer read the result as a vector.
+        """
+        assert all(
+            isinstance(value, (int, float)) and not isinstance(value, bool)
+            for value in data
+        ), f"sequence-level output must be a flat numeric vector, got {data!r}"
+
+    @staticmethod
+    def _validate_token_wise_data(data: Any) -> None:
+        """Require a non-empty matrix of numeric rows with a consistent width.
+
+        Rejects a flattened vector, ragged rows, empty rows, and non-numeric
+        values — every row is checked, not just the first.
+        """
+        assert all(
+            isinstance(row, list) for row in data
+        ), f"token-wise output must be a list of rows, got {data!r}"
+
+        width = len(data[0])
+        assert width, "token-wise rows must be non-empty"
+        for position, row in enumerate(data):
+            assert len(row) == width, (
+                f"token-wise rows must have a consistent width; row {position} "
+                f"has {len(row)}, expected {width}"
+            )
+            assert all(
+                isinstance(value, (int, float)) and not isinstance(value, bool)
+                for value in row
+            ), f"token-wise row {position} has non-numeric values: {row!r}"
+
+    def _handle_json_response(self, response: Any) -> str:
+        result = response.json()
+        assert (
+            result.get("object") == "list"
+        ), f"Expected object='list', got {result.get('object')}"
+        assert result.get("data"), "Empty pooling data"
+
+        encoding_format = self.body.get("encoding_format", "float")
+        dtype_width = self._DTYPE_WIDTHS[self.body.get("embed_dtype", "float32")]
+        for index, item in enumerate(result["data"]):
+            assert item.get("index") == index
+            assert item.get("object") == "pooling"
+            data = item.get("data")
+            if encoding_format == "base64":
+                assert isinstance(data, str)
+                decoded = base64.b64decode(data, validate=True)
+                assert decoded and len(decoded) % dtype_width == 0
+            else:
+                self._validate_json_data(data)
+
+        usage = result.get("usage")
+        assert isinstance(usage, dict), "Missing usage in pooling response"
+        assert usage.get("prompt_tokens") == usage.get("total_tokens")
+        assert usage.get("completion_tokens") == 0
+        if self.expected_prompt_tokens is not None:
+            assert usage.get("prompt_tokens") == self.expected_prompt_tokens
+
+        return f"Pooled {len(result['data'])} inputs as {encoding_format}"
+
+    def _handle_binary_response(self, response: Any) -> str:
+        assert response.headers.get("content-type") == "application/octet-stream"
+        assert response.content, "Empty binary pooling response"
+
+        encoding_format = self.body["encoding_format"]
+        metadata_header = response.headers.get("metadata")
+        if encoding_format == "bytes_only":
+            assert metadata_header is None
+            return f"Pooled bytes_only response with {len(response.content)} bytes"
+
+        assert metadata_header is not None, "bytes response is missing metadata"
+        metadata = json.loads(metadata_header)
+        assert metadata.get("data"), "bytes metadata has no tensor entries"
+
+        # A client reconstructs each tensor from (start, end, shape, dtype,
+        # endianness) alone, so metadata that merely stays in bounds is not
+        # enough — it must agree with the body byte-for-byte. Checking only
+        # bounds lets an offset/shape serialization regression pass here while
+        # clients cannot reconstruct anything.
+        dtype_width = self._DTYPE_WIDTHS[self.body.get("embed_dtype", "float32")]
+        expected_start = 0
+        for index, item in enumerate(metadata["data"]):
+            assert item.get("index") == index
+            assert item.get("embed_dtype") == self.body.get("embed_dtype", "float32")
+            assert item.get("endianness") == self.body.get("endianness", "native")
+            assert item["start"] < item["end"] <= len(response.content)
+
+            shape = item.get("shape")
+            assert shape, "bytes metadata entry is missing shape"
+            assert all(
+                isinstance(dim, int) and dim > 0 for dim in shape
+            ), f"tensor {index} has a non-positive shape: {shape!r}"
+
+            # Rank matters as much as the byte count: [2, 2] and [4] cover the
+            # same span, but only one is the shape the task promises.
+            expected_rank = 2 if self.body.get("task") in self._TOKEN_WISE_TASKS else 1
+            assert len(shape) == expected_rank, (
+                f"tensor {index} has rank {len(shape)} (shape {shape!r}), "
+                f"expected rank {expected_rank} for task "
+                f"{self.body.get('task', 'embed')!r}"
+            )
+
+            element_count = math.prod(shape)
+            expected_bytes = element_count * dtype_width
+            actual_bytes = item["end"] - item["start"]
+            assert actual_bytes == expected_bytes, (
+                f"tensor {index} span is {actual_bytes} bytes but shape {shape} "
+                f"at {dtype_width} bytes/element needs {expected_bytes}"
+            )
+
+            # Spans must tile the body in order: contiguous and non-overlapping.
+            assert item["start"] == expected_start, (
+                f"tensor {index} starts at {item['start']}, expected "
+                f"{expected_start} (spans must be contiguous and non-overlapping)"
+            )
+            expected_start = item["end"]
+
+        assert expected_start == len(response.content), (
+            f"metadata spans cover {expected_start} bytes but the body is "
+            f"{len(response.content)} bytes"
+        )
+
+        usage = metadata.get("usage")
+        assert isinstance(usage, dict), "bytes metadata is missing usage"
+        assert usage.get("prompt_tokens") == usage.get("total_tokens")
+        if self.expected_prompt_tokens is not None:
+            assert usage.get("prompt_tokens") == self.expected_prompt_tokens
+
+        return f"Pooled {len(metadata['data'])} binary tensors"
+
+    def response_handler(self, response: Any) -> str:
+        response.raise_for_status()
+        if self.body.get("encoding_format") in ("bytes", "bytes_only"):
+            return self._handle_binary_response(response)
+        return self._handle_json_response(response)
+
+
+@dataclass
+class EmbeddingMultiWorkerDispatchPayload(BasePayload):
+    """Send ``repeat_count`` embedding requests to the frontend, capturing a
+    per-worker ``/metrics`` snapshot on the FIRST iteration and on the LAST
+    iteration. Assert the delta — i.e. requests attributed during *this*
+    burst — matches an expected per-worker pattern.
+
+    Diff semantics are important because the same fixture may run multiple
+    bursts back-to-back (e.g. one per model in a multi-model dispatch
+    test): the prior burst leaves a worker's absolute counter > 0, so only
+    deltas can prove the second burst did not also reach that worker.
+
+    Two routing properties of the embedding worker pool are checked
+    through this payload:
+
+    1. **Same-model load balancing** — when multiple workers serve the
+       same embedding model, ``select_worker_set_with()`` does
+       weighted-random selection across them, so both workers should see
+       ``>0`` delta. Set ``expected_workers_with_delta={port1, port2}``.
+
+    2. **Multi-model dispatch** — when workers serve different models,
+       the name-keyed ``get_embeddings_engine(model)`` lookup must route
+       only to the worker registered for the requested model. Set
+       ``expected_workers_with_delta={port_of_requested_model}`` so the
+       check asserts the wrong-model worker observed exactly 0 delta
+       during this burst.
+
+    The per-worker counter sampled is
+    ``dynamo_component_requests_total`` — the same counter exercised by
+    ``MetricsPayload`` for single-worker tests. The dispatch assertion
+    fires once after the last repeat.
+    """
+
+    endpoint: str = "/v1/embeddings"
+
+    # Indices into ``self.system_ports`` (inherited from BasePayload, with
+    # DefaultPort.SYSTEM{1,2} entries remapped to per-test dynamic ports
+    # by the harness). Each indexed worker must have observed >0 delta
+    # during this burst; other workers must observe exactly 0 delta.
+    #
+    # Index-based on purpose: the actual port values are not known at
+    # config-construction time because the harness assigns dynamic ports.
+    expected_worker_indices_with_delta: set[int] = field(default_factory=set)
+
+    # Lower bound on the SUM of per-worker deltas across all workers. Use
+    # ``repeat_count`` for an exact-match expectation in clean fixtures.
+    # Defaults to 0 (predicate-only — workers_with_delta must match).
+    min_total_delta: int = 0
+
+    # Settle delay applied around each /metrics scrape so the worker has
+    # time to flush the most recent counter increment.
+    settle_seconds: float = 1.0
+
+    # Internal: iteration counter and baseline snapshot. Both are mutated
+    # in validate(); the dataclass machinery treats them as normal
+    # attributes once the instance is constructed.
+    _calls_seen: int = 0
+    _baseline: dict[int, float] = field(default_factory=dict)
+
+    def with_model(self, model):
+        # Embedding body is set externally; this is a no-op.
+        return self
+
+    def response_handler(self, response: Any) -> str:
+        # Validate the per-iteration response shape so an HTML/JSON error
+        # surfaces immediately. The *dispatch* assertion happens in
+        # validate() on the final repeat.
+        return EmbeddingPayload.extract_embeddings(response)
+
+    def _scrape(self) -> dict[int, float]:
+        prefix = prometheus_names.name_prefix.COMPONENT
+        counter_name = f"{prefix}_{prometheus_names.work_handler.REQUESTS_TOTAL}"
+
+        counts: dict[int, float] = {}
+        for port in self.system_ports:
+            r = requests.get(
+                f"http://{self.host}:{port}/metrics",
+                timeout=self.timeout,
+            )
+            r.raise_for_status()
+            counts[port] = sum_metric_samples(r.text, counter_name)
+        return counts
+
+    def validate(self, response: Any, content: str) -> None:
+        """First repeat: snapshot baseline counts. Last repeat: scrape
+        again, compute deltas, and assert the dispatch pattern.
+        """
+        self._calls_seen += 1
+
+        if self._calls_seen == 1:
+            # Snapshot AFTER the first request; this is fine because the
+            # baseline is subtracted out below — we only care that the
+            # delta from this point forward matches expectations.
+            time.sleep(self.settle_seconds)
+            self._baseline = self._scrape()
+            logger.info("Baseline per-worker counts: %s", self._baseline)
+            return
+
+        if self._calls_seen < self.repeat_count:
+            return
+
+        # Last repeat — compute delta.
+        time.sleep(self.settle_seconds)
+        final = self._scrape()
+        delta = {p: final[p] - self._baseline.get(p, 0.0) for p in final}
+        logger.info(
+            "Per-worker delta (final - baseline) over %d requests: %s",
+            self.repeat_count - 1,
+            delta,
+        )
+
+        workers_with_delta_idx = {
+            i for i, port in enumerate(self.system_ports) if delta.get(port, 0) > 0
+        }
+        assert workers_with_delta_idx == self.expected_worker_indices_with_delta, (
+            f"Expected worker indices with delta "
+            f"{self.expected_worker_indices_with_delta}, got "
+            f"{workers_with_delta_idx}. Per-worker delta: {delta} "
+            f"(baseline={self._baseline}, final={final}, "
+            f"system_ports={self.system_ports})"
+        )
+
+        if self.min_total_delta > 0:
+            total_delta = sum(delta.values())
+            assert total_delta >= self.min_total_delta, (
+                f"Expected at least {self.min_total_delta} total delta across "
+                f"workers, got {int(total_delta)}. Per-worker delta: {delta}"
+            )
+
+
+@dataclass
+class MetricCheck:
+    """Definition of a metric validation check"""
+
+    name: str
+    pattern: Callable[[str], str]
+    validator: Callable[[Any], bool]
+    error_msg: Callable[[str, Any], str]
+    success_msg: Callable[[str, Any], str]
+    multiline: bool = False
+
+
+@dataclass
+class KvEventMetricsPayload(BasePayload):
+    """Validate structured KV event counters instead of grepping event logs."""
+
+    endpoint: str = "/metrics"
+    method: str = "GET"
+    port: int = DefaultPort.SYSTEM1.value
+    event_type: str = "stored"
+    min_received: int = 1
+    min_accepted: int = 1
+    settle_seconds: float = 0.5
+
+    def with_model(self, model):
+        return self
+
+    def response_handler(self, response: Any) -> str:
+        response.raise_for_status()
+        if self.settle_seconds > 0:
+            time.sleep(self.settle_seconds)
+
+        contents = []
+        seen_ports: set[int] = set()
+
+        for port in [self.port, *self.system_ports]:
+            if port in seen_ports:
+                continue
+            seen_ports.add(port)
+            metrics_response = requests.get(
+                f"http://{self.host}:{port}/{self.endpoint.lstrip('/')}",
+                timeout=self.timeout,
+            )
+            metrics_response.raise_for_status()
+            contents.append(metrics_response.text)
+
+        return "\n".join(contents)
+
+    def validate(self, response: Any, content: str) -> None:
+        metric_name = (
+            f"{prometheus_names.name_prefix.COMPONENT}_"
+            f"{prometheus_names.kv_publisher.ZMQ_EVENTS_TOTAL}"
+        )
+        received = sum_metric_samples(
+            content,
+            metric_name,
+            {"stage": "received", "event_type": self.event_type},
+        )
+        accepted = sum_metric_samples(
+            content,
+            metric_name,
+            {"stage": "accepted", "event_type": self.event_type},
+        )
+
+        assert received >= self.min_received, (
+            f"Expected at least {self.min_received} received KV events with "
+            f"event_type={self.event_type!r}, got {received:g}"
+        )
+        assert accepted >= self.min_accepted, (
+            f"Expected at least {self.min_accepted} accepted KV events with "
+            f"event_type={self.event_type!r}, got {accepted:g}"
+        )
+
+        # Regression guard: this counter silently failed to register
+        # because it declared `worker_id` as a variable label, which
+        # collides with the const label the runtime auto-injects under the same
+        # name. It only increments on an event_id gap, so a healthy run leaves it
+        # at zero -- assert that it is exposed at all, not that it has a value.
+        dropped_metric_name = (
+            f"{prometheus_names.name_prefix.COMPONENT}_"
+            f"{prometheus_names.kv_publisher.ENGINES_DROPPED_EVENTS_TOTAL}"
+        )
+        assert find_metric_samples(content, dropped_metric_name), (
+            f"{dropped_metric_name} is absent from /metrics. The KV publisher "
+            "registers it unconditionally at startup, so absence means it never "
+            "reached the metrics registry"
+        )
+
+        logger.info(
+            "SUCCESS: KV event metrics found for event_type=%s: "
+            "received=%s accepted=%s; %s is registered",
+            self.event_type,
+            received,
+            accepted,
+            dropped_metric_name,
+        )
+
+
+@dataclass
+class MetricsPayload(BasePayload):
+    """Base class for Prometheus metrics validation payloads.
+
+    Validates common dynamo_component_* metrics shared across all backends.
+    Backend-specific subclasses handle engine-specific metrics.
+
+    Set ``check_lifecycle_gauges=True`` to additionally assert the unified-
+    only framework gauges (``cleanup_time_seconds``, ``drain_time_seconds``,
+    ``kv_cache_hit_rate``). Off by default because legacy entry points
+    don't emit them.
+    """
+
+    endpoint: str = "/metrics"
+    method: str = "GET"
+    port: int = DefaultPort.SYSTEM1.value
+    min_num_requests: int = 1
+    check_lifecycle_gauges: bool = False
+
+    def with_model(self, model):
+        # Metrics does not use model in request body
+        return self
+
+    def response_handler(self, response: Any) -> str:
+        response.raise_for_status()
+        return response.text
+
+    def _filter_bucket_metrics(self, content: str) -> str:
+        """Filter out histogram bucket metrics to avoid count inflation"""
+        content_lines = content.split("\n")
+        filtered_lines = [line for line in content_lines if "_bucket{" not in line]
+        return "\n".join(filtered_lines)
+
+    def _get_common_metric_checks(self) -> list[MetricCheck]:
+        """Get common dynamo_component_* metric checks shared across all backends"""
+        prefix = prometheus_names.name_prefix.COMPONENT
+
+        # Define metrics to check
+        # Pattern matches: metric_name{labels} value OR metric_name value (labels optional)
+        # Examples:
+        #   - dynamo_component_requests_total{model="Qwen/Qwen3-0.6B"} 6
+        #   - dynamo_component_uptime_seconds 150.390999059
+        # Note: Supports scientific notation (e.g., 8.34e-05)
+        def metric_pattern(name):
+            return rf"{name}(?:\{{[^}}]*\}})?\s+([\d.eE+-]+)"
+
+        return [
+            MetricCheck(
+                # Check: Minimum count of unique dynamo_component_* metrics
+                name=f"{prefix}_*",
+                pattern=lambda name: rf"^{prefix}_\w+",
+                validator=lambda value: (
+                    len(set(value)) >= 7
+                ),  # 80% of typical ~13 metrics (excluding _bucket and removed kvstats metrics)
+                error_msg=lambda name, value: (
+                    f"Expected at least 7 unique {prefix}_* metrics, but found only {len(set(value))}"
+                ),
+                success_msg=lambda name, value: (
+                    f"SUCCESS: Found {len(set(value))} unique {prefix}_* metrics (minimum required: 7)"
+                ),
+                multiline=True,
+            ),
+            MetricCheck(
+                name=f"{prefix}_{prometheus_names.work_handler.REQUESTS_TOTAL}",
+                pattern=metric_pattern,
+                validator=lambda value: int(float(value)) >= self.min_num_requests,
+                error_msg=lambda name, value: (
+                    f"{name} has count {value} which is less than required {self.min_num_requests}"
+                ),
+                success_msg=lambda name, value: (
+                    f"SUCCESS: Found {name} with count: {value}"
+                ),
+            ),
+            MetricCheck(
+                name=f"{prefix}_{prometheus_names.distributed_runtime.UPTIME_SECONDS}",
+                pattern=metric_pattern,
+                validator=lambda value: float(value) > 0,
+                error_msg=lambda name, value: f"{name} should be > 0, but got {value}",
+                success_msg=lambda name, value: f"SUCCESS: Found {name} = {value}s",
+            ),
+            MetricCheck(
+                name=f"{prefix}_{prometheus_names.kvstats.TOTAL_BLOCKS}",
+                pattern=metric_pattern,
+                validator=lambda value: float(value) >= 0,
+                error_msg=lambda name, value: f"{name} should be >= 0, but got {value}",
+                success_msg=lambda name, value: f"SUCCESS: Found {name} = {value}",
+            ),
+            MetricCheck(
+                name=f"{prefix}_{prometheus_names.kvstats.GPU_CACHE_USAGE_PERCENT}",
+                pattern=metric_pattern,
+                validator=lambda value: 0.0 <= float(value) <= 1.0,
+                error_msg=lambda name, value: (
+                    f"{name} should be between 0.0 and 1.0, but got {value}"
+                ),
+                success_msg=lambda name, value: f"SUCCESS: Found {name} = {value}",
+            ),
+            MetricCheck(
+                name=f"{prefix}_{prometheus_names.model_info.LOAD_TIME_SECONDS}",
+                pattern=metric_pattern,
+                validator=lambda value: float(value) > 0,
+                error_msg=lambda name, value: f"{name} should be > 0, but got {value}",
+                success_msg=lambda name, value: (
+                    f"SUCCESS: Found {name} = {float(value):.2f}s"
+                ),
+            ),
+        ]
+
+    def _get_lifecycle_gauge_checks(self) -> list[MetricCheck]:
+        """Unified-only framework lifecycle gauges. Legacy entry points
+        don't emit these — gated by ``check_lifecycle_gauges`` so legacy
+        callers don't trip on the absence.
+
+        - cleanup_time / drain_time: Rust-side ``LifecycleGauges``, owned
+          by ``dynamo_backend_common::Worker``. While the worker is
+          serving the values are 0 (set at shutdown). The "name appears"
+          check catches regressions where the gauges silently fail to
+          register against the runtime's ``MetricsRegistry``.
+
+        ``kv_cache_hit_rate`` is INTENTIONALLY not in this list. With the
+        Rust ``prometheus`` crate, a ``GaugeVec`` family with no labeled
+        children is skipped by the text encoder — so an engine that
+        legitimately reports ``kv_cache_hit_rate=None`` (no prefix cache,
+        or no requests observed) has no HELP line. That's the tri-state
+        contract working as designed; not a regression to test for here.
+        """
+        prefix = prometheus_names.name_prefix.COMPONENT
+
+        def metric_pattern(name):
+            return rf"{name}(?:\{{[^}}]*\}})?\s+([\d.eE+-]+)"
+
+        return [
+            MetricCheck(
+                name=f"{prefix}_{prometheus_names.lifecycle.CLEANUP_TIME_SECONDS}",
+                pattern=metric_pattern,
+                validator=lambda value: float(value) >= 0,
+                error_msg=lambda name, value: f"{name} should be >= 0, but got {value}",
+                success_msg=lambda name, value: f"SUCCESS: Found {name} = {value}",
+            ),
+            MetricCheck(
+                name=f"{prefix}_{prometheus_names.lifecycle.DRAIN_TIME_SECONDS}",
+                pattern=metric_pattern,
+                validator=lambda value: float(value) >= 0,
+                error_msg=lambda name, value: f"{name} should be >= 0, but got {value}",
+                success_msg=lambda name, value: f"SUCCESS: Found {name} = {value}",
+            ),
+        ]
+
+    def _get_backend_specific_checks(self) -> list[MetricCheck]:
+        """Get backend-specific metric checks. Override in subclasses."""
+        return []
+
+    def _validate_metric_checks(
+        self, metrics_to_check: list[MetricCheck], content: str
+    ) -> None:
+        """Run all metric checks and raise AssertionError if any fail"""
+        for metric in metrics_to_check:
+            # Special handling for multiline patterns (like counting unique metrics)
+            if metric.multiline:
+                pattern = metric.pattern(metric.name)
+                matches = re.findall(pattern, content, re.MULTILINE)
+                if not matches:
+                    raise AssertionError(
+                        f"Could not find any matches for pattern '{metric.name}'"
+                    )
+
+                # For multiline, pass the entire list to validator
+                if metric.validator(matches):
+                    logger.info(metric.success_msg(metric.name, matches))
+                else:
+                    raise AssertionError(metric.error_msg(metric.name, matches))
+            else:
+                # Standard single-value metric check
+                if metric.name not in content:
+                    raise AssertionError(
+                        f"Metric '{metric.name}' not found in metrics output"
+                    )
+
+                pattern = metric.pattern(metric.name)
+                matches = re.findall(pattern, content)
+                if not matches:
+                    raise AssertionError(
+                        f"Could not parse value for metric '{metric.name}'"
+                    )
+
+                # For metrics with multiple values (like requests_total with different labels),
+                # check if any match passes validation
+                validation_passed = False
+                last_value = None
+                for match in matches:
+                    last_value = match
+                    if metric.validator(match):
+                        logger.info(metric.success_msg(metric.name, match))
+                        validation_passed = True
+                        break
+
+                if not validation_passed:
+                    raise AssertionError(
+                        metric.error_msg(
+                            metric.name, last_value if last_value else "N/A"
+                        )
+                    )
+
+    def validate(self, response: Any, content: str) -> None:
+        """Validate Prometheus metrics output"""
+        content = self._filter_bucket_metrics(content)
+
+        # Collect all checks: common + backend-specific (+ lifecycle if opted in)
+        metrics_to_check = self._get_common_metric_checks()
+        metrics_to_check.extend(self._get_backend_specific_checks())
+        if self.check_lifecycle_gauges:
+            metrics_to_check.extend(self._get_lifecycle_gauge_checks())
+
+        # Run all validations
+        self._validate_metric_checks(metrics_to_check, content)
+
+
+@dataclass
+class ImageTokenMetricsPayload(MetricsPayload):
+    """Validate frontend image-token usage aggregates for one model."""
+
+    model: Optional[str] = None
+    port: int = DefaultPort.FRONTEND.value
+
+    def with_model(self, model: str) -> "ImageTokenMetricsPayload":
+        payload = deepcopy(self)
+        payload.model = model
+        return payload
+
+    def _get_common_metric_checks(self) -> list[MetricCheck]:
+        if self.model is None:
+            raise ValueError("ImageTokenMetricsPayload requires a model")
+
+        prefix = prometheus_names.name_prefix.FRONTEND
+        metric = prometheus_names.frontend_service.IMAGE_TOKENS_PER_REQUEST
+        count_name = f"{prefix}_{metric}_count"
+        sum_name = f"{prefix}_{metric}_sum"
+        escaped_model = re.escape(self.model)
+
+        def model_metric_pattern(name: str) -> str:
+            return (
+                rf'{re.escape(name)}\{{(?:[^}}]*,)?model="{escaped_model}"'
+                r"(?:,[^}]*)?\}"
+                r"\s+([\d.eE+-]+)"
+            )
+
+        return [
+            MetricCheck(
+                name=count_name,
+                pattern=model_metric_pattern,
+                validator=lambda value: int(float(value)) >= self.min_num_requests,
+                error_msg=lambda name, value: (
+                    f"{name} has count {value}, expected at least "
+                    f"{self.min_num_requests}"
+                ),
+                success_msg=lambda name, value: (
+                    f"SUCCESS: Found {name} with count: {value}"
+                ),
+            ),
+            MetricCheck(
+                name=sum_name,
+                pattern=model_metric_pattern,
+                validator=lambda value: float(value) > 0,
+                error_msg=lambda name, value: (
+                    f"{name} should contain positive image-token usage, got {value}"
+                ),
+                success_msg=lambda name, value: (
+                    f"SUCCESS: Found {name} with aggregate image-token usage: {value}"
+                ),
+            ),
+        ]
+
+
+@dataclass
+class VLLMMetricsPayload(MetricsPayload):
+    """Metrics validation for vLLM backend with auto-label checks"""
+
+    def _get_backend_specific_checks(self) -> list[MetricCheck]:
+        """vLLM-specific metric checks"""
+        checks = [
+            MetricCheck(
+                # Check: Minimum count of unique vllm:* metrics
+                name="vllm:*",
+                pattern=lambda name: r"^vllm:\w+",
+                validator=lambda value: (
+                    len(set(value)) >= 56
+                ),  # 80% of typical ~70 vllm metrics (excluding _bucket) as of 2026-02-05 (but will grow)
+                error_msg=lambda name, value: (
+                    f"Expected at least 56 unique vllm:* metrics, but found only {len(set(value))}"
+                ),
+                success_msg=lambda name, value: (
+                    f"SUCCESS: Found {len(set(value))} unique vllm:* metrics (minimum required: 56)"
+                ),
+                multiline=True,
+            )
+        ]
+
+        # Check required labels: auto-injected (from prometheus_names.labels) + injected by backend
+        required_labels = [
+            prometheus_names.labels.NAMESPACE,
+            prometheus_names.labels.COMPONENT,
+            prometheus_names.labels.ENDPOINT,
+            prometheus_names.labels.MODEL,  # OpenAI standard (injected by all backends)
+            prometheus_names.labels.MODEL_NAME,  # Alternative label (injected for compatibility)
+        ]
+        for label_name in required_labels:
+            checks.append(
+                MetricCheck(
+                    name=f"vllm:* with {label_name}",
+                    pattern=cast(
+                        Callable[[str], str],
+                        lambda name, lbl=label_name: rf'vllm:\w+\{{[^}}]*{lbl}="[^"]+"',
+                    ),
+                    validator=lambda value: len(value) > 0,
+                    error_msg=cast(
+                        Callable[[str, Any], str],
+                        lambda name, value, lbl=label_name: (
+                            f"vLLM metrics missing label: {lbl}"
+                        ),
+                    ),
+                    success_msg=cast(
+                        Callable[[str, Any], str],
+                        lambda name, value, lbl=label_name: (
+                            f"SUCCESS: vLLM metrics include {lbl} label (found {len(value)} metrics)"
+                        ),
+                    ),
+                    multiline=True,
+                )
+            )
+
+        return checks
+
+
+@dataclass
+class LMCacheMetricsPayload(MetricsPayload):
+    """Metrics validation for lmcache"""
+
+    def _get_backend_specific_checks(self) -> list[MetricCheck]:
+        """lmcache-specific metric checks"""
+        return [
+            MetricCheck(
+                # Check: Minimum count of unique lmcache:* metrics
+                name="lmcache:*",
+                pattern=lambda name: r"^lmcache:\w+",
+                validator=lambda value: (
+                    len(set(value)) >= 26
+                ),  # 80% of typical ~33 lmcache metrics (excluding _bucket) as of 2026-02-05 (but will grow)
+                error_msg=lambda name, value: (
+                    f"Expected at least 26 unique lmcache:* metrics, but found only {len(set(value))}"
+                ),
+                success_msg=lambda name, value: (
+                    f"SUCCESS: Found {len(set(value))} lmcache:* metrics (minimum required: 26)"
+                ),
+                multiline=True,
+            )
+        ]
+
+
+@dataclass
+class SGLangMetricsPayload(MetricsPayload):
+    """Metrics validation for SGLang backend with auto-label checks"""
+
+    def _get_backend_specific_checks(self) -> list[MetricCheck]:
+        """SGLang-specific metric checks"""
+        checks = [
+            MetricCheck(
+                # Check: Minimum count of unique sglang:* metrics
+                name="sglang:*",
+                pattern=lambda name: r"^sglang:\w+",
+                validator=lambda value: (
+                    len(set(value)) >= 20
+                ),  # 80% of typical ~25 sglang metrics (excluding _bucket) as of 2025-10-22 (but will grow)
+                error_msg=lambda name, value: (
+                    f"Expected at least 20 unique sglang:* metrics, but found only {len(set(value))}"
+                ),
+                success_msg=lambda name, value: (
+                    f"SUCCESS: Found {len(set(value))} unique sglang:* metrics (minimum required: 20)"
+                ),
+                multiline=True,
+            )
+        ]
+
+        # Check required labels: auto-injected (from prometheus_names.labels) + injected by backend
+        required_labels = [
+            prometheus_names.labels.NAMESPACE,
+            prometheus_names.labels.COMPONENT,
+            prometheus_names.labels.ENDPOINT,
+            prometheus_names.labels.MODEL,  # OpenAI standard (injected by all backends)
+            prometheus_names.labels.MODEL_NAME,  # Alternative label (injected for compatibility)
+        ]
+        for label_name in required_labels:
+            checks.append(
+                MetricCheck(
+                    name=f"sglang:* with {label_name}",
+                    pattern=cast(
+                        Callable[[str], str],
+                        lambda name, lbl=label_name: (
+                            rf'sglang:\w+\{{[^}}]*{lbl}="[^"]+"'
+                        ),
+                    ),
+                    validator=lambda value: len(value) > 0,
+                    error_msg=cast(
+                        Callable[[str, Any], str],
+                        lambda name, value, lbl=label_name: (
+                            f"sglang metrics missing label: {lbl}"
+                        ),
+                    ),
+                    success_msg=cast(
+                        Callable[[str, Any], str],
+                        lambda name, value, lbl=label_name: (
+                            f"SUCCESS: sglang metrics include {lbl} label (found {len(value)} metrics)"
+                        ),
+                    ),
+                    multiline=True,
+                )
+            )
+
+        return checks
+
+
+@dataclass
+class SGLangSpecDecodeMetricsPayload(SGLangMetricsPayload):
+    """Metrics validation for an SGLang worker running speculative decoding.
+
+    Both checks use cumulative counters rather than the windowed
+    ``sglang:spec_accept_length`` gauge, which only refreshes on SGLang's decode
+    log interval and can be stale after short requests.
+    """
+
+    # Loose floor on tokens per verify step; a working EAGLE3 draft measures ~2.2.
+    min_tokens_per_verify: float = 1.2
+
+    @staticmethod
+    def _sum_counter(name: str, content: str) -> float:
+        values = find_metric_samples(content, name)
+        if not values:
+            raise AssertionError(f"Metric '{name}' not found in metrics output")
+        return sum(values)
+
+    def validate(self, response: Any, content: str) -> None:
+        super().validate(response, content)
+
+        verify_calls = self._sum_counter("sglang:spec_verify_calls_total", content)
+        if verify_calls <= 0:
+            raise AssertionError(
+                "sglang:spec_verify_calls_total is 0; speculative decoding did not run"
+            )
+        logger.info(f"SUCCESS: sglang:spec_verify_calls_total = {verify_calls}")
+
+        generated = self._sum_counter("sglang:generation_tokens_total", content)
+        tokens_per_verify = generated / verify_calls
+        if tokens_per_verify <= self.min_tokens_per_verify:
+            raise AssertionError(
+                f"{generated} generated tokens over {verify_calls} verify calls is "
+                f"{tokens_per_verify:.2f} tokens/verify, expected > "
+                f"{self.min_tokens_per_verify}; draft tokens are not being accepted"
+            )
+        logger.info(f"SUCCESS: {tokens_per_verify:.2f} tokens per verify step")
+
+
+@dataclass
+class SGLangDisaggMetricsPayload(SGLangMetricsPayload):
+    """Metrics validation for SGLang disaggregated workers.
+
+    Disagg workers (prefill/decode) expose fewer sglang:* metrics than
+    aggregated workers because each only runs half the scheduler pipeline.
+    Observed: ~14 unique sglang:* metrics vs ~25 for aggregated.
+    """
+
+    def _get_backend_specific_checks(self) -> list[MetricCheck]:
+        checks = super()._get_backend_specific_checks()
+        for check in checks:
+            if check.name == "sglang:*":
+                check.validator = lambda value: len(set(value)) >= 10
+                check.error_msg = lambda name, value: (
+                    f"Expected at least 10 unique sglang:* metrics, but found only {len(set(value))}"
+                )
+                check.success_msg = lambda name, value: (
+                    f"SUCCESS: Found {len(set(value))} unique sglang:* metrics (minimum required: 10)"
+                )
+        return checks
+
+
+@dataclass
+class SGLangDisaggRouterMetricsPayload(MetricsPayload):
+    """Validate request accounting across disaggregated prefill workers."""
+
+    def _get_common_metric_checks(self) -> list[MetricCheck]:
+        request_counter_name = (
+            f"{prometheus_names.name_prefix.COMPONENT}_"
+            f"{prometheus_names.work_handler.REQUESTS_TOTAL}"
+        )
+        return [
+            check
+            for check in super()._get_common_metric_checks()
+            if check.name != request_counter_name
+        ]
+
+    def validate(self, response: Any, content: str) -> None:
+        # Preserve the existing common metrics checks on the primary prefill
+        # worker, but account for routed requests across every configured
+        # prefill worker.
+        super().validate(response, content)
+
+        if not self.system_ports:
+            raise AssertionError("No prefill worker metrics ports were configured")
+
+        counter_name = (
+            f"{prometheus_names.name_prefix.COMPONENT}_"
+            f"{prometheus_names.work_handler.REQUESTS_TOTAL}"
+        )
+        labels = {
+            prometheus_names.labels.COMPONENT: "prefill",
+            prometheus_names.labels.ENDPOINT: "generate",
+        }
+        counts: dict[int, float] = {}
+
+        for port in self.system_ports:
+            worker_content = content
+            if port != self.port:
+                worker_response = requests.get(
+                    f"http://{self.host}:{port}/metrics",
+                    timeout=self.timeout,
+                )
+                worker_response.raise_for_status()
+                worker_content = worker_response.text
+
+            samples = find_metric_samples(worker_content, counter_name, labels)
+            if not samples:
+                raise AssertionError(
+                    f"Metric {counter_name} with labels {labels} was not found "
+                    f"on prefill worker metrics port {port}"
+                )
+            counts[port] = sum(samples)
+
+        total_requests = sum(counts.values())
+        per_worker = ", ".join(
+            f"port {port}={count:g}" for port, count in counts.items()
+        )
+        if total_requests < self.min_num_requests:
+            raise AssertionError(
+                f"{counter_name} has aggregate count {total_requests:g}, less than "
+                f"required {self.min_num_requests} across prefill workers "
+                f"({per_worker})"
+            )
+        logger.info(
+            "SUCCESS: Found %s with aggregate count %g across prefill workers (%s)",
+            counter_name,
+            total_requests,
+            per_worker,
+        )
+
+
+@dataclass
+class TRTLLMMetricsPayload(MetricsPayload):
+    """Metrics validation for TensorRT-LLM backend"""
+
+    def _get_backend_specific_checks(self) -> list[MetricCheck]:
+        """TRT-LLM-specific metric checks"""
+        component_prefix = prometheus_names.name_prefix.COMPONENT
+        total_blocks = f"{component_prefix}_{prometheus_names.kvstats.TOTAL_BLOCKS}"
+
+        checks = [
+            MetricCheck(
+                # Check: Minimum count of unique trtllm_* metrics
+                name="trtllm_*",
+                pattern=lambda name: r"^trtllm_\w+",
+                validator=lambda value: (
+                    len(set(value)) >= 4
+                ),  # 80% of typical ~5 trtllm metrics (excluding _bucket) as of 2025-10-22 (but will grow)
+                error_msg=lambda name, value: (
+                    f"Expected at least 4 unique trtllm_* metrics, but found only {len(set(value))}"
+                ),
+                success_msg=lambda name, value: (
+                    f"SUCCESS: Found {len(set(value))} unique trtllm_* metrics (minimum required: 4)"
+                ),
+                multiline=True,
+            ),
+            # The checks above and in the base class count metric *names* and
+            # accept a zero block count. Prometheus registers names when the
+            # collector is constructed, so both pass on a worker whose stats
+            # thread never published a sample and whose engine never recorded
+            # a request. The two checks below require an observation on each
+            # path, so one going dead cannot pass as the other still working.
+            MetricCheck(
+                # Stats path: the per-rank gauges are seeded at 0 by
+                # _init_publish_metrics_thread and only move when iteration
+                # stats arrive from the engine. Any rank reporting a positive
+                # block count proves the polling thread published.
+                name=f"{total_blocks} (positive on some rank)",
+                pattern=lambda name: (
+                    rf"{total_blocks}(?:\{{[^}}]*\}})?\s+([\d.eE+-]+)"
+                ),
+                validator=lambda value: any(float(v) > 0 for v in value),
+                error_msg=lambda name, value: (
+                    f"{name}: every rank reported a non-positive block count "
+                    f"(values: {value}). The stats polling thread never "
+                    f"published iteration stats."
+                ),
+                success_msg=lambda name, value: (f"SUCCESS: {name} (values: {value})"),
+                multiline=True,
+            ),
+            MetricCheck(
+                # Request path: TRT-LLM's own per-request series, recorded by
+                # MetricsCollector as requests finish. Several names are
+                # matched because they come from tensorrt_llm.metrics and one
+                # upstream rename should not silently void the check.
+                name="trtllm_* per-request observations",
+                pattern=lambda name: (
+                    r"trtllm_(?:request_success_total"
+                    r"|e2e_request_latency_seconds_count"
+                    r"|time_to_first_token_seconds_count"
+                    r"|time_per_output_token_seconds_count"
+                    r"|request_queue_time_seconds_count)"
+                    r"(?:\{[^}]*\})?\s+([\d.eE+-]+)"
+                ),
+                validator=lambda value: any(float(v) > 0 for v in value),
+                error_msg=lambda name, value: (
+                    f"{name}: TRT-LLM recorded no per-request observations "
+                    f"(values: {value}). The engine's request metrics are not "
+                    f"reaching the collector."
+                ),
+                success_msg=lambda name, value: (f"SUCCESS: {name} (values: {value})"),
+                multiline=True,
+            ),
+        ]
+
+        # Check required labels: auto-injected (from prometheus_names.labels) + injected by backend
+        required_labels = [
+            prometheus_names.labels.NAMESPACE,
+            prometheus_names.labels.COMPONENT,
+            prometheus_names.labels.ENDPOINT,
+            prometheus_names.labels.MODEL,  # OpenAI standard (injected by all backends)
+            prometheus_names.labels.MODEL_NAME,  # Alternative label (injected for compatibility)
+        ]
+        for label_name in required_labels:
+            checks.append(
+                MetricCheck(
+                    name=f"trtllm_* with {label_name}",
+                    pattern=cast(
+                        Callable[[str], str],
+                        lambda name, lbl=label_name: (
+                            rf'trtllm_\w+\{{[^}}]*{lbl}="[^"]+"'
+                        ),
+                    ),
+                    validator=lambda value: len(value) > 0,
+                    error_msg=cast(
+                        Callable[[str, Any], str],
+                        lambda name, value, lbl=label_name: (
+                            f"TRT-LLM metrics missing label: {lbl}"
+                        ),
+                    ),
+                    success_msg=cast(
+                        Callable[[str, Any], str],
+                        lambda name, value, lbl=label_name: (
+                            f"SUCCESS: TRT-LLM metrics include {lbl} label (found {len(value)} metrics)"
+                        ),
+                    ),
+                    multiline=True,
+                )
+            )
+
+        return checks
+
+
+# backwards compatiability
+def completions_response_handler(response):
+    return CompletionPayload.extract_text(response)
+
+
+def chat_completions_response_handler(response):
+    return ChatPayload.extract_content(response)
+
+
+@dataclass
+class ImageGenerationPayload(BasePayload):
+    """Payload for /v1/images/generations endpoint (diffusion image generation)."""
+
+    endpoint: str = "/v1/images/generations"
+    timeout: int = 300
+
+    def response_handler(self, response: Any) -> str:
+        response.raise_for_status()
+        result = response.json()
+        assert (
+            "data" in result
+        ), f"Missing 'data' in response. Keys: {list(result.keys())}"
+        assert len(result["data"]) > 0, "Empty data in image response"
+        entry = result["data"][0]
+        if "url" in entry:
+            assert entry["url"], "Image response url is empty"
+            return entry["url"]
+        assert entry.get("b64_json"), "Image response b64_json is empty"
+        return "b64_image_returned"
+
+
+@dataclass
+class VideoGenerationPayload(BasePayload):
+    """Payload for /v1/videos endpoint (diffusion video generation)."""
+
+    endpoint: str = "/v1/videos"
+    timeout: int = 600
+    # Opt-in decode checks require inline media, so a URL alone cannot pass.
+    expected_video_shape: Optional[tuple[int, int, int]] = None  # frames, height, width
+    expected_video_fps: Optional[float] = None
+
+    def response_handler(self, response: Any) -> str:
+        response.raise_for_status()
+        result = response.json()
+        assert result.get("status") == "completed", (
+            f"Video generation not completed. Status: {result.get('status')}, "
+            f"Error: {result.get('error', 'none')}"
+        )
+        assert (
+            "data" in result
+        ), f"Missing 'data' in response. Keys: {list(result.keys())}"
+        assert len(result["data"]) > 0, "Empty data in video response"
+        entry = result["data"][0]
+        if self.expected_video_shape is not None or self.expected_video_fps is not None:
+            assert entry.get("b64_json"), "Video decode checks require b64_json media"
+            self._validate_video(base64.b64decode(entry["b64_json"], validate=True))
+        if "url" in entry:
+            assert entry["url"], "Video response url is empty"
+            return entry["url"]
+        assert entry.get("b64_json"), "Video response b64_json is empty"
+        return "b64_video_returned"
+
+    def _validate_video(self, video_bytes: bytes) -> None:
+        ffprobe = shutil.which("ffprobe")
+        if ffprobe is None:
+            raise RuntimeError("ffprobe is required for video decode checks")
+        assert video_bytes[4:8] == b"ftyp", "Expected an MP4 container"
+        with tempfile.NamedTemporaryFile(suffix=".mp4") as video:
+            video.write(video_bytes)
+            video.flush()
+            # -count_frames decodes every frame without requiring the rawvideo
+            # encoder/image2pipe muxer that our restricted FFmpeg build omits.
+            result = subprocess.run(
+                [
+                    ffprobe,
+                    "-v",
+                    "error",
+                    "-err_detect",
+                    "explode",
+                    "-select_streams",
+                    "v:0",
+                    "-count_frames",
+                    "-show_entries",
+                    "stream=width,height,avg_frame_rate,nb_read_frames",
+                    "-of",
+                    "json",
+                    video.name,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        # FFprobe can return zero even after reporting decode errors. With
+        # -v error, any stderr means that the clip did not decode cleanly.
+        assert (
+            result.returncode == 0 and not result.stderr.strip()
+        ), f"Could not decode video (ffprobe exit {result.returncode}): {result.stderr}"
+        streams = json.loads(result.stdout)["streams"]
+        assert len(streams) == 1, "Expected a video stream"
+        metadata = streams[0]
+        frame_count = int(metadata.get("nb_read_frames", 0))
+        assert frame_count > 0, "Decoded video contains no frames"
+        if self.expected_video_fps is not None:
+            fps = float(Fraction(metadata["avg_frame_rate"]))
+            assert (
+                fps == self.expected_video_fps
+            ), f"Expected {self.expected_video_fps} FPS, got {fps}"
+        if self.expected_video_shape is not None:
+            count, height, width = self.expected_video_shape
+            assert (metadata["width"], metadata["height"]) == (width, height), (
+                f"Expected {width}x{height} video, "
+                f"got {metadata['width']}x{metadata['height']}"
+            )
+            assert frame_count == count, f"Expected {count} frames, got {frame_count}"
+
+    def validate(self, response: Any, content: str) -> None:
+        assert content, "Video response content is empty"
+        if self.expected_response and not any(
+            expected.lower() in content.lower() for expected in self.expected_response
+        ):
+            raise AssertionError(
+                f"Expected at least one of {self.expected_response} in {content!r}"
+            )
+
+
+@dataclass
+class I2VPayload(VideoGenerationPayload):
+    """Payload for image-to-video via /v1/videos with input_reference."""
+
+    def __post_init__(self):
+        from PIL import Image
+
+        image_buffer = BytesIO()
+        Image.new("RGB", (64, 64), color="red").save(image_buffer, format="PNG")
+        image_b64 = base64.b64encode(image_buffer.getvalue()).decode("ascii")
+        self.body["input_reference"] = f"data:image/png;base64,{image_b64}"
+
+
+@dataclass
+class AudioSpeechPayload(BasePayload):
+    """Payload for /v1/audio/speech endpoint.
+
+    The byte-count check alone passes on a WAV that carries a header and a
+    fraction of a second of silence, which is what a broken decoder or a
+    mis-assembled chunk stream produces. Set the waveform expectations below to
+    assert the audio is actually as long and as loud as the request implies;
+    they apply to WAV responses (binary or base64) and are skipped for URL
+    responses.
+    """
+
+    endpoint: str = "/v1/audio/speech"
+    timeout: int = 300
+    # Minimum decoded duration in seconds; 0 disables the check.
+    min_duration_s: float = 0.0
+    # Minimum RMS amplitude, normalized to [0, 1]; 0 disables the check.
+    min_rms: float = 0.0
+    # Expected sample rate in Hz; None disables the check.
+    expected_sample_rate: Optional[int] = None
+
+    def response_handler(self, response: Any) -> str:
+        response.raise_for_status()
+        content_type = response.headers.get("content-type", "")
+        if "audio" in content_type:
+            audio_bytes = response.content
+            assert len(audio_bytes) > 100, (
+                f"Audio response too small ({len(audio_bytes)} bytes), "
+                f"likely not valid audio"
+            )
+            self._validate_waveform(audio_bytes)
+            return f"binary_audio_{len(audio_bytes)}_bytes"
+        result = response.json()
+        assert (
+            result.get("status") != "failed"
+        ), f"Audio generation failed: {result.get('error', 'unknown')}"
+        assert (
+            "data" in result
+        ), f"Missing 'data' in response. Keys: {list(result.keys())}"
+        assert len(result["data"]) > 0, "Empty data in audio response"
+        entry = result["data"][0]
+        if "url" in entry and entry["url"]:
+            return entry["url"]
+        assert entry.get("b64_json"), "Audio response b64_json is empty"
+        self._validate_waveform(base64.b64decode(entry["b64_json"]))
+        return "b64_audio_returned"
+
+    def _validate_waveform(self, audio_bytes: bytes) -> None:
+        """Assert the decoded WAV meets the configured expectations."""
+        if (
+            self.min_duration_s <= 0
+            and self.min_rms <= 0
+            and self.expected_sample_rate is None
+        ):
+            return
+
+        with wave.open(BytesIO(audio_bytes), "rb") as wav:
+            sample_rate = wav.getframerate()
+            sample_width = wav.getsampwidth()
+            channels = wav.getnchannels()
+            frames = wav.readframes(wav.getnframes())
+        # Count what was read: a streamed WAV header carries a 0xFFFFFFFF
+        # placeholder data size, so getnframes() reports about 2**31 frames.
+        frame_count = len(frames) // (sample_width * channels)
+
+        if self.expected_sample_rate is not None:
+            assert sample_rate == self.expected_sample_rate, (
+                f"Expected {self.expected_sample_rate} Hz audio, "
+                f"got {sample_rate} Hz"
+            )
+
+        duration_s = frame_count / sample_rate if sample_rate else 0.0
+        assert duration_s >= self.min_duration_s, (
+            f"Audio is {duration_s:.3f}s, shorter than the expected minimum "
+            f"{self.min_duration_s:.3f}s ({frame_count} frames at {sample_rate} Hz)"
+        )
+
+        if self.min_rms <= 0:
+            return
+
+        assert sample_width == 2, (
+            f"RMS check supports 16-bit PCM only, got {sample_width * 8}-bit "
+            f"audio; drop min_rms for this payload"
+        )
+        sample_count = len(frames) // 2
+        assert sample_count > 0, "Decoded WAV carries no samples"
+        samples = struct.unpack(f"<{sample_count}h", frames[: sample_count * 2])
+        rms = math.sqrt(sum(s * s for s in samples) / sample_count) / 32768.0
+        assert rms >= self.min_rms, (
+            f"Audio RMS {rms:.5f} is below the expected minimum {self.min_rms:.5f}; "
+            f"the waveform is silent or near-silent "
+            f"({duration_s:.3f}s, {channels}ch at {sample_rate} Hz)"
+        )

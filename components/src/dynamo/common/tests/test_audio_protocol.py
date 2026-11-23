@@ -1,0 +1,80 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Unit tests for dynamo.common.protocols.audio_protocol module."""
+
+import pytest
+from pydantic import ValidationError
+
+from dynamo.common.protocols.audio_protocol import (
+    AudioData,
+    NvAudioSpeechResponse,
+    NvCreateAudioSpeechRequest,
+)
+
+pytestmark = [
+    pytest.mark.unit,
+    pytest.mark.gpu_0,
+    pytest.mark.pre_merge,
+]
+
+
+def test_audio_request_wire_shape():
+    # `speed` is the one request field with a protocol default; the frontend
+    # fills it in. The handlers own the default for `response_format`.
+    request = NvCreateAudioSpeechRequest(
+        input="hello",
+        model="qwen-tts",
+        voice="vivian",
+        data_source="b64_json",
+        task_type="CustomVoice",
+        language="English",
+    )
+
+    assert request.model_dump(exclude_none=True) == {
+        "input": "hello",
+        "model": "qwen-tts",
+        "voice": "vivian",
+        "data_source": "b64_json",
+        "speed": 1.0,
+        "task_type": "CustomVoice",
+        "language": "English",
+    }
+
+
+@pytest.mark.parametrize("speed", [0.1, 5.0])
+def test_audio_request_rejects_speed_outside_supported_range(speed):
+    with pytest.raises(ValidationError):
+        NvCreateAudioSpeechRequest(input="hi", speed=speed)
+
+
+def test_audio_request_speed_omitted_is_the_default_and_explicit_is_kept():
+    assert NvCreateAudioSpeechRequest(input="hi").speed == 1.0
+    assert NvCreateAudioSpeechRequest(input="hi", speed=2.5).speed == 2.5
+
+
+def test_audio_request_null_speed_is_not_part_of_the_worker_contract():
+    # A client may send `"speed": null`; the frontend reads it as 1.0 and
+    # forwards the number. The generated model describes what a worker
+    # receives, so `null` is rejected here, not normalized.
+    with pytest.raises(ValidationError):
+        NvCreateAudioSpeechRequest.model_validate({"input": "hi", "speed": None})
+
+
+def test_audio_response_wire_shape():
+    response = NvAudioSpeechResponse(
+        id="r1",
+        model="qwen-tts",
+        created=0,
+        data=[AudioData(output_format="mp3", b64_json="xyz")],
+    )
+
+    assert response.model_dump(exclude_none=True) == {
+        "id": "r1",
+        "object": "audio.speech",
+        "model": "qwen-tts",
+        "status": "completed",
+        "progress": 100,
+        "created": 0,
+        "data": [{"output_format": "mp3", "b64_json": "xyz"}],
+    }

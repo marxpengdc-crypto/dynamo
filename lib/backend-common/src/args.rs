@@ -1,0 +1,236 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+//! Common CLI flags every Rust backend needs.
+//!
+//! Flag names match the Python runtime's `WorkerConfig` knobs so operators see
+//! the same CLI surface across Rust and Python backends. Engines extend this
+//! with their own `clap` `Args` using `#[command(flatten)]`.
+
+use std::path::PathBuf;
+
+use clap::Args;
+use dynamo_llm::local_model::runtime_config::{StructuralTagConfig, StructuralTagScope};
+use dynamo_runtime::config::parse_bool_opt;
+
+use crate::disagg::DisaggregationMode;
+
+/// CLI flags that every Rust backend needs. Flatten these into your engine's
+/// `Args` struct:
+///
+/// ```ignore
+/// #[derive(clap::Parser)]
+/// struct EngineArgs {
+///     #[clap(flatten)]
+///     common: CommonArgs,
+///
+///     #[arg(long, default_value = "sample-model")]
+///     model_name: String,
+/// }
+/// ```
+#[derive(Args, Clone, Debug)]
+pub struct CommonArgs {
+    #[command(flatten)]
+    pub runtime: crate::RuntimeConfig,
+
+    /// Dynamo namespace for discovery routing. `DYN_NAMESPACE_WORKER_SUFFIX`
+    /// is appended as `-{suffix}` unless it is empty or already present.
+    #[arg(
+        long,
+        default_value = "dynamo",
+        env = "DYN_NAMESPACE",
+        value_parser = parse_worker_namespace
+    )]
+    pub namespace: String,
+
+    /// Component name within the namespace.
+    #[arg(long, default_value = "backend", env = "DYN_COMPONENT")]
+    pub component: String,
+
+    /// Endpoint name exposed by this worker.
+    #[arg(long, default_value = "generate", env = "DYN_ENDPOINT")]
+    pub endpoint: String,
+
+    /// Comma-separated list of supported endpoint types
+    /// (`chat`, `completions`, `embeddings`, ...).
+    #[arg(long, default_value = "chat,completions", env = "DYN_ENDPOINT_TYPES")]
+    pub endpoint_types: String,
+
+    /// Optional path to a custom Jinja chat template, used instead of the
+    /// template shipped with the model.
+    #[arg(long, env = "DYN_CUSTOM_JINJA_TEMPLATE")]
+    pub custom_jinja_template: Option<PathBuf>,
+
+    /// Dynamo frontend tool-call parser name for this model.
+    #[arg(long = "dyn-tool-call-parser", env = "DYN_TOOL_CALL_PARSER")]
+    pub dyn_tool_call_parser: Option<String>,
+
+    /// Dynamo frontend reasoning parser name for this model.
+    #[arg(long = "dyn-reasoning-parser", env = "DYN_REASONING_PARSER")]
+    pub dyn_reasoning_parser: Option<String>,
+
+    /// Exclude tools from the chat template when tool_choice is none.
+    #[arg(
+        long = "exclude-tools-when-tool-choice-none",
+        env = "DYN_EXCLUDE_TOOLS_WHEN_TOOL_CHOICE_NONE",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    pub exclude_tools_when_tool_choice_none: bool,
+
+    /// Structural-tag guided decoding for tool calls: `true`, `false`, or a JSON object.
+    #[arg(
+        long = "dyn-structural-tag",
+        env = "DYN_STRUCTURAL_TAG",
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = parse_structural_tag
+    )]
+    pub dyn_structural_tag: Option<StructuralTagFlag>,
+
+    /// Disaggregation role: `agg` (default), `prefill`, `decode`, or `encode`.
+    /// Prefill workers register with `ModelType::empty()` and
+    /// `WorkerType::Prefill` regardless of `endpoint_types`; decode and encode
+    /// workers do not advertise a local KV indexer. Encode workers register as
+    /// `WorkerType::Encode` and are not exposed on the public chat/completions
+    /// surface.
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = DisaggregationMode::Aggregated,
+        env = "DYN_DISAGGREGATION_MODE",
+    )]
+    pub disaggregation_mode: DisaggregationMode,
+
+    /// Declare an upstream Encode peer in this worker's topology `needs`.
+    /// Meaningful only on `--disaggregation-mode agg` and `prefill`.
+    /// Setting it on `decode` or `encode` is rejected at startup.
+    ///
+    /// Scope: Rust backends consuming `CommonArgs` via clap. Python
+    /// backends populate this from their own runtime config -- the Python
+    /// shim does not read this env var.
+    #[arg(long, default_value_t = false, env = "DYN_ROUTE_TO_ENCODER")]
+    pub route_to_encoder: bool,
+
+    /// Publish this worker's engine control/update routes on the RL request-plane endpoint.
+    #[arg(long, default_value_t = false, env = "DYN_ENABLE_RL")]
+    pub enable_rl: bool,
+}
+
+/// An explicit `--dyn-structural-tag` value; `StructuralTagFlag(None)` is `false`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StructuralTagFlag(pub Option<StructuralTagConfig>);
+
+impl CommonArgs {
+    /// The flag's value, or the always-on policy when unset and `on_by_default`.
+    pub fn structural_tag(&self, on_by_default: bool) -> Option<StructuralTagConfig> {
+        match &self.dyn_structural_tag {
+            Some(StructuralTagFlag(config)) => config.clone(),
+            None => on_by_default.then(always_on),
+        }
+    }
+}
+
+fn always_on() -> StructuralTagConfig {
+    StructuralTagConfig {
+        scope: StructuralTagScope::Always,
+        ..Default::default()
+    }
+}
+
+fn parse_worker_namespace(namespace: &str) -> Result<String, std::convert::Infallible> {
+    let Ok(suffix) = std::env::var("DYN_NAMESPACE_WORKER_SUFFIX") else {
+        return Ok(namespace.to_owned());
+    };
+    if suffix.is_empty() {
+        return Ok(namespace.to_owned());
+    }
+    let suffix = format!("-{suffix}");
+    if namespace.ends_with(&suffix) {
+        return Ok(namespace.to_owned());
+    }
+    Ok(format!("{namespace}{suffix}"))
+}
+
+fn parse_structural_tag(value: &str) -> Result<StructuralTagFlag, String> {
+    if let Some(enabled) = parse_bool_opt(value) {
+        return Ok(StructuralTagFlag(enabled.then(always_on)));
+    }
+    let mut config: serde_json::Value =
+        serde_json::from_str(value).map_err(|error| error.to_string())?;
+    let Some(fields) = config.as_object_mut() else {
+        return Err("expected true, false, or a JSON object".to_string());
+    };
+    // Unlike the wire type, the flag defaults scope to `always`.
+    fields.entry("scope").or_insert_with(|| "always".into());
+    StructuralTagConfig::from_value_strict(config)
+        .map(|config| StructuralTagFlag(Some(config)))
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::CommonArgs;
+
+    #[derive(Parser)]
+    struct TestArgs {
+        #[command(flatten)]
+        common: CommonArgs,
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn runtime_environment_values_remain_compatible() {
+        temp_env::with_vars(
+            [
+                ("DYN_DISCOVERY_BACKEND", Some("mem")),
+                ("DYN_REQUEST_PLANE", Some("TCP")),
+                ("DYN_RESPONSE_PLANE", None),
+                ("DYN_EVENT_PLANE", Some("")),
+            ],
+            || {
+                let args = TestArgs::try_parse_from(["test"]).unwrap();
+                let config = args.common.runtime.to_distributed_config().unwrap();
+                assert_eq!(
+                    config.request_plane,
+                    dynamo_runtime::distributed::RequestPlaneMode::Tcp
+                );
+                assert_eq!(
+                    config.event_transport_kind,
+                    dynamo_runtime::discovery::EventTransportKind::Zmq
+                );
+            },
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn worker_suffix_is_applied_once_to_namespace() {
+        for (namespace, suffix, argv, expected) in [
+            (Some("dynamo"), Some("qa1"), &["test"][..], "dynamo-qa1"),
+            (Some("dynamo-qa1"), Some("qa1"), &["test"][..], "dynamo-qa1"),
+            (Some("dynamo"), Some(""), &["test"][..], "dynamo"),
+            (Some("dynamo"), None, &["test"][..], "dynamo"),
+            (None, Some("qa1"), &["test"][..], "dynamo-qa1"),
+            (
+                Some("ignored"),
+                Some("qa1"),
+                &["test", "--namespace", "cli"][..],
+                "cli-qa1",
+            ),
+        ] {
+            temp_env::with_vars(
+                [
+                    ("DYN_NAMESPACE", namespace),
+                    ("DYN_NAMESPACE_WORKER_SUFFIX", suffix),
+                ],
+                || {
+                    let args = TestArgs::try_parse_from(argv).unwrap();
+                    assert_eq!(args.common.namespace, expected);
+                },
+            );
+        }
+    }
+}

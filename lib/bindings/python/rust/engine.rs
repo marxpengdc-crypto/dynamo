@@ -1,0 +1,1005 @@
+// SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+use dynamo_llm::protocols::openai::chat_completions::{
+    NvCreateChatCompletionRequest, NvCreateChatCompletionStreamResponse,
+};
+
+use std::pin::Pin;
+use std::sync::{Arc, OnceLock};
+use std::task::{Context as TaskContext, Poll};
+
+use anyhow::{Error, Result};
+use pyo3::prelude::*;
+use pyo3::types::{PyDict, PyModule};
+use pyo3::{PyAny, PyErr};
+use pyo3_async_runtimes::TaskLocals;
+use pythonize::{depythonize, pythonize};
+pub use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc;
+use tokio_stream::{Stream, StreamExt, wrappers::ReceiverStream};
+use tokio_util::sync::CancellationToken;
+
+use dynamo_llm::admission_gate::{AdmissionRequest, AdmissionResponse, WorkerAdmissionGate};
+use dynamo_runtime::dynamo_nvtx_range;
+use dynamo_runtime::error::{BackendError, DynamoError, ErrorType};
+use dynamo_runtime::logging::get_distributed_tracing_context;
+use dynamo_runtime::pipeline::network::RequestPlanePayloadCodec;
+use dynamo_runtime::telemetry::LifecycleOperationRole;
+pub use dynamo_runtime::{
+    pipeline::{
+        AsyncEngine, AsyncEngineContext, AsyncEngineContextProvider, Data, DataStream, ManyOut,
+        ResponseStream, SingleIn,
+    },
+    protocols::{annotated::Annotated, maybe_error::MaybeError},
+};
+
+use crate::PyAsyncRequestStream;
+use dynamo_runtime::pipeline::ManyIn;
+
+use super::context::{Context, callable_accepts_kwarg};
+use super::errors::{
+    http_like_error_to_dynamo, py_exception_to_backend_error, routed_engine_error_to_dynamo,
+    worker_unavailable_to_dynamo,
+};
+use crate::python_payload::{
+    EncodedPythonResponse, PythonPayload, PythonResponseItem, WaitClassification,
+    encode_python_item,
+};
+
+/// Add bindings from this crate to the provided module
+pub fn add_to_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_class::<PythonAsyncEngine>()?;
+    Ok(())
+}
+// todos:
+// - [ ] enable context cancellation
+//   - this will likely require a change to the function signature python calling arguments
+// - [ ] other `AsyncEngine` implementations will have a similar pattern, i.e. one AsyncEngine
+//       implementation per struct
+
+/// Detect whether the Python `generate` callable accepts a `context`
+/// keyword argument for backwards compatibility with the legacy positional-only call.
+fn detect_has_context(generator: &PyObject) -> bool {
+    Python::with_gil(|py| {
+        let callable = generator.bind(py);
+        callable_accepts_kwarg(py, callable, "context").unwrap_or(false)
+    })
+}
+
+/// Boxed Rust stream of items yielded by a Python async generator. Each
+/// item is either a `PyObject` frame or the `PyErr` the generator raised.
+pub(crate) type PyItemStream = Pin<Box<dyn Stream<Item = PyResult<Py<PyAny>>> + Send>>;
+
+/// Invoke the Python `generate` callable and convert the async generator it
+/// returns into a Rust [`Stream`] of `PyObject` items.
+///
+/// `to_python_input` converts this engine's `generate` input into the Python
+/// object passed as the generator's positional argument.
+/// `to_python_context` when `Some`, builds the `context=` keyword argument; `None` selects the
+/// legacy positional-only call.
+/// Note: functions instead of Python objects are passed because the construction
+/// of the Python objects needs to run inside the GIL.
+///
+/// The GIL is acquired on a blocking task rather than inline: under contention
+/// it can block for an unbounded time, which would park the tokio reactor.
+/// The returned stream polls `__anext__` only when its consumer requests an
+/// item, preventing Python from mutating a reused object before it is consumed.
+pub(crate) async fn invoke_generator<F, G>(
+    generator: Arc<PyObject>,
+    event_loop: Arc<PyObject>,
+    to_python_input: F,
+    to_python_kwargs: Option<G>,
+) -> Result<PyItemStream>
+where
+    F: FnOnce(Python) -> PyResult<Py<PyAny>> + Send + 'static,
+    G: FnOnce(Python) -> PyResult<Vec<(&'static str, Py<PyAny>)>> + Send + 'static,
+{
+    let stream = tokio::task::spawn_blocking(move || {
+        // Covers GIL acquisition plus the Rust->Python crossing that builds the
+        // request object and calls the handler's `generate`. Not token
+        // generation: the generator has not been advanced when this range ends.
+        let _nvtx = dynamo_nvtx_range!("pybridge.invoke_generator");
+        Python::with_gil(|py| {
+            let python_input = to_python_input(py)?;
+
+            // The closure returns the FULL kwarg list rather than just the
+            // context, so a caller needing several keyword arguments builds
+            // them all under one GIL acquisition. The push-egress path relies
+            // on this to pass `context` and `response_sender` together.
+            let gen_result = match to_python_kwargs {
+                Some(to_python_kwargs) => {
+                    let kwargs = to_python_kwargs(py)?;
+                    let kwarg = PyDict::new(py);
+                    for (name, value) in kwargs {
+                        kwarg.set_item(name, value)?;
+                    }
+                    generator.call(py, (python_input,), Some(&kwarg))
+                }
+                // Legacy: no keyword arguments at all.
+                None => generator.call1(py, (python_input,)),
+            }?;
+
+            let locals = TaskLocals::new(event_loop.bind(py).clone());
+            demand_driven_python_stream(locals, gen_result.into_bound(py))
+        })
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("failed to offload python call to blocking task: {e}"))??;
+
+    Ok(stream)
+}
+
+fn demand_driven_python_stream(
+    locals: TaskLocals,
+    generator: Bound<'_, PyAny>,
+) -> PyResult<PyItemStream> {
+    let anext = generator.getattr("__anext__")?.unbind();
+    let stream = futures::stream::unfold((anext, locals), |(anext, locals)| async move {
+        // Only the GIL-bound `__anext__` call is annotated. The `.await` below is
+        // the Python generator (and, for a worker, the engine) producing the item,
+        // so leaving it outside the range keeps engine time out of the bridge cost.
+        let nvtx_anext = dynamo_nvtx_range!("pybridge.anext_call");
+        let next = Python::with_gil(|py| {
+            pyo3_async_runtimes::into_future_with_locals(&locals, anext.bind(py).call0()?)
+        });
+        drop(nvtx_anext);
+        let item = match next {
+            Ok(next) => next.await,
+            Err(error) => Err(error),
+        };
+        if item.as_ref().is_err_and(|error| {
+            Python::with_gil(|py| {
+                error.is_instance_of::<pyo3::exceptions::PyStopAsyncIteration>(py)
+            })
+        }) {
+            None
+        } else {
+            Some((item, (anext, locals)))
+        }
+    });
+    Ok(Box::pin(stream))
+}
+
+/// Rust/Python bridge that maps to the [`AsyncEngine`] trait
+///
+/// Currently this is only implemented for the [`SingleIn`] and [`ManyOut`] types; however,
+/// more [`AsyncEngine`] implementations can be added in the future.
+///
+/// For the [`SingleIn`] and [`ManyOut`] case, this implementation will take a Python async
+/// generator and convert it to a Rust async stream.
+///
+/// ```python
+/// class ComputeEngine:
+///     def __init__(self):
+///         self.compute_engine = make_compute_engine()
+///
+///     def generate(self, request):
+///         async generator():
+///            async for output in self.compute_engine.generate(request):
+///                yield output
+///         return generator()
+///
+/// def main():
+///     loop = asyncio.create_event_loop()
+///     compute_engine = ComputeEngine()
+///     engine = PythonAsyncEngine(compute_engine.generate, loop)
+///     service = RustService()
+///     service.add_engine("model_name", engine)
+///     loop.run_until_complete(service.run())
+/// ```
+#[pyclass]
+#[derive(Clone)]
+pub struct PythonAsyncEngine(PythonServerStreamingEngine);
+
+#[pymethods]
+impl PythonAsyncEngine {
+    /// Create a new instance of the PythonAsyncEngine
+    ///
+    /// # Arguments
+    /// - `generator`: a Python async generator that will be used to generate responses
+    /// - `event_loop`: the Python event loop that will be used to run the generator
+    ///
+    /// Note: In Rust land, the request and the response are both concrete; however, in
+    /// Python land, the request and response not strongly typed, meaning the generator
+    /// could accept a different type of request or return a different type of response
+    /// and we would not know until runtime.
+    #[new]
+    pub fn new(generator: PyObject, event_loop: PyObject) -> PyResult<Self> {
+        let cancel_token = CancellationToken::new();
+        Ok(PythonAsyncEngine(PythonServerStreamingEngine::new(
+            cancel_token,
+            Arc::new(generator),
+            Arc::new(event_loop),
+        )))
+    }
+}
+
+impl PythonAsyncEngine {
+    pub(crate) fn chat_engine(
+        &self,
+        runtime_config: dynamo_llm::local_model::runtime_config::ModelRuntimeConfig,
+    ) -> PythonChatEngine {
+        PythonChatEngine {
+            engine: self.0.clone(),
+            runtime_config: Arc::new(runtime_config),
+        }
+    }
+
+    pub(crate) fn network_engine(
+        &self,
+        backend_role: BackendRole,
+        admission: WorkerAdmissionGate,
+    ) -> PythonNetworkEngine {
+        PythonNetworkEngine {
+            engine: self.0.clone(),
+            backend_role,
+            admission,
+        }
+    }
+}
+
+/// In-process frontend adapter. The generic/network Python engines retain
+/// their normal serialization contract, including the N-2 worker wire.
+pub(crate) struct PythonChatEngine {
+    engine: PythonServerStreamingEngine,
+    runtime_config: Arc<dynamo_llm::local_model::runtime_config::ModelRuntimeConfig>,
+}
+
+#[async_trait::async_trait]
+impl
+    AsyncEngine<
+        SingleIn<NvCreateChatCompletionRequest>,
+        ManyOut<Annotated<NvCreateChatCompletionStreamResponse>>,
+        Error,
+    > for PythonChatEngine
+{
+    async fn generate(
+        &self,
+        request: SingleIn<NvCreateChatCompletionRequest>,
+    ) -> Result<ManyOut<Annotated<NvCreateChatCompletionStreamResponse>>, Error> {
+        let runtime_config = self.runtime_config.clone();
+        generate_python_stream(
+            &self.engine,
+            request,
+            move |py, request| {
+                // Ordinary Chat Completions retain direct typed serialization.
+                if request.responses_tools.is_none() {
+                    let object = pythonize(py, &request)?;
+                    // Named passthrough fields (`stop_token_ids`, ...) are not
+                    // serialized with the request; add them at the top level, as
+                    // the client sent them.
+                    let dict = object.downcast::<PyDict>()?;
+                    if let Some(tools) = &request.chat_template_tools {
+                        dict.set_item("chat_template_tools", pythonize(py, tools.as_ref())?)?;
+                    }
+                    for (key, value) in request.passthrough_extra_fields() {
+                        dict.set_item(key, pythonize(py, value)?)?;
+                    }
+                    return Ok(object.unbind());
+                }
+                let value = request
+                    .python_chat_processor_request_json(&runtime_config)
+                    .map_err(|error| pyo3::exceptions::PyValueError::new_err(error.to_string()))?;
+                Ok(pythonize(py, &value)?.unbind())
+            },
+            buffered_typed_response_stream::<NvCreateChatCompletionStreamResponse>,
+        )
+        .await
+    }
+}
+
+/// The role a Python endpoint serves as a model backend, once it has one.
+///
+/// A Python endpoint can serve any handler; it is a model backend only once
+/// `register_model` records its role, which it does before it builds and
+/// publishes the model card. The cell is the endpoint's own, shared by every
+/// clone, so a role recorded after serving starts applies to the next request.
+/// Its network engines admit a request through the backend admission gate only
+/// while a worker role is recorded: a generic endpoint never touches the gate.
+/// Each reads the role once per request, and admits the request and classifies
+/// its responses under that one reading, so a registration while it runs
+/// changes neither. The role decides only whether a request uses the gate.
+#[derive(Clone)]
+pub(crate) struct BackendRole(Arc<OnceLock<LifecycleOperationRole>>);
+
+impl BackendRole {
+    pub(crate) fn of(endpoint: &dynamo_runtime::component::Endpoint) -> Self {
+        Self(endpoint.lifecycle_operation_role())
+    }
+
+    /// Whether a request arriving now uses the gate: only while the endpoint
+    /// serves a worker role, never before one is recorded, and never for a
+    /// frontend, which serves no backend requests.
+    pub(crate) fn uses_admission(&self) -> bool {
+        match self.0.get() {
+            Some(
+                LifecycleOperationRole::Decode
+                | LifecycleOperationRole::Worker
+                | LifecycleOperationRole::Encode
+                | LifecycleOperationRole::Prefill,
+            ) => true,
+            Some(LifecycleOperationRole::Frontend) | None => false,
+        }
+    }
+}
+
+/// Network-only Python engine. Requests stay Python-owned objects, transcoded
+/// directly from the request-plane codec, and each response is encoded
+/// straight into the request's own codec as it leaves the handler.
+#[derive(Clone)]
+pub(crate) struct PythonNetworkEngine {
+    engine: PythonServerStreamingEngine,
+    backend_role: BackendRole,
+    admission: WorkerAdmissionGate,
+}
+
+#[async_trait::async_trait]
+impl AsyncEngine<SingleIn<PythonPayload>, ManyOut<EncodedPythonResponse>, Error>
+    for PythonNetworkEngine
+{
+    /// A model backend's request is admitted through its worker's admission
+    /// gate before its handler is invoked; any other endpoint's request goes
+    /// straight to its handler.
+    async fn generate(
+        &self,
+        request: SingleIn<PythonPayload>,
+    ) -> Result<ManyOut<EncodedPythonResponse>, Error> {
+        let payload_codec = request.payload_codec();
+        let context = request.context();
+        let dp_rank = request.dp_rank();
+        let uses_admission = self.backend_role.uses_admission();
+        let generate = generate_python_stream(
+            &self.engine,
+            request,
+            |_py, request| Ok(request.into_inner()),
+            move |stream, ctx, request_id| {
+                encoded_python_response_stream(
+                    stream,
+                    ctx,
+                    request_id,
+                    payload_codec,
+                    WaitClassification::new(uses_admission),
+                )
+            },
+        );
+        if uses_admission {
+            self.admission
+                .get()?
+                .admit(&context, dp_rank, generate)
+                .await
+        } else {
+            generate.await
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl<Req, Resp> AsyncEngine<SingleIn<Req>, ManyOut<Annotated<Resp>>, Error> for PythonAsyncEngine
+where
+    Req: Data + Serialize,
+    Resp: Data + for<'de> Deserialize<'de>,
+{
+    async fn generate(&self, request: SingleIn<Req>) -> Result<ManyOut<Annotated<Resp>>, Error> {
+        self.0.generate(request).await
+    }
+}
+
+#[derive(Clone)]
+pub struct PythonServerStreamingEngine {
+    _cancel_token: CancellationToken,
+    generator: Arc<PyObject>,
+    event_loop: Arc<PyObject>,
+    has_context: bool,
+}
+
+impl PythonServerStreamingEngine {
+    pub fn new(
+        cancel_token: CancellationToken,
+        generator: Arc<PyObject>,
+        event_loop: Arc<PyObject>,
+    ) -> Self {
+        let has_context = detect_has_context(&generator);
+
+        PythonServerStreamingEngine {
+            _cancel_token: cancel_token,
+            generator,
+            event_loop,
+            has_context,
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+enum ResponseProcessingError {
+    #[error("dynamo error")]
+    Dynamo(DynamoError),
+
+    #[error("deserialize error: {0}")]
+    Deserialize(String),
+
+    #[error("gil offload error: {0}")]
+    Offload(String),
+}
+
+#[async_trait::async_trait]
+impl<Req, Resp> AsyncEngine<SingleIn<Req>, ManyOut<Annotated<Resp>>, Error>
+    for PythonServerStreamingEngine
+where
+    Req: Data + Serialize,
+    Resp: Data + for<'de> Deserialize<'de>,
+{
+    async fn generate(&self, request: SingleIn<Req>) -> Result<ManyOut<Annotated<Resp>>, Error> {
+        generate_python_stream(
+            self,
+            request,
+            |py, request| Ok(pythonize(py, &request)?.unbind()),
+            buffered_typed_response_stream::<Resp>,
+        )
+        .await
+    }
+}
+
+async fn generate_python_stream<Req, Resp, ToPythonInput, ForwardResponses>(
+    engine: &PythonServerStreamingEngine,
+    request: SingleIn<Req>,
+    to_python_input: ToPythonInput,
+    forward_responses: ForwardResponses,
+) -> Result<ManyOut<Resp>, Error>
+where
+    Req: Data,
+    Resp: Data,
+    ToPythonInput: FnOnce(Python, Req) -> PyResult<Py<PyAny>> + Send + 'static,
+    ForwardResponses:
+        FnOnce(PyItemStream, Arc<dyn AsyncEngineContext>, String) -> DataStream<Resp> + Send,
+{
+    let (request, context) = request.transfer(());
+    let ctx = context.context();
+    let id = context.id().to_string();
+    tracing::trace!("processing request: {}", id);
+
+    let current_trace_context = get_distributed_tracing_context();
+    let metadata = context.metadata().clone();
+    let py_context = if engine.has_context {
+        Some(
+            Context::new(ctx.clone(), current_trace_context, None, metadata)
+                .with_session_affinity_from(&context)
+                .map_err(anyhow::Error::msg)?
+                .with_agent_context_from(&context)
+                .map_err(anyhow::Error::msg)?
+                .with_response_headers_from(&context),
+        )
+    } else {
+        None
+    };
+    let stream = invoke_generator(
+        engine.generator.clone(),
+        engine.event_loop.clone(),
+        move |py| to_python_input(py, request),
+        py_context.map(|py_context| {
+            move |py: Python<'_>| {
+                Py::new(py, py_context).map(|context| vec![("context", context.into_any())])
+            }
+        }),
+    )
+    .await?;
+
+    let response_stream = forward_responses(stream, ctx, id);
+    Ok(ResponseStream::new(response_stream, context.context()))
+}
+
+/// Convert one Python response object into the wire value.
+///
+/// Yields tagged with `_dynamo_annotated: True` are wire `Annotated<R>`
+/// envelopes; everything else is plain data.
+///
+/// Used by the typed pull path via [`process_item`]. The direct request-plane
+/// paths — pull and push alike — instead go through
+/// `python_payload::parse_python_response`, which keeps the payload a
+/// `PythonPayload` so it transcodes straight into the wire codec.
+///
+/// The caller owns the error mapping; the GIL is already held.
+fn depythonize_annotated<Resp>(
+    bound: &Bound<'_, PyAny>,
+) -> Result<Annotated<Resp>, pythonize::PythonizeError>
+where
+    Resp: for<'de> Deserialize<'de>,
+{
+    let is_envelope = bound
+        .downcast::<PyDict>()
+        .ok()
+        .and_then(|d| {
+            d.get_item(pyo3::intern!(bound.py(), "_dynamo_annotated"))
+                .ok()
+                .flatten()
+        })
+        .and_then(|v| v.is_truthy().ok())
+        .unwrap_or(false);
+
+    if is_envelope {
+        depythonize::<Annotated<Resp>>(bound)
+    } else {
+        depythonize::<Resp>(bound).map(Annotated::from_data)
+    }
+}
+
+async fn process_item<Resp>(
+    item: Result<Py<PyAny>, PyErr>,
+) -> Result<Annotated<Resp>, ResponseProcessingError>
+where
+    Resp: Data + for<'de> Deserialize<'de>,
+{
+    let item = item.map_err(|e| ResponseProcessingError::Dynamo(map_python_exception(e)))?;
+    let response = tokio::task::spawn_blocking(move || {
+        // Per-response Python->Rust deserialization: pure Dynamo overhead paid
+        // once per streamed chunk.
+        let _nvtx = dynamo_nvtx_range!("pybridge.decode_response");
+        Python::with_gil(|py| depythonize_annotated::<Resp>(&item.into_bound(py)))
+    })
+    .await
+    .map_err(|e| ResponseProcessingError::Offload(e.to_string()))?
+    .map_err(|e| ResponseProcessingError::Deserialize(e.to_string()))?;
+
+    Ok(response)
+}
+
+pub(crate) fn map_python_exception(error: PyErr) -> DynamoError {
+    Python::with_gil(|py| {
+        error.display(py);
+
+        // Checked before the backend mapping, whose `DynamoException` fallback
+        // would otherwise classify it as `Unknown`.
+        if let Some(error) = worker_unavailable_to_dynamo(py, &error) {
+            return error;
+        }
+        // A `RoutedEngineError` a chat engine let escape keeps its backend's
+        // class and status. No worker endpoint can hold one.
+        if let Some(error) = routed_engine_error_to_dynamo(py, &error) {
+            return error;
+        }
+
+        if let Some((backend_err, message)) = py_exception_to_backend_error(py, &error) {
+            let mut builder = DynamoError::builder()
+                .error_type(ErrorType::Backend(backend_err))
+                .message(message.clone());
+            if backend_err == BackendError::InvalidArgument {
+                builder = builder.public_message(message);
+            }
+            return builder.build();
+        }
+
+        if let Some(error) = http_like_error_to_dynamo(py, &error) {
+            return error;
+        }
+
+        if error.is_instance_of::<pyo3::exceptions::PyGeneratorExit>(py) {
+            return DynamoError::builder()
+                .error_type(ErrorType::Backend(BackendError::EngineShutdown))
+                .message("engine shutting down")
+                .build();
+        }
+
+        let backend_err = if error.is_instance_of::<pyo3::exceptions::PyValueError>(py)
+            || error.is_instance_of::<pyo3::exceptions::PyTypeError>(py)
+        {
+            BackendError::InvalidArgument
+        } else if error.is_instance_of::<pyo3::exceptions::PyTimeoutError>(py) {
+            BackendError::ConnectionTimeout
+        } else if error.is_instance_of::<pyo3::exceptions::PyConnectionRefusedError>(py) {
+            BackendError::CannotConnect
+        } else if error.is_instance_of::<pyo3::exceptions::PyConnectionResetError>(py)
+            || error.is_instance_of::<pyo3::exceptions::PyBrokenPipeError>(py)
+            || error.is_instance_of::<pyo3::exceptions::PyConnectionError>(py)
+        {
+            BackendError::Disconnected
+        } else if error.is_instance_of::<pyo3::exceptions::asyncio::CancelledError>(py) {
+            BackendError::Cancelled
+        } else {
+            BackendError::Unknown
+        };
+
+        DynamoError::builder()
+            .error_type(ErrorType::Backend(backend_err))
+            .message(error.to_string())
+            .build()
+    })
+}
+
+/// Channel depth between the response-forwarding task and the consumer of
+/// the engine's output stream.
+pub(crate) const RESPONSE_CHANNEL_DEPTH: usize = 128;
+
+/// Drain the Python response stream on a spawned task, deserialize each item
+/// into `Resp` via [`process_item`], and forward it as an [`Annotated`] frame
+/// over an mpsc channel. Returns the receiver, to be wrapped in a
+/// [`ResponseStream`].
+///
+/// Errors raised by the Python generator are mapped to typed backend errors
+/// and emitted as annotated error frames, so a failing generator returns as
+/// an error to the client rather than a silently truncated stream.
+/// On a deserialize mismatch the request context is told to stop generating.
+/// The generator is not polled again until [`process_item`] has converted the
+/// current `PyObject` into an owned Rust value, so this channel never buffers
+/// mutable Python objects that a generator could reuse for a later yield.
+fn spawn_response_forwarder<Resp>(
+    stream: PyItemStream,
+    ctx: Arc<dyn AsyncEngineContext>,
+    request_id: String,
+) -> mpsc::Receiver<Annotated<Resp>>
+where
+    Resp: Data + for<'de> Deserialize<'de>,
+{
+    let (tx, rx) = mpsc::channel::<Annotated<Resp>>(RESPONSE_CHANNEL_DEPTH);
+
+    // any error thrown in the stream will be caught and complete the
+    // processing task; the error is emitted as an annotated error frame
+    tokio::spawn(async move {
+        tracing::debug!(
+            request_id,
+            "starting task to process python async generator stream"
+        );
+
+        let mut stream = stream;
+        let mut count = 0;
+
+        while let Some(item) = stream.next().await {
+            count += 1;
+            tracing::trace!(
+                request_id,
+                "processing the {}th item from python async generator",
+                count
+            );
+
+            let mut done = false;
+
+            let response = match process_item::<Resp>(item).await {
+                Ok(response) => response,
+                Err(e) => {
+                    done = true;
+
+                    match e {
+                        ResponseProcessingError::Deserialize(e) => {
+                            // tell the python async generator to stop generating
+                            ctx.stop_generating();
+                            Annotated::from_error(format!(
+                                "critical error: invalid response object from python async generator; application-logic-mismatch: {}",
+                                e
+                            ))
+                        }
+                        ResponseProcessingError::Dynamo(dynamo_err) => {
+                            Annotated::from_err(dynamo_err)
+                        }
+                        ResponseProcessingError::Offload(e) => Annotated::from_error(format!(
+                            "critical error: failed to offload the python async generator to a new thread: {}",
+                            e
+                        )),
+                    }
+                }
+            };
+
+            if tx.send(response).await.is_err() {
+                // Consumer dropped the response stream — tell the generator to
+                // stop rather than relying solely on upstream push_handler.
+                ctx.stop_generating();
+                tracing::trace!(
+                    request_id,
+                    "error forwarding annotated response to channel; channel is closed"
+                );
+                break;
+            }
+
+            if done {
+                tracing::debug!(
+                    request_id,
+                    "early termination of python async generator stream task"
+                );
+                break;
+            }
+        }
+
+        tracing::debug!(
+            request_id,
+            "finished processing python async generator stream"
+        );
+    });
+
+    rx
+}
+
+fn buffered_typed_response_stream<Resp>(
+    stream: PyItemStream,
+    ctx: Arc<dyn AsyncEngineContext>,
+    request_id: String,
+) -> DataStream<Annotated<Resp>>
+where
+    Resp: Data + for<'de> Deserialize<'de>,
+{
+    Box::pin(ReceiverStream::new(spawn_response_forwarder::<Resp>(
+        stream, ctx, request_id,
+    )))
+}
+
+/// [`unbuffered_python_response_stream`], with each item encoded into the
+/// request-plane `payload_codec` before the stream yields it — the same parse
+/// and encoding the ingress would otherwise run on the raw item, in the same
+/// blocking step — and classified for backend admission while `classification`
+/// says the gate still reads it. The gate consumes this stream directly, so an
+/// item it yields is accepted in stream order. The generator is still polled
+/// only when the consumer asks for the next item, and only once the current
+/// one is fully encoded, so no Python object outlives its turn.
+fn encoded_python_response_stream(
+    stream: PyItemStream,
+    ctx: Arc<dyn AsyncEngineContext>,
+    request_id: String,
+    payload_codec: RequestPlanePayloadCodec,
+    classification: WaitClassification,
+) -> DataStream<EncodedPythonResponse> {
+    let items = unbuffered_python_response_stream(stream, ctx, request_id);
+    Box::pin(futures::stream::unfold(
+        (items, classification),
+        move |(mut items, classification)| async move {
+            let item = items.next().await?;
+            let response =
+                encode_python_item(payload_codec, item, classification.classifies()).await;
+            classification.accepted(response.admission_output());
+            Some((response, (items, classification)))
+        },
+    ))
+}
+
+fn unbuffered_python_response_stream(
+    stream: PyItemStream,
+    ctx: Arc<dyn AsyncEngineContext>,
+    request_id: String,
+) -> DataStream<PythonResponseItem> {
+    // Do not poll the generator again until ingress has encoded the current
+    // Python object. A generator may reuse and mutate the same dict/list for
+    // later yields; buffering raw PyObject handles would make earlier frames
+    // observe those later mutations.
+    Box::pin(DirectPythonResponseStream {
+        stream: Some(stream),
+        ctx,
+        request_id,
+        exhausted: false,
+    })
+}
+
+/// Demand-driven network response stream with cooperative Python cancellation.
+///
+/// Ingress stops the request context when the client response connection
+/// closes, then drops this stream. Give the Python generator one final poll so
+/// it can observe `context.is_stopped()` and run its cancellation path. Normal
+/// response delivery remains unbuffered: the next generator item is not polled
+/// until ingress has encoded the current one.
+struct DirectPythonResponseStream {
+    stream: Option<PyItemStream>,
+    ctx: Arc<dyn AsyncEngineContext>,
+    request_id: String,
+    exhausted: bool,
+}
+
+impl Stream for DirectPythonResponseStream {
+    type Item = PythonResponseItem;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
+        let poll = self
+            .stream
+            .as_mut()
+            .expect("direct Python response stream missing before exhaustion")
+            .as_mut()
+            .poll_next(cx);
+        match poll {
+            Poll::Ready(Some(item)) => {
+                if item.is_err() {
+                    self.exhausted = true;
+                    self.stream.take();
+                }
+                Poll::Ready(Some(PythonResponseItem::new(item)))
+            }
+            Poll::Ready(None) => {
+                self.exhausted = true;
+                self.stream.take();
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl Drop for DirectPythonResponseStream {
+    fn drop(&mut self) {
+        if self.exhausted || !self.ctx.is_stopped() {
+            return;
+        }
+
+        let Some(mut stream) = self.stream.take() else {
+            return;
+        };
+        let request_id = self.request_id.clone();
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        runtime.spawn(async move {
+            // Cooperative Python generators inspect their Context when polled.
+            // Discard the result: the client has already dropped its stream.
+            let _ = stream.next().await;
+            tracing::trace!(
+                request_id,
+                "polled direct Python response generator after cancellation"
+            );
+        });
+    }
+}
+
+/// Channel depth between the inbound forwarder and the Python iterator.
+/// Mirrors the depth used by the wire-side bidirectional ingress forwarder
+/// in `lib/runtime/src/pipeline/network/ingress/push_handler.rs`.
+const BIDIRECTIONAL_INPUT_CHANNEL_DEPTH: usize = 8;
+
+/// Rust-side adapter that bridges a Python `async def generate(request_stream, context)`
+/// callable into an [`AsyncEngine`] of the ManyIn / ManyOut
+/// shape (`PythonPayload` request frames and raw Python response items).
+///
+/// The adapter:
+///
+/// 1. Transforms the inbound `RequestStream<PythonPayload>` into a
+///    `PyAsyncRequestStream` and `context`. Similar to unary engine,
+///    cancellation observation is the Python engine's responsibility via the
+///    `context` argument. Input stream can end early if no more inputs are expected.
+/// 2. Invokes the Python generator with `(request_stream, context)`, then
+///    wraps the returned async generator into a Rust `Stream<Item = PyResult<PyObject>>`.
+/// 3. Forwards each raw Python response to the ingress payload adapter, which
+///    performs annotation handling and wire serialization in one blocking step.
+pub struct PythonBidirectionalEngine {
+    generator: Arc<PyObject>,
+    event_loop: Arc<PyObject>,
+    has_context: bool,
+}
+
+impl PythonBidirectionalEngine {
+    /// Build the adapter from a Python callable and an event loop. The
+    /// callable should be an `async def generate(request_stream)` or
+    /// `async def generate(request_stream, context)` returning an async
+    /// generator of JSON-shaped response frames.
+    pub fn new(generator: PyObject, event_loop: PyObject) -> PyResult<Self> {
+        let has_context = detect_has_context(&generator);
+        Ok(Self {
+            generator: Arc::new(generator),
+            event_loop: Arc::new(event_loop),
+            has_context,
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl AsyncEngine<ManyIn<PythonPayload>, ManyOut<PythonResponseItem>, Error>
+    for PythonBidirectionalEngine
+{
+    async fn generate(
+        &self,
+        input: ManyIn<PythonPayload>,
+    ) -> Result<ManyOut<PythonResponseItem>, Error> {
+        let (request_stream, ctx_unit) = input.into_parts();
+        let ctx = ctx_unit.context();
+        let request_id = ctx_unit.id().to_string();
+        let metadata = ctx_unit.metadata().clone();
+        let mut inbound = request_stream
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("RequestStream::take returned None"))?;
+
+        // Capture trace context once, while we still hold the
+        // dispatching task; needed when constructing the Python `Context`.
+        let current_trace_context = get_distributed_tracing_context();
+
+        // Forwarder: move Python-owned frames directly into the Python
+        // iterator. The `frame_tx.closed()` arm cancels the forwarder as soon
+        // as the Python iterator drops the receiver, so it shuts down promptly
+        // instead of blocking on the next inbound frame.
+        let (frame_tx, frame_rx) = mpsc::channel::<PyObject>(BIDIRECTIONAL_INPUT_CHANNEL_DEPTH);
+        let forwarder_request_id = request_id.clone();
+        tokio::spawn(async move {
+            loop {
+                let value = tokio::select! {
+                    _ = frame_tx.closed() => break,
+                    value = inbound.next() => value,
+                };
+                let Some(value) = value else {
+                    break;
+                };
+                if frame_tx.send(value.into_inner()).await.is_err() {
+                    tracing::debug!(
+                        request_id = %forwarder_request_id,
+                        "python engine dropped request stream; input forwarder exiting"
+                    );
+                    break;
+                }
+            }
+        });
+
+        let py_request_stream = PyAsyncRequestStream::new(frame_rx);
+
+        // The positional argument is the `PyAsyncRequestStream` handle, wrapped
+        // inside the GIL.
+        let stream = invoke_generator(
+            self.generator.clone(),
+            self.event_loop.clone(),
+            move |py| Ok(Py::new(py, py_request_stream)?.into_any()),
+            self.has_context.then_some({
+                let ctx = ctx.clone();
+                move |py: Python<'_>| {
+                    Py::new(py, Context::new(ctx, current_trace_context, None, metadata))
+                        .map(|c| vec![("context", c.into_any())])
+                }
+            }),
+        )
+        .await?;
+
+        let response_stream = unbuffered_python_response_stream(stream, ctx.clone(), request_id);
+        Ok(ResponseStream::new(response_stream, ctx))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::errors::error_class_for_http_status;
+    use dynamo_runtime::error::ErrorClass;
+
+    #[test]
+    fn http_statuses_map_to_semantic_classes() {
+        assert_eq!(error_class_for_http_status(400), ErrorClass::InvalidRequest);
+        assert_eq!(
+            error_class_for_http_status(415),
+            ErrorClass::UnsupportedMedia
+        );
+        assert_eq!(error_class_for_http_status(429), ErrorClass::RateLimited);
+        assert_eq!(error_class_for_http_status(499), ErrorClass::Cancelled);
+        assert_eq!(error_class_for_http_status(418), ErrorClass::InvalidRequest);
+        assert_eq!(error_class_for_http_status(501), ErrorClass::NotImplemented);
+        assert_eq!(
+            error_class_for_http_status(502),
+            ErrorClass::BackendProtocol
+        );
+        assert_eq!(error_class_for_http_status(503), ErrorClass::Unavailable);
+        assert_eq!(
+            error_class_for_http_status(504),
+            ErrorClass::DeadlineExceeded
+        );
+        assert_eq!(
+            error_class_for_http_status(529),
+            ErrorClass::CapacityExhausted
+        );
+        assert_eq!(error_class_for_http_status(500), ErrorClass::Internal);
+    }
+
+    /// An endpoint's requests use the gate only while it serves a worker role:
+    /// never before a role is recorded, and never for a frontend. A role
+    /// recorded later, through the endpoint's shared cell, applies from then on.
+    #[test]
+    fn only_a_worker_role_uses_the_gate() {
+        use super::BackendRole;
+        use dynamo_runtime::telemetry::LifecycleOperationRole::{
+            Decode, Encode, Frontend, Prefill, Worker,
+        };
+        use std::sync::{Arc, OnceLock};
+
+        for (role, uses_admission) in [
+            (Decode, true),
+            (Worker, true),
+            (Encode, true),
+            (Prefill, true),
+            (Frontend, false),
+        ] {
+            let backend_role = BackendRole(Arc::new(OnceLock::from(role)));
+            assert_eq!(backend_role.uses_admission(), uses_admission, "{role:?}");
+        }
+
+        let cell = Arc::new(OnceLock::new());
+        let backend_role = BackendRole(Arc::clone(&cell));
+        assert!(!backend_role.uses_admission(), "no role recorded yet");
+        cell.set(Decode).expect("unset");
+        assert!(
+            backend_role.uses_admission(),
+            "a role recorded late applies"
+        );
+    }
+}

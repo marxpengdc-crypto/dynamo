@@ -1,0 +1,663 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+import importlib
+import json
+import logging
+from pathlib import Path
+from stat import S_ISDIR
+from typing import Optional, Union
+
+from huggingface_hub import hf_hub_download, model_info
+from pydantic import BaseModel
+from transformers import AutoConfig
+
+try:
+    from aisim_core.sdk.utils import (
+        HuggingFaceDownloadError,
+        _load_model_config_from_model_path,
+    )
+except ImportError:
+
+    class HuggingFaceDownloadError(Exception):
+        pass
+
+    _load_model_config_from_model_path = None
+
+# huggingface_hub raises its HTTP client's network errors, which are not
+# OSError: httpx in 1.x, httpx2 in 2.x. Older versions use requests (OSError).
+HUB_NETWORK_ERRORS: tuple[type[Exception], ...] = ()
+for _client in ("httpx", "httpx2"):
+    try:
+        HUB_NETWORK_ERRORS += (importlib.import_module(_client).HTTPError,)
+    except ImportError:
+        pass
+logger = logging.getLogger(__name__)
+
+DTYPE_BYTES_MAP = {
+    "F32": 4,  # FP32: 4 bytes per parameter
+    "BF16": 2,  # BF16: 2 bytes per parameter
+    "F16": 2,  # FP16: 2 bytes per parameter
+    "F8_E4M3": 1,  # FP8: 1 byte per parameter
+    "F8_E5M2": 1,  # FP8: 1 byte per parameter
+    "F8_E8M0": 1,  # FP8: 1 byte per parameter
+    "I8": 1,  # INT8: 1 byte per parameter
+    "I4": 0.5,  # INT4: 0.5 bytes per parameter
+}
+
+CONTEXT_LENGTH_ATTRS = [
+    "max_position_embeddings",  # Most common (BERT, GPT, LLaMA, etc.)
+    "n_positions",  # GPT-2, GPT-Neo
+    "max_seq_len",  # MPT
+    "max_sequence_length",  # Some models
+    "max_seq_length",  # Some encoder configs
+    "seq_length",  # Some older models
+    "seq_len",  # Alternative spelling
+    "max_target_positions",  # Encoder-decoder models
+    "model_max_length",  # Some tokenizer configs
+    "sliding_window",  # Mistral with sliding window attention
+]
+
+# supported MoE architectures
+MOE_ARCHITECTURES = {
+    "DeepseekV3ForCausalLM",
+    "DeepseekV32ForCausalLM",  # MLA + MoE
+    "Qwen3MoeForCausalLM",  # GQA + MoE
+}
+# MoE architectures that sweeps TP additionally to TEP/DEP
+MOE_ADDITIONAL_TP_ARCHITECTURES = {
+    "Qwen3MoeForCausalLM",  # GQA + MoE
+}
+
+
+# Checkpoint formats in the order vLLM's default loader prefers them.
+HUB_WEIGHT_EXTENSIONS = (".safetensors", ".bin", ".pt", ".pth")
+SAFETENSORS_INDEX_NAME = "model.safetensors.index.json"
+# Root files that are not model weights: PEFT adapters and training state,
+# as in vLLM's filter_files_not_needed_for_inference.
+NON_WEIGHT_FILENAMES = {
+    "adapter_model.safetensors",
+    "adapter_model.bin",
+    "training_args.bin",
+    "optimizer.bin",
+    "optimizer.pt",
+    "scheduler.bin",
+    "scheduler.pt",
+    "scaler.pt",
+}
+
+
+def _select_weight_files(root_names) -> tuple[Optional[str], list[str]]:
+    """Return the first weight format among repo-root file names, and its files.
+
+    Like vLLM's default loader, this tries the formats in
+    ``HUB_WEIGHT_EXTENSIONS`` order and skips ``NON_WEIGHT_FILENAMES``, so a
+    repo that ships the weights in two formats counts one of them.
+    """
+    names = [name for name in root_names if name not in NON_WEIGHT_FILENAMES]
+    for ext in HUB_WEIGHT_EXTENSIONS:
+        files = [name for name in names if name.endswith(ext)]
+        if files:
+            return ext, files
+    return None, []
+
+
+def _read_indexed_shards(index_path: Union[str, Path]) -> set[str]:
+    """Return indexed shard names, raising ValueError for unreadable indexes."""
+    try:
+        with open(index_path) as f:
+            weight_map = json.load(f)["weight_map"]
+        if not isinstance(weight_map, dict) or not weight_map:
+            raise ValueError("weight_map must be a nonempty object")
+        if any(not isinstance(name, str) or not name for name in weight_map.values()):
+            raise ValueError("weight_map must contain nonempty shard file names")
+        return set(weight_map.values())
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        raise ValueError(f"Cannot read weight_map from {index_path}: {e!r}") from e
+
+
+def get_local_model_weight_size(
+    model_path: Union[str, Path],
+) -> float:
+    """Return model size in MB from the weight files vLLM would load locally.
+
+    Uses the same file selection as the Hub reader: root files only (nested
+    copies such as ``original/`` are ignored), and only the shards listed in
+    ``model.safetensors.index.json`` when there is one.
+    """
+    model_path = Path(model_path)
+
+    if not model_path.exists():
+        raise FileNotFoundError(f"Model path does not exist: {model_path}")
+
+    if not model_path.is_dir():
+        raise ValueError(f"Model path is not a directory: {model_path}")
+
+    root_files = {path.name: path for path in model_path.iterdir() if path.is_file()}
+    ext, names = _select_weight_files(root_files)
+    if not names:
+        logger.warning("No weight files at the root of %s", model_path)
+        return 0.0
+
+    index_path = root_files.get(SAFETENSORS_INDEX_NAME)
+    if ext == ".safetensors" and index_path is not None:
+        # Unlike the Hub reader, there is no parameter-count estimate to fall
+        # back on, so an unreadable or incomplete index is an error.
+        indexed = _read_indexed_shards(index_path)
+        missing = indexed.difference(names)
+        if missing:
+            raise ValueError(
+                f"{index_path} lists shards missing from {model_path}: "
+                f"{sorted(missing)}"
+            )
+        names = [name for name in names if name in indexed]
+
+    # stat() follows symlinks, as in a Hugging Face cache snapshot.
+    total_size_bytes = sum(root_files[name].stat().st_size for name in names)
+    return total_size_bytes / (1024**2)
+
+
+def _select_hub_checkpoint_files(model_name: str, info, token: Optional[str]) -> list:
+    """Return the Hub repo files that vLLM would load as the model weights.
+
+    Like vLLM's default loader, this takes the repo-root files of the first
+    format present, skips non-weight files, and keeps only the files listed in
+    ``model.safetensors.index.json`` when the repo has one. That counts one
+    copy when a repo ships the weights twice (gpt2 in two formats, Mistral's
+    consolidated file, Llama's ``original/`` folder).
+    """
+    root_siblings = {
+        sibling.rfilename: sibling
+        for sibling in info.siblings or []
+        if "/" not in sibling.rfilename
+    }
+    ext, names = _select_weight_files(root_siblings)
+    if ext == ".safetensors" and SAFETENSORS_INDEX_NAME in root_siblings:
+        try:
+            index_path = hf_hub_download(
+                repo_id=model_name,
+                filename=SAFETENSORS_INDEX_NAME,
+                revision=info.sha,
+                token=token,
+            )
+            indexed = _read_indexed_shards(index_path)
+        except (OSError, ValueError, *HUB_NETWORK_ERRORS) as e:
+            # Gated repos refuse the download; the network can fail.
+            logger.warning(
+                "Cannot read %s for %s: %s", SAFETENSORS_INDEX_NAME, model_name, e
+            )
+            return []
+        names = [name for name in names if name in indexed]
+        # An indexed file missing from the repo would make the sum too small.
+        if len(names) != len(indexed):
+            return []
+    return [root_siblings[name] for name in names]
+
+
+def get_model_weight_size_from_hub(
+    model_name: str,
+    token: Optional[str] = None,
+) -> float:
+    """Return model size in MB by querying Hugging Face Hub API."""
+    try:
+        # Sibling file sizes are only populated when file metadata is requested.
+        info = model_info(model_name, token=token, files_metadata=True)
+
+        total_size_bytes = 0
+        checkpoint_files = _select_hub_checkpoint_files(model_name, info, token)
+        # A partial sum would undercount, so fall back to the estimate instead.
+        if checkpoint_files and all(
+            sibling.size is not None for sibling in checkpoint_files
+        ):
+            total_size_bytes = sum(sibling.size for sibling in checkpoint_files)
+
+        # If no file sizes were available, try to estimate from safetensors metadata
+        if total_size_bytes == 0 and info.safetensors is not None:
+            # SafeTensors info gives parameter counts per dtype
+            for dtype, param_count in info.safetensors.parameters.items():
+                bytes_per_param = DTYPE_BYTES_MAP.get(
+                    dtype, 2
+                )  # Default to 2 bytes (FP16/BF16)
+                total_size_bytes += int(param_count * bytes_per_param)
+
+        return total_size_bytes / (1024**2)
+    except Exception as e:
+        raise RuntimeError(f"Failed to get model info from Hub: {e}")
+
+
+def get_model_weight_size(
+    model_name_or_path: Union[str, Path],
+) -> float:
+    """Return model size in MB (auto-detects local vs HF Hub)."""
+    path = Path(model_name_or_path)
+
+    if path.exists() and path.is_dir():
+        # Local model
+        return get_local_model_weight_size(model_name_or_path)
+    else:
+        # HF Hub model
+        return get_model_weight_size_from_hub(str(model_name_or_path))
+
+
+def model_has_auto_map(
+    model_name_or_path: Union[str, Path],
+    token: Optional[str] = None,
+) -> bool:
+    """Return True iff the HF ``config.json`` declares an ``auto_map`` field.
+
+    ``auto_map`` signals that the model ships its own loader code in the HF
+    repo (``modeling_*.py`` / ``configuration_*.py``), which HF, vLLM, and
+    sglang refuse to execute unless the caller explicitly opts in via
+    ``trust_remote_code=True`` / ``--trust-remote-code``.
+
+    Works for both local directories and Hub model IDs. Reads ``config.json``
+    directly (no ``AutoConfig`` load) so it works even for architectures
+    that ``transformers`` doesn't know about. Returns False for missing or
+    malformed configs. Unexpected read errors return True so callers apply
+    their trust policy; this does not itself authorize custom code execution.
+    """
+    path = Path(model_name_or_path)
+    try:
+        if path.exists() and path.is_dir():
+            config_path = path / "config.json"
+            if not config_path.is_file():
+                return False
+        else:
+            try:
+                config_path = Path(
+                    hf_hub_download(
+                        repo_id=str(model_name_or_path),
+                        filename="config.json",
+                        token=token,
+                    )
+                )
+            except Exception as e:
+                # RepositoryNotFoundError / EntryNotFoundError mean the model or
+                # config.json doesn't exist — no custom code to worry about.
+                # Checked by name to avoid importing specific exception types at
+                # module level (huggingface_hub submodule portability).
+                if type(e).__name__ in (
+                    "RepositoryNotFoundError",
+                    "EntryNotFoundError",
+                ):
+                    return False
+                raise
+        with open(config_path) as f:
+            cfg = json.load(f)
+    except json.JSONDecodeError as e:
+        logger.warning(
+            "model_has_auto_map: malformed config.json for %s: %s — assuming no auto_map.",
+            model_name_or_path,
+            e,
+        )
+        return False
+    except Exception as e:
+        # Unexpected failure (network, auth, I/O). We cannot determine whether
+        # the model needs trust_remote_code, so return True and let the caller
+        # decide whether custom code execution is allowed.
+        logger.warning(
+            "model_has_auto_map: unexpected error reading config.json for %s: %s "
+            "— auto_map detection is inconclusive; returning True for the "
+            "caller's trust policy check.",
+            model_name_or_path,
+            e,
+        )
+        return True
+    return bool(cfg.get("auto_map"))
+
+
+def model_ref_allows_implicit_trust_remote_code(
+    model_name_or_path: Union[str, Path],
+) -> bool:
+    """Return True when implicit trust_remote_code is allowed for this ref.
+
+    Until DGDR carries an immutable remote revision through to the profiler,
+    remote HF model IDs are treated as mutable and must opt in explicitly.
+    Only local directories (including PVC-resolved snapshots) qualify for
+    implicit ``--trust-remote-code`` injection.
+
+    Raises RuntimeError when the path cannot be inspected, rather than
+    treating an inaccessible local path as a remote model ID.
+    """
+    path = Path(model_name_or_path)
+    try:
+        return S_ISDIR(path.stat().st_mode)
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    except OSError as e:
+        raise RuntimeError(
+            f"Cannot inspect model path {str(path)!r} to determine whether "
+            f"--trust-remote-code may be enabled automatically: {e}. "
+            "Check directory permissions and symlink ownership for the profiler "
+            "user. For PVC models, set modelCache.pvcModelPath to the actual "
+            "snapshot directory or create the symlink with the profiler's UID."
+        ) from e
+
+
+class ModelInfo(BaseModel):
+    model_size: float
+    architecture: str
+    is_moe: bool
+    max_context_length: Optional[int] = None
+    num_experts: Optional[int] = None
+    intermediate_size: Optional[int] = None
+    num_kv_heads: Optional[int] = None
+    quantization_block_size: Optional[int] = None
+
+
+def _get_config_value(config: object, attr: str) -> object:
+    if isinstance(config, dict):
+        return config.get(attr)
+    return getattr(config, attr, None)
+
+
+def _positive_int_config_value(config: object, attr: str) -> Optional[int]:
+    value = _get_config_value(config, attr)
+    try:
+        parsed = int(value)
+    except (OverflowError, TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _load_tokenizer_config(
+    model_name_or_path: Union[str, Path],
+) -> Optional[dict]:
+    """Load optional tokenizer metadata without making context lookup fail."""
+    path = Path(model_name_or_path)
+    if path.is_dir():
+        config_path = path / "tokenizer_config.json"
+        if not config_path.is_file():
+            return None
+    else:
+        try:
+            config_path = Path(
+                hf_hub_download(
+                    repo_id=str(model_name_or_path),
+                    filename="tokenizer_config.json",
+                )
+            )
+        except Exception:
+            logger.debug(
+                "Could not load tokenizer config for %s",
+                model_name_or_path,
+                exc_info=True,
+            )
+            return None
+
+    try:
+        with open(config_path) as f:
+            config = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        logger.debug(
+            "Could not read tokenizer config for %s",
+            model_name_or_path,
+            exc_info=True,
+        )
+        return None
+    return config if isinstance(config, dict) else None
+
+
+def _load_model_config(
+    model_name_or_path: Union[str, Path],
+    trust_remote_code: bool = False,
+) -> object:
+    path = Path(model_name_or_path)
+    config_path = path / "config.json"
+    if path.is_dir() and config_path.is_file():
+        with open(config_path) as f:
+            return json.load(f)
+
+    if _load_model_config_from_model_path is not None:
+        try:
+            return _load_model_config_from_model_path(str(model_name_or_path))
+        except HuggingFaceDownloadError:
+            logger.debug(
+                "AIConfigurator could not load model config for %s; falling back "
+                "to Transformers",
+                model_name_or_path,
+                exc_info=True,
+            )
+
+    return AutoConfig.from_pretrained(
+        model_name_or_path,
+        trust_remote_code=trust_remote_code,
+    )
+
+
+def get_model_context_length(
+    model_name_or_path: Union[str, Path],
+    trust_remote_code: bool = False,
+) -> Optional[int]:
+    """Return vLLM's config-derived context-window ceiling when available."""
+    config = _load_model_config(model_name_or_path, trust_remote_code)
+    tokenizer_config = _load_tokenizer_config(model_name_or_path)
+    tokenizer_context_length = _positive_int_config_value(
+        tokenizer_config, "model_max_length"
+    )
+    candidates = []
+    candidate_ids = set()
+
+    def add_candidate(candidate: object) -> None:
+        if candidate is None or id(candidate) in candidate_ids:
+            return
+        candidate_ids.add(id(candidate))
+        candidates.append(candidate)
+
+    thinker_config = _get_config_value(config, "thinker_config")
+    add_candidate(_get_config_value(thinker_config, "text_config"))
+    if not isinstance(config, dict):
+        get_text_config = getattr(config, "get_text_config", None)
+        if callable(get_text_config):
+            add_candidate(get_text_config())
+    for key in ("text_config", "language_config", "decoder", "generator"):
+        add_candidate(_get_config_value(config, key))
+    add_candidate(config)
+
+    for candidate in candidates:
+        lengths = []
+        for attr in CONTEXT_LENGTH_ATTRS:
+            if attr in ("model_max_length", "sliding_window"):
+                continue
+            value = _positive_int_config_value(candidate, attr)
+            if value is not None:
+                lengths.append(value)
+
+        context_length = min(lengths) if lengths else None
+        model_max_length = _positive_int_config_value(candidate, "model_max_length")
+        if model_max_length is not None:
+            context_length = model_max_length
+        if tokenizer_context_length is not None:
+            context_length = (
+                min(context_length, tokenizer_context_length)
+                if context_length is not None
+                else tokenizer_context_length
+            )
+        if context_length is None:
+            continue
+
+        rope_params = _get_config_value(candidate, "rope_parameters")
+        if rope_params is None:
+            rope_params = _get_config_value(candidate, "rope_scaling")
+        if rope_params is None and candidate is not config:
+            rope_params = _get_config_value(config, "rope_parameters")
+            if rope_params is None:
+                rope_params = _get_config_value(config, "rope_scaling")
+        model_type = str(
+            _get_config_value(candidate, "model_type")
+            or _get_config_value(config, "model_type")
+            or ""
+        )
+        if isinstance(rope_params, dict) and "gemma3" not in model_type:
+            if any(isinstance(value, dict) for value in rope_params.values()):
+                rope_configs = [
+                    value for value in rope_params.values() if isinstance(value, dict)
+                ]
+            else:
+                rope_configs = [rope_params]
+
+            scaling_factor = 1.0
+            for rope_config in rope_configs:
+                rope_type = rope_config.get("rope_type") or rope_config.get("type")
+                if rope_type not in ("su", "longrope", "llama3"):
+                    try:
+                        scaling_factor = float(
+                            rope_config.get("factor", scaling_factor) or 1.0
+                        )
+                    except (TypeError, ValueError):
+                        scaling_factor = 1.0
+                    if rope_type == "yarn":
+                        original = rope_config.get("original_max_position_embeddings")
+                        try:
+                            context_length = int(original)
+                        except (TypeError, ValueError):
+                            pass
+            context_length = int(context_length * scaling_factor)
+        return context_length
+    return None
+
+
+def get_mamba_cache_align_block_size(
+    model_name_or_path: Union[str, Path],
+    trust_remote_code: bool = False,
+) -> Optional[int]:
+    """Return vLLM's Mamba cache align token floor when derivable.
+
+    vLLM requires ``max_num_batched_tokens`` to be at least this block size
+    when Mamba cache mode is ``align``. Nemotron-H configs expose the fields
+    needed to compute it directly.
+    """
+    config = _load_model_config(model_name_or_path, trust_remote_code)
+    mamba_num_heads = _positive_int_config_value(config, "mamba_num_heads")
+    mamba_head_dim = _positive_int_config_value(config, "mamba_head_dim")
+    ssm_state_size = _positive_int_config_value(config, "ssm_state_size")
+    if not (mamba_num_heads and mamba_head_dim and ssm_state_size):
+        return None
+    return mamba_num_heads * mamba_head_dim + ssm_state_size
+
+
+def get_model_info(
+    model_name_or_path: Union[str, Path],
+    trust_remote_code: bool = False,
+) -> ModelInfo:
+    model_size = get_model_weight_size(model_name_or_path)
+
+    config = AutoConfig.from_pretrained(
+        model_name_or_path,
+        trust_remote_code=trust_remote_code,
+    )
+
+    architecture = config.architectures[0]
+    if architecture in MOE_ARCHITECTURES:
+        is_moe = True
+    else:
+        is_moe = False
+
+    # Detect max context length from config
+    # Different models use different attribute names for max context length
+    max_context_length = None
+    for attr in CONTEXT_LENGTH_ATTRS:
+        if hasattr(config, attr):
+            value = getattr(config, attr)
+            if value is not None:
+                max_context_length = value
+                break
+
+    # Detect number of experts for MoE models
+    # Different models use different attribute names
+    num_experts = None
+    if is_moe:
+        expert_attrs = [
+            "n_routed_experts",  # DeepSeek V3/R1
+            "num_local_experts",  # Mixtral, Qwen
+            "num_experts",  # Generic
+        ]
+        for attr in expert_attrs:
+            if hasattr(config, attr):
+                value = getattr(config, attr)
+                if value is not None:
+                    num_experts = value
+                    break
+
+    # Detect intermediate size (FFN hidden dimension)
+    intermediate_size = None
+    intermediate_attrs = [
+        "intermediate_size",  # Most common (BERT, LLaMA, etc.)
+        "ffn_dim",  # Some transformer models
+    ]
+    for attr in intermediate_attrs:
+        if hasattr(config, attr):
+            value = getattr(config, attr)
+            if value is not None:
+                intermediate_size = value
+                break
+
+    # Detect number of key-value heads (for GQA)
+    num_kv_heads = None
+    kv_head_attrs = [
+        "num_key_value_heads",  # LLaMA 2/3, Mistral, etc.
+        "num_kv_heads",  # Alternative name
+    ]
+    for attr in kv_head_attrs:
+        if hasattr(config, attr):
+            value = getattr(config, attr)
+            if value is not None:
+                num_kv_heads = value
+                break
+    # If not found, check if it equals num_attention_heads (standard MHA)
+    if num_kv_heads is None and hasattr(config, "num_attention_heads"):
+        num_kv_heads = config.num_attention_heads
+
+    # Detect quantization block size
+    quantization_block_size = None
+    if hasattr(config, "quantization_config"):
+        quant_config = config.quantization_config
+        if isinstance(quant_config, dict):
+            # Check for common quantization block size attributes
+            quantization_block_size = (
+                quant_config.get("weight_block_size")
+                or quant_config.get("block_size")
+                or quant_config.get("group_size")
+                or quant_config.get("q_group_size")
+            )
+        elif quant_config is not None:
+            # Handle object-based quantization config
+            for attr in [
+                "weight_block_size",
+                "block_size",
+                "group_size",
+                "q_group_size",
+            ]:
+                if hasattr(quant_config, attr):
+                    value = getattr(quant_config, attr)
+                    if value is not None:
+                        quantization_block_size = value
+                        break
+
+        # Handle case where block size is a list (e.g., [128, 128] for [input, output] block sizes)
+        if (
+            isinstance(quantization_block_size, list)
+            and len(quantization_block_size) > 0
+        ):
+            quantization_block_size = max(quantization_block_size)
+
+    return ModelInfo(
+        model_size=model_size,
+        architecture=architecture,
+        is_moe=is_moe,
+        max_context_length=max_context_length,
+        num_experts=num_experts,
+        intermediate_size=intermediate_size,
+        num_kv_heads=num_kv_heads,
+        quantization_block_size=quantization_block_size,
+    )
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model", type=str, required=True)
+    args = parser.parse_args()
+
+    print(get_model_info(args.model))

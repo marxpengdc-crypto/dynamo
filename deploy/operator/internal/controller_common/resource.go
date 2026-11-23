@@ -1,0 +1,772 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package controller_common
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/json"
+	"fmt"
+	"maps"
+	"reflect"
+	"sort"
+	"strconv"
+
+	"github.com/ai-dynamo/dynamo/deploy/operator/api/v1beta1"
+	"github.com/google/go-cmp/cmp"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
+	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/events"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/log"
+)
+
+const (
+	// NvidiaAnnotationHashKey indicates annotation name for last applied hash by the operator
+	NvidiaAnnotationHashKey = "nvidia.com/last-applied-hash"
+	// NvidiaAnnotationGenerationKey indicates annotation name for last applied generation by the operator
+	// This is used to detect manual changes to resources
+	NvidiaAnnotationGenerationKey = "nvidia.com/last-applied-generation"
+	// EventReasonOwnershipConflict identifies a parent resource with a child-resource ownership collision.
+	EventReasonOwnershipConflict = "OwnershipConflict"
+)
+
+type OwnershipConflictError struct {
+	Cause error
+}
+
+func (e *OwnershipConflictError) Error() string {
+	return e.Cause.Error()
+}
+
+func (e *OwnershipConflictError) Unwrap() error {
+	return e.Cause
+}
+
+type Reconciler interface {
+	client.Client
+	GetRecorder() events.EventRecorder
+}
+
+// ResourceGenerator is a function that generates a resource.
+// it must return the resource, a boolean indicating if the resource should be deleted, and an error
+// if the resource should be deleted, the returned resource must contain the necessary information to delete it (name and namespace)
+type ResourceGenerator[T client.Object] func(ctx context.Context) (T, bool, error)
+
+// SyncOption configures resource synchronization.
+type SyncOption func(*syncOptions)
+
+type syncOptions struct {
+	sharedOwnership   bool
+	preserveListOrder bool
+}
+
+// WithPreservedListOrder makes authored list ordering significant in spec hashes.
+func WithPreservedListOrder() SyncOption {
+	return func(options *syncOptions) {
+		options.preserveListOrder = true
+	}
+}
+
+// WithSharedOwnership permits a caller to reconcile a resource whose controller
+// owner is another resource. Callers must use this only for a documented,
+// intentional shared-resource lifecycle.
+func WithSharedOwnership() SyncOption {
+	return func(options *syncOptions) {
+		options.sharedOwnership = true
+	}
+}
+
+func resolveSyncOptions(opts []SyncOption) syncOptions {
+	var options syncOptions
+	for _, opt := range opts {
+		opt(&options)
+	}
+	return options
+}
+
+// CheckControllerOwnership verifies that existing is controlled by parentResource.
+// A namespaced name is not sufficient evidence of ownership: a resource with no
+// controller owner or one owned by a different parent is a collision.
+func CheckControllerOwnership(existing, parentResource client.Object, scheme *runtime.Scheme) error {
+	if parentResource == nil {
+		return nil
+	}
+
+	existingOwner := metav1.GetControllerOf(existing)
+	if existingOwner == nil {
+		return &OwnershipConflictError{Cause: fmt.Errorf(
+			"%T %s/%s has no controller owner; refusing to reconcile it for %T %s/%s",
+			existing,
+			existing.GetNamespace(),
+			existing.GetName(),
+			parentResource,
+			parentResource.GetNamespace(),
+			parentResource.GetName(),
+		)}
+	}
+
+	parentGVK, err := apiutil.GVKForObject(parentResource, scheme)
+	if err != nil {
+		return fmt.Errorf("get parent GVK: %w", err)
+	}
+	existingOwnerGV, err := schema.ParseGroupVersion(existingOwner.APIVersion)
+	if err != nil ||
+		existingOwnerGV.Group != parentGVK.Group ||
+		existingOwner.Kind != parentGVK.Kind ||
+		existingOwner.Name != parentResource.GetName() ||
+		existingOwner.UID != parentResource.GetUID() {
+		return &OwnershipConflictError{Cause: &controllerutil.AlreadyOwnedError{Object: existing, Owner: *existingOwner}}
+	}
+
+	return nil
+}
+
+// SyncResource synchronizes a generated resource with the API server. parentResource may be nil;
+// when it is nil, SyncResource neither sets nor validates controller ownership.
+//
+//nolint:nakedret
+func SyncResource[T client.Object](ctx context.Context, r Reconciler, parentResource client.Object, generateResource ResourceGenerator[T], opts ...SyncOption) (modified bool, res T, err error) {
+	logs := log.FromContext(ctx)
+	options := resolveSyncOptions(opts)
+
+	resource, toDelete, err := generateResource(ctx)
+	if err != nil {
+		return
+	}
+	resourceNamespace := resource.GetNamespace()
+	resourceName := resource.GetName()
+	resourceType := reflect.TypeOf(resource).Elem().Name()
+	logs = logs.WithValues("namespace", resourceNamespace, "resourceName", resourceName, "resourceType", resourceType)
+
+	// Retrieve the GroupVersionKind (GVK) of the desired object
+	gvk, err := apiutil.GVKForObject(resource, r.Scheme())
+	if err != nil {
+		logs.Error(err, "Failed to get GVK for object")
+		return
+	}
+
+	// Create a new instance of the object
+	obj, err := r.Scheme().New(gvk)
+	if err != nil {
+		logs.Error(err, "Failed to create a new object for GVK")
+		return
+	}
+
+	// Type assertion to ensure the object implements client.Object
+	oldResource, ok := obj.(T)
+	if !ok {
+		return
+	}
+
+	err = r.Get(ctx, types.NamespacedName{Name: resourceName, Namespace: resourceNamespace}, oldResource)
+	oldResourceIsNotFound := errors.IsNotFound(err)
+	if err != nil && !oldResourceIsNotFound {
+		r.GetRecorder().Eventf(resource, nil, corev1.EventTypeWarning, fmt.Sprintf("Get%s", resourceType), "Get", "Failed to get %s %s: %s", resourceType, resourceNamespace, err)
+		logs.Error(err, "Failed to get resource.")
+		return
+	}
+	err = nil
+
+	if oldResourceIsNotFound {
+		if toDelete {
+			logs.Info("Resource not found. Nothing to do.")
+			return
+		}
+		logs.Info("Resource not found. Creating a new one.")
+		var observed T
+		return SyncObservedResource(ctx, r, parentResource, observed, resource, opts...)
+	}
+
+	logs.Info(fmt.Sprintf("%s found.", resourceType))
+	if toDelete {
+		if !options.sharedOwnership {
+			err = CheckControllerOwnership(oldResource, parentResource, r.Scheme())
+			if err != nil {
+				logs.Error(err, "Refusing to delete a resource with conflicting controller ownership")
+				return
+			}
+		}
+		logs.Info(fmt.Sprintf("%s found. Deleting the existing one.", resourceType))
+		uid := oldResource.GetUID()
+		resourceVersion := oldResource.GetResourceVersion()
+		err = r.Delete(ctx, oldResource, client.Preconditions{UID: &uid, ResourceVersion: &resourceVersion})
+		if err != nil {
+			logs.Error(err, fmt.Sprintf("Failed to delete %s.", resourceType))
+			r.GetRecorder().Eventf(oldResource, nil, corev1.EventTypeWarning, fmt.Sprintf("Delete%s", resourceType), "Delete", "Failed to delete %s %s: %s", resourceType, resourceNamespace, err)
+			return
+		}
+		logs.Info(fmt.Sprintf("%s deleted.", resourceType))
+		r.GetRecorder().Eventf(oldResource, nil, corev1.EventTypeNormal, fmt.Sprintf("Delete%s", resourceType), "Delete", "Deleted %s %s", resourceType, resourceNamespace)
+		modified = true
+		return
+	}
+
+	return SyncObservedResource(ctx, r, parentResource, oldResource, resource, opts...)
+}
+
+// SyncObservedResource synchronizes a desired resource against the exact
+// object previously observed by its caller. Unlike SyncResource, it does not
+// read from the API server. parentResource may be nil; when it is nil,
+// SyncObservedResource neither sets nor validates controller ownership. Create
+// and update conflicts must be retried from a fresh observation so render-time
+// decisions remain tied to the written object.
+func SyncObservedResource[T client.Object](
+	ctx context.Context,
+	r Reconciler,
+	parentResource client.Object,
+	observed T,
+	desired T,
+	opts ...SyncOption,
+) (bool, T, error) {
+	resourceNamespace := desired.GetNamespace()
+	resourceName := desired.GetName()
+	resourceType := reflect.TypeOf(desired).Elem().Name()
+	logs := log.FromContext(ctx).WithValues(
+		"namespace", resourceNamespace,
+		"resourceName", resourceName,
+		"resourceType", resourceType,
+	)
+
+	if isNilClientObject(observed) {
+		if parentResource != nil {
+			if err := ctrl.SetControllerReference(parentResource, desired, r.Scheme()); err != nil {
+				logs.Error(err, "Failed to set controller reference.")
+				recordResourceEvent(r, desired, corev1.EventTypeWarning, "SetControllerReference", "Update", "Failed to set controller reference for %s %s: %s", resourceType, resourceNamespace, err)
+				var zero T
+				return false, zero, err
+			}
+		} else {
+			logs.Info("No parent resource provided, creating resource without owner reference (independent lifecycle)")
+		}
+
+		hash, err := GetSpecHash(desired, opts...)
+		if err != nil {
+			logs.Error(err, "Failed to get spec hash.")
+			recordResourceEvent(r, desired, corev1.EventTypeWarning, "GetSpecHash", "Get", "Failed to get spec hash for %s %s: %s", resourceType, resourceNamespace, err)
+			var zero T
+			return false, zero, err
+		}
+		updateAnnotations(desired, hash, 1)
+
+		if err := r.Create(ctx, desired); err != nil {
+			logs.Error(err, "Failed to create Resource.")
+			recordResourceEvent(r, desired, corev1.EventTypeWarning, fmt.Sprintf("Create%s", resourceType), "Create", "Failed to create %s %s: %s", resourceType, resourceNamespace, err)
+			var zero T
+			return false, zero, err
+		}
+		logs.Info(fmt.Sprintf("%s created.", resourceType))
+		recordResourceEvent(r, desired, corev1.EventTypeNormal, fmt.Sprintf("Create%s", resourceType), "Create", "Created %s %s", resourceType, resourceNamespace)
+		return true, desired, nil
+	}
+
+	if !resolveSyncOptions(opts).sharedOwnership {
+		if err := CheckControllerOwnership(observed, parentResource, r.Scheme()); err != nil {
+			logs.Error(err, "Refusing to reconcile a resource with conflicting controller ownership")
+			var zero T
+			return false, zero, err
+		}
+	}
+
+	changeResult, err := GetSpecChangeResult(observed, desired, opts...)
+	if err != nil {
+		recordResourceEvent(r, desired, corev1.EventTypeWarning, fmt.Sprintf("CalculatePatch%s", resourceType), "Update", "Failed to calculate patch for %s %s: %s", resourceType, resourceNamespace, err)
+		return false, desired, fmt.Errorf("failed to check if spec has changed: %w", err)
+	}
+	if !changeResult.NeedsUpdate {
+		logs.Info(fmt.Sprintf("%s spec is the same. Skipping update.", resourceType))
+		return false, observed, nil
+	}
+	if changeResult.NewHash == nil {
+		var zero T
+		return false, zero, fmt.Errorf("%s update has no desired spec hash", resourceType)
+	}
+
+	if changeResult.ManualChangeDetected {
+		logs.Info(fmt.Sprintf("Manual changes detected on %s, will be overwritten", resourceType),
+			"currentGeneration", observed.GetGeneration(),
+			"lastAppliedGeneration", getAnnotation(observed, NvidiaAnnotationGenerationKey))
+	}
+
+	synced, ok := observed.DeepCopyObject().(T)
+	if !ok {
+		var zero T
+		return false, zero, fmt.Errorf("deep copy observed %s as %T", resourceType, observed)
+	}
+	if changeResult.SpecNeedsUpdate {
+		diff, diffErr := generateSpecDiff(observed, desired)
+		if diffErr != nil {
+			logs.V(1).Info(fmt.Sprintf("Failed to generate diff for %s: %v", resourceType, diffErr))
+		} else if diff != "" {
+			logs.Info(fmt.Sprintf("%s spec changes detected", resourceType), "diff", diff)
+		}
+
+		if err := CopySpec(desired, synced); err != nil {
+			logs.Error(err, fmt.Sprintf("Failed to copy spec for %s.", resourceType))
+			recordResourceEvent(r, observed, corev1.EventTypeWarning, fmt.Sprintf("CopySpec%s", resourceType), "Update", "Failed to copy spec for %s %s: %s", resourceType, resourceNamespace, err)
+			var zero T
+			return false, zero, err
+		}
+	} else {
+		logs.Info(fmt.Sprintf("%s spec is equivalent. Updating bookkeeping annotations only.", resourceType))
+	}
+
+	updateAnnotations(synced, *changeResult.NewHash, changeResult.NewGeneration)
+	if err := r.Update(ctx, synced); err != nil {
+		logs.Error(err, fmt.Sprintf("Failed to update %s.", resourceType))
+		recordResourceEvent(r, observed, corev1.EventTypeWarning, fmt.Sprintf("Update%s", resourceType), "Update", "Failed to update %s %s: %s", resourceType, resourceNamespace, err)
+		var zero T
+		return false, zero, err
+	}
+	logs.Info(fmt.Sprintf("%s updated.", resourceType))
+	recordResourceEvent(r, observed, corev1.EventTypeNormal, fmt.Sprintf("Update%s", resourceType), "Update", "Updated %s %s", resourceType, resourceNamespace)
+	return true, synced, nil
+}
+
+func isNilClientObject[T client.Object](object T) bool {
+	value := reflect.ValueOf(object)
+	return !value.IsValid() || ((value.Kind() == reflect.Chan ||
+		value.Kind() == reflect.Func ||
+		value.Kind() == reflect.Interface ||
+		value.Kind() == reflect.Map ||
+		value.Kind() == reflect.Pointer ||
+		value.Kind() == reflect.Slice) && value.IsNil())
+}
+
+func recordResourceEvent(
+	r Reconciler,
+	object client.Object,
+	eventType, reason, action, messageFmt string,
+	args ...any,
+) {
+	if recorder := r.GetRecorder(); recorder != nil {
+		recorder.Eventf(object, nil, eventType, reason, action, messageFmt, args...)
+	}
+}
+
+// CopySpec copies only the Spec field from source to destination using Unstructured
+
+// kubeEnvelopeFields are standard top-level Kubernetes fields that don't
+// represent the resource's desired state. Everything else (spec, data,
+// rules, roleRef, subjects, etc.) is considered content.
+var kubeEnvelopeFields = map[string]bool{
+	"apiVersion": true,
+	"kind":       true,
+	"metadata":   true,
+	"status":     true,
+}
+
+// nonEnvelopeFields returns all top-level fields from an unstructured map
+// except the Kubernetes envelope (apiVersion, kind, metadata, status).
+func nonEnvelopeFields(obj map[string]any) map[string]any {
+	content := make(map[string]any, len(obj))
+	for k, v := range obj {
+		if kubeEnvelopeFields[k] {
+			continue
+		}
+		content[k] = v
+	}
+	return content
+}
+
+// getContentFields returns all content fields from an unstructured object,
+// i.e. everything except the Kubernetes envelope (apiVersion, kind, metadata, status).
+// For resources with a "spec" field, it returns the spec directly for
+// backward-compatible hashing. For spec-less resources (ConfigMaps, Secrets,
+// Roles, etc.), it returns a map of all content fields.
+func getContentFields(u *unstructured.Unstructured) (any, bool) {
+	if spec, found, err := unstructured.NestedFieldNoCopy(u.Object, "spec"); err == nil && found {
+		return spec, true
+	}
+
+	content := nonEnvelopeFields(u.Object)
+	if len(content) == 0 {
+		return nil, false
+	}
+	return content, true
+}
+
+func CopySpec(source, destination client.Object) error {
+	sourceMap, err := runtime.DefaultUnstructuredConverter.ToUnstructured(source)
+	if err != nil {
+		return err
+	}
+	sourceUnstructured := &unstructured.Unstructured{Object: sourceMap}
+
+	destMap, err := runtime.DefaultUnstructuredConverter.ToUnstructured(destination)
+	if err != nil {
+		return err
+	}
+	destUnstructured := &unstructured.Unstructured{Object: destMap}
+
+	if spec, found, err := unstructured.NestedFieldNoCopy(sourceUnstructured.Object, "spec"); err == nil && found {
+		// Keep unstructured destinations opaque so unknown provider fields survive.
+		if destinationUnstructured, ok := destination.(*unstructured.Unstructured); ok {
+			return unstructured.SetNestedField(destinationUnstructured.Object, spec, "spec")
+		}
+		if err := unstructured.SetNestedField(destUnstructured.Object, spec, "spec"); err != nil {
+			return err
+		}
+		return runtime.DefaultUnstructuredConverter.FromUnstructured(destUnstructured.Object, destination)
+	}
+
+	maps.Copy(destUnstructured.Object, nonEnvelopeFields(sourceUnstructured.Object))
+
+	return runtime.DefaultUnstructuredConverter.FromUnstructured(destUnstructured.Object, destination)
+}
+
+func getSpec(obj client.Object) (any, error) {
+	sourceMap, err := runtime.DefaultUnstructuredConverter.ToUnstructured(obj)
+	if err != nil {
+		return nil, err
+	}
+	sourceUnstructured := &unstructured.Unstructured{Object: sourceMap}
+
+	content, found := getContentFields(sourceUnstructured)
+	if !found {
+		return nil, nil
+	}
+	return content, nil
+}
+
+// SpecChangeResult contains the result of spec change detection
+type SpecChangeResult struct {
+	// NewHash is the hash to set in the annotation (nil if no update needed)
+	NewHash *string
+	// NewGeneration is the generation to set in the annotation
+	NewGeneration int64
+	// NeedsUpdate indicates whether the resource needs to be updated
+	NeedsUpdate bool
+	// SpecNeedsUpdate indicates whether the desired spec/content must be copied.
+	// When false with NeedsUpdate=true, only operator bookkeeping annotations need
+	// repair and the resource spec should be left untouched.
+	SpecNeedsUpdate bool
+	// ManualChangeDetected indicates whether a manual change was detected
+	ManualChangeDetected bool
+}
+
+// GetSpecChangeResult determines if a resource needs to be updated by comparing the desired spec hash
+// with the last applied hash annotation. It also tracks generation to detect manual changes.
+//
+// Returns:
+//   - SpecChangeResult with update information
+//   - error if hash computation fails
+func GetSpecChangeResult(current client.Object, desired client.Object, opts ...SyncOption) (SpecChangeResult, error) {
+	desiredSpec, err := getSpec(desired)
+	if err != nil {
+		return SpecChangeResult{}, err
+	}
+	desiredHash, err := GetResourceHash(desiredSpec, opts...)
+	if err != nil {
+		return SpecChangeResult{}, err
+	}
+	currentSpec, err := getSpec(current)
+	if err != nil {
+		return SpecChangeResult{}, err
+	}
+	currentMatchesDesired := equality.Semantic.DeepEqual(currentSpec, desiredSpec)
+
+	lastAppliedHash := getAnnotation(current, NvidiaAnnotationHashKey)
+	lastAppliedGenStr := getAnnotation(current, NvidiaAnnotationGenerationKey)
+	currentGen := current.GetGeneration()
+	annotationOnlyChange := func() SpecChangeResult {
+		return SpecChangeResult{
+			NewHash:       &desiredHash,
+			NewGeneration: currentGen,
+			NeedsUpdate:   true,
+		}
+	}
+	specChange := func(manual bool) SpecChangeResult {
+		return SpecChangeResult{
+			NewHash:              &desiredHash,
+			NewGeneration:        currentGen + 1,
+			NeedsUpdate:          true,
+			SpecNeedsUpdate:      true,
+			ManualChangeDetected: manual,
+		}
+	}
+
+	// Case 1: Hash annotation missing (external create or pre-upgrade resource)
+	// Note: This is not first-time CREATE (handled separately in SyncResource with generation=1).
+	// If the live spec already matches the desired spec, only backfill the operator
+	// bookkeeping annotations. This avoids rewriting API-server-defaulted fields
+	// during upgrades.
+	if lastAppliedHash == "" {
+		if currentMatchesDesired {
+			return annotationOnlyChange(), nil
+		}
+		return specChange(false), nil
+	}
+
+	// Case 2: Hash different (spec changed)
+	if desiredHash != lastAppliedHash {
+		if currentMatchesDesired {
+			return annotationOnlyChange(), nil
+		}
+		return specChange(false), nil
+	}
+
+	// Case 3: Hash same, but generation annotation missing (upgrade scenario)
+	if lastAppliedGenStr == "" {
+		if currentMatchesDesired {
+			return annotationOnlyChange(), nil
+		}
+		return specChange(false), nil
+	}
+
+	// Case 4: Both annotations exist, check for manual changes
+	lastAppliedGen, err := strconv.ParseInt(lastAppliedGenStr, 10, 64)
+	if err != nil {
+		// Corrupted annotation, force update to fix
+		if currentMatchesDesired {
+			return annotationOnlyChange(), nil
+		}
+		return specChange(false), nil
+	}
+
+	// Detect manual changes: if current generation > last applied generation,
+	// someone else modified the resource after our last update. Some resources
+	// can advance generation for metadata-only writes, so confirm that the
+	// current content actually drifted before forcing a rewrite.
+	if currentGen > 0 && currentGen > lastAppliedGen {
+		if currentMatchesDesired {
+			return annotationOnlyChange(), nil
+		}
+		return specChange(true), nil
+	}
+
+	// No update needed
+	return SpecChangeResult{
+		NeedsUpdate: false,
+	}, nil
+}
+
+// getAnnotation safely retrieves an annotation value from an object
+func getAnnotation(obj client.Object, key string) string {
+	annotations := obj.GetAnnotations()
+	if annotations == nil {
+		return ""
+	}
+	return annotations[key]
+}
+
+// generateSpecDiff creates a unified diff showing changes between old and new resource specs
+func generateSpecDiff(oldResource, newResource client.Object) (string, error) {
+	oldSpec, err := getSpec(oldResource)
+	if err != nil {
+		return "", fmt.Errorf("failed to get old spec: %w", err)
+	}
+
+	newSpec, err := getSpec(newResource)
+	if err != nil {
+		return "", fmt.Errorf("failed to get new spec: %w", err)
+	}
+
+	// Generate diff using cmp
+	diff := cmp.Diff(oldSpec, newSpec)
+	if diff == "" {
+		return "", nil
+	}
+
+	return diff, nil
+}
+
+func GetSpecHash(obj client.Object, opts ...SyncOption) (string, error) {
+	spec, err := getSpec(obj)
+	if err != nil {
+		return "", err
+	}
+	return GetResourceHash(spec, opts...)
+}
+
+// updateAnnotations sets both hash and generation annotations on an object
+func updateAnnotations(obj client.Object, hash string, generation int64) {
+	annotations := obj.GetAnnotations()
+	if annotations == nil {
+		annotations = map[string]string{}
+	}
+	annotations[NvidiaAnnotationHashKey] = hash
+	annotations[NvidiaAnnotationGenerationKey] = strconv.FormatInt(generation, 10)
+	obj.SetAnnotations(annotations)
+}
+
+// GetResourceHash returns a consistent hash for the given object spec
+func GetResourceHash(obj any, opts ...SyncOption) (string, error) {
+	// Convert obj to a map[string]interface{}
+	objMap, err := json.Marshal(obj)
+	if err != nil {
+		return "", err
+	}
+
+	// JSON already orders map keys deterministically without reordering lists.
+	if resolveSyncOptions(opts).preserveListOrder {
+		return fmt.Sprintf("%x", sha256.Sum256(objMap)), nil
+	}
+
+	var objData map[string]any
+	if err := json.Unmarshal(objMap, &objData); err != nil {
+		return "", err
+	}
+
+	// Sort keys to ensure consistent serialization
+	sortedObjData := SortKeys(objData)
+
+	// Serialize to JSON
+	serialized, err := json.Marshal(sortedObjData)
+	if err != nil {
+		return "", err
+	}
+
+	// Compute the hash
+	hasher := sha256.New()
+	hasher.Write(serialized)
+	return fmt.Sprintf("%x", hasher.Sum(nil)), nil
+}
+
+// SortKeys consumes a JSON-decoded tree, ordering slices for consistent serialization.
+func SortKeys(obj any) any {
+	switch obj := obj.(type) {
+	case map[string]any:
+		if obj == nil {
+			return map[string]any{}
+		}
+		for k, v := range obj {
+			obj[k] = SortKeys(v)
+		}
+		return obj
+	case []any:
+		// Check if the slice contains maps and sort them by the "name" field or the first available field
+		if len(obj) > 0 {
+
+			if _, ok := obj[0].(map[string]any); ok {
+				sort.SliceStable(obj, func(i, j int) bool {
+					iMap, iOk := obj[i].(map[string]any)
+					jMap, jOk := obj[j].(map[string]any)
+					if iOk && jOk {
+						// Try to sort by "name" if present
+						iName, iNameOk := iMap["name"].(string)
+						jName, jNameOk := jMap["name"].(string)
+						if iNameOk && jNameOk {
+							return iName < jName
+						}
+
+						// If "name" is not available, sort by the first key in each map
+						if len(iMap) > 0 && len(jMap) > 0 {
+							iFirstKey := firstKey(iMap)
+							jFirstKey := firstKey(jMap)
+							return iFirstKey < jFirstKey
+						}
+					}
+					// If no valid comparison is possible, maintain the original order
+					return false
+				})
+			}
+		}
+		for i, v := range obj {
+			obj[i] = SortKeys(v)
+		}
+	}
+	return obj
+}
+
+// Helper function to get the first key of a map (alphabetically sorted)
+func firstKey(m map[string]any) string {
+	var first string
+	firstSet := false
+	for k := range m {
+		if !firstSet || k < first {
+			first, firstSet = k, true
+		}
+	}
+	return first
+}
+
+// AppendUniqueImagePullSecrets appends secrets to existing, skipping any that already exist by name.
+func AppendUniqueImagePullSecrets(existing, additional []corev1.LocalObjectReference) []corev1.LocalObjectReference {
+	if len(additional) == 0 {
+		return existing
+	}
+	seen := make(map[string]bool, len(existing))
+	for _, s := range existing {
+		seen[s.Name] = true
+	}
+	for _, s := range additional {
+		if !seen[s.Name] {
+			existing = append(existing, s)
+			seen[s.Name] = true
+		}
+	}
+	return existing
+}
+
+type Resource struct {
+	object            client.Object
+	isReady           bool
+	readyReason       string
+	componentStatuses map[string]v1beta1.ComponentReplicaStatus
+}
+
+func NewResource[T client.Object](resource T, isReady func() (bool, string)) (*Resource, error) {
+	v := reflect.ValueOf(resource)
+	// handles untype nil and typed nil
+	if !v.IsValid() || v.IsNil() {
+		return nil, fmt.Errorf("resource is nil")
+	}
+	ready, reason := isReady()
+	return &Resource{
+		object:      resource,
+		isReady:     ready,
+		readyReason: reason,
+	}, nil
+}
+
+func NewResourceWithComponentStatuses[T client.Object](resource T, isReadyAndComponentStatuses func() (bool, string, map[string]v1beta1.ComponentReplicaStatus)) (*Resource, error) {
+	v := reflect.ValueOf(resource)
+	// handles untype nil and typed nil
+	if !v.IsValid() || v.IsNil() {
+		return nil, fmt.Errorf("resource is nil")
+	}
+	ready, reason, componentStatuses := isReadyAndComponentStatuses()
+	return &Resource{
+		object:            resource,
+		isReady:           ready,
+		readyReason:       reason,
+		componentStatuses: componentStatuses,
+	}, nil
+}
+
+func (r *Resource) IsReady() (bool, string) {
+	return r.isReady, r.readyReason
+}
+
+func (r *Resource) GetName() string {
+	return r.object.GetName()
+}
+
+func (r *Resource) GetComponentStatuses() map[string]v1beta1.ComponentReplicaStatus {
+	return r.componentStatuses
+}

@@ -1,0 +1,709 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Timing notes (measured in an SGLang-enabled container):
+# - GPU-1 subset (`-m "gpu_1"`): 92.35s total for 2 tests (+ 1 skipped).
+# These tests load a real model and can be slow/flaky when GPU resources are contended,
+# so we set explicit pytest timeouts to fail fast on hangs (see per-test markers below).
+import logging
+import os
+import tempfile
+from typing import Any, Dict, Optional
+
+import pytest
+import requests
+from huggingface_hub import snapshot_download
+
+from tests.router.e2e_harness import (
+    ManagedEngineProcessMixin,
+    build_test_payload,
+    run_basic_router_test,
+    run_cache_salt_isolation_test,
+    run_disagg_router_decisions_test,
+    run_indexers_sync_test,
+    run_lora_isolation_test,
+    run_router_decisions_test,
+)
+from tests.router.helper import generate_random_suffix
+from tests.serve.lora_utils import DEFAULT_LORA_NAME, DEFAULT_LORA_REPO
+from tests.utils.constants import DynamoPortRange
+from tests.utils.gpu_args import build_gpu_mem_args
+from tests.utils.managed_process import ManagedProcess, check_health_ready
+from tests.utils.payloads import SGLangSpecDecodeMetricsPayload
+from tests.utils.port_utils import (
+    allocate_contiguous_ports,
+    allocate_port,
+    allocate_ports,
+    deallocate_ports,
+)
+
+logger = logging.getLogger(__name__)
+
+MODEL_NAME = "silence09/DeepSeek-R1-Small-2layers"
+
+
+pytestmark = [
+    pytest.mark.router,
+    pytest.mark.sglang,
+]
+# SGLang uses "page_size" instead of "block_size". 64 (not 16) because the
+# TRT-LLM MLA attention backend only supports page sizes 32/64, and
+# dynamo.sglang coerces page_size up to 64 on GPUs where that backend is
+# selected (overrides._mla_backend_page_constraints). A 16-token page here
+# then desyncs the router radix (16) from the worker KV events (64) and every
+# device_blocks assertion sees 0. 64 is honored on every backend, so the
+# router and workers always agree.
+PAGE_SIZE = 64
+
+# Shared SGLang configuration for all tests.
+# Memory is budgeted with the token-cap form (--max-total-tokens +
+# --mem-fraction-static 0.9, see tests/README.md "SGLang KV tokens").
+SGLANG_ARGS: Dict[str, Any] = {
+    "page_size": PAGE_SIZE,
+    "model": MODEL_NAME,
+    "max_total_tokens": 2048,  # matches the requested_sglang_kv_tokens(2048) markers
+    "context_length": 1024,  # Limit context length to reduce KV cache size (equivalent to vLLM's max_model_len)
+    "disable_cuda_graph": True,  # Disable CUDA graphs for faster startup & lower memory (equivalent to vLLM's enforce_eager)
+}
+
+
+class SGLangProcess(ManagedEngineProcessMixin):
+    """Manages SGLang workers using dynamo.sglang (HTTP API + KV events).
+
+    This is a drop-in replacement for MockerProcess that uses real SGLang workers.
+    The key difference: dynamo.sglang automatically handles:
+    - HTTP API serving
+    - KV cache event publishing (ZMQ → NATS bridge)
+    - Integration with dynamo.frontend router
+    """
+
+    def __init__(
+        self,
+        request,
+        sglang_args: Optional[Dict[str, Any]] = None,
+        num_workers: int = 2,
+        single_gpu: bool = False,
+        data_parallel_size: Optional[int] = None,
+        request_plane: str = "tcp",
+        store_backend: str = "etcd",
+        namespace: Optional[str] = None,
+        gpu_start_index: int = 0,
+        disaggregation_mode: Optional[str] = None,
+    ):
+        """Initialize SGLang workers with dynamo integration.
+
+        Args:
+            request: pytest request fixture for log directory
+            sglang_args: Configuration dict with keys:
+                - page_size: KV cache page size (default: 16)
+                - model: Model name/path (default: TinyLlama-1.1B)
+                - mem_fraction_static: Fraction of GPU memory to allocate (optional)
+                - max_total_tokens: Max KV cache tokens; takes precedence over
+                  mem_fraction_static and is emitted with --mem-fraction-static 0.9
+                  (see tests/README.md "SGLang KV tokens")
+                - context_length: Maximum sequence length (optional)
+                - disable_cuda_graph: Disable CUDA graphs (default: False)
+                - extra_args: Additional dynamo.sglang CLI flags (optional)
+                - enable_lora: Enable dynamic LoRA loading (default: False)
+            num_workers: Number of SGLang worker processes
+            single_gpu: If True, all workers share GPU 0
+            data_parallel_size: If set, enables this many data-parallel ranks per worker process.
+            request_plane: Request plane to use ("nats", "tcp"). Defaults to "tcp".
+            store_backend: Storage backend to use ("etcd" or "file"). Defaults to "etcd".
+        """
+        # Generate unique namespace for isolation
+        namespace_suffix = generate_random_suffix()
+        self.namespace = namespace or f"test-namespace-{namespace_suffix}"
+        self.component_name = (
+            "prefill" if disaggregation_mode == "prefill" else "backend"
+        )
+        self.endpoint = f"dyn://{self.namespace}.{self.component_name}.generate"
+        self.num_workers = num_workers
+        self.data_parallel_size = data_parallel_size
+        self.worker_processes = []
+        self.store_backend = store_backend
+
+        # Dynamically allocate unique system and KV event ports to avoid
+        # conflicts in parallel test runs.
+        self._system_ports = allocate_ports(num_workers, DynamoPortRange.ROUTER.value)
+        kv_event_rank_span = data_parallel_size or 1
+        self._kv_event_ports = allocate_contiguous_ports(
+            num_workers, kv_event_rank_span, DynamoPortRange.ROUTER.value
+        )
+        # Forward-pass metrics: SGLang publishes FPM over a per-worker ipc://
+        # socket (path derived from the worker's connection_id), so unlike vLLM
+        # it never binds this port -- the env var only flips the feature on. One
+        # shared value across workers is therefore sufficient (no collision).
+        self._fpm_port = allocate_port(DynamoPortRange.FPM.value)
+        # Pin the torch.distributed rendezvous port per worker: on the non-DP path
+        # SGLang probes and closes a port, so it can be taken before the real bind.
+        self._nccl_ports = [
+            allocate_port(DynamoPortRange.NCCL.value) for _ in range(num_workers)
+        ]
+        request.addfinalizer(
+            lambda: deallocate_ports(
+                self._system_ports
+                + self._kv_event_ports
+                + self._nccl_ports
+                + [self._fpm_port]
+            )
+        )
+
+        if sglang_args is None:
+            sglang_args = {}
+
+        page_size = sglang_args.get("page_size", PAGE_SIZE)
+        model = sglang_args.get("model", MODEL_NAME)
+        mem_fraction_static = sglang_args.get("mem_fraction_static")
+        max_total_tokens = sglang_args.get("max_total_tokens")
+        context_length = sglang_args.get("context_length")
+        disable_cuda_graph = sglang_args.get("disable_cuda_graph", False)
+        extra_args = sglang_args.get("extra_args", ())
+        enable_lora = sglang_args.get("enable_lora", False)
+        # Resolved memory budget, for startup logs (mirrors the command flags).
+        mem_budget = (
+            f"max_total_tokens={max_total_tokens}, mem_frac=0.9"
+            if max_total_tokens is not None
+            else f"mem_frac={mem_fraction_static}"
+        )
+
+        self.model_name = model
+
+        for worker_idx in range(num_workers):
+            # Calculate GPU device for this process
+            if single_gpu:
+                # Force all processes to GPU 0 (for single-GPU testing)
+                gpu_device = str(gpu_start_index)
+            elif data_parallel_size is not None:
+                # Worker sees dp_rank GPUs (each DP rank gets its own GPU)
+                worker_start_gpu = gpu_start_index + worker_idx * data_parallel_size
+                gpu_device = ",".join(
+                    str(i)
+                    for i in range(
+                        worker_start_gpu, worker_start_gpu + data_parallel_size
+                    )
+                )
+            else:
+                # No DP; worker sees one GPU
+                gpu_device = str(gpu_start_index + worker_idx)
+
+            command = [
+                "python3",
+                "-m",
+                "dynamo.sglang",
+                "--model-path",
+                model,
+                "--page-size",
+                str(page_size),
+            ]
+
+            # Disable CUDA graphs for faster startup & lower memory.
+            # sglang 0.5.10+ has piecewise CUDA graphs (separate flag) that
+            # consume ~7 GB during capture — must also be disabled for
+            # multi-worker same-GPU tests to avoid OOM.
+            if disable_cuda_graph:
+                command.append("--disable-cuda-graph")
+                command.append("--disable-piecewise-cuda-graph")
+
+            # Limit VRAM allocation (required for multi-worker on same GPU).
+            # Prefer the token-cap form; see the SGLANG_ARGS comment.
+            if max_total_tokens is not None:
+                command.extend(
+                    [
+                        "--max-total-tokens",
+                        str(max_total_tokens),
+                        "--mem-fraction-static",
+                        "0.9",
+                    ]
+                )
+            elif mem_fraction_static is not None:
+                command.extend(["--mem-fraction-static", str(mem_fraction_static)])
+
+            # Add optional context_length if specified
+            if context_length is not None:
+                command.extend(["--context-length", str(context_length)])
+
+            command.extend(build_gpu_mem_args("build_sglang_gpu_mem_args"))
+
+            if enable_lora:
+                command.extend(
+                    [
+                        "--enable-lora",
+                        "--max-lora-rank",
+                        "64",
+                        "--lora-target-modules",
+                        "all",
+                    ]
+                )
+
+            if disaggregation_mode is not None:
+                command.extend(["--disaggregation-mode", disaggregation_mode])
+                command.extend(["--disaggregation-transfer-backend", "nixl"])
+                # The KV bootstrap server binds to --host (default 127.0.0.1),
+                # but dynamo.sglang advertises the auto-detected local IP to
+                # decode workers, so bind all interfaces like launch/disagg.sh.
+                command.extend(["--host", "0.0.0.0"])
+
+            if data_parallel_size is not None:
+                # Add DP configuration
+                command.extend(
+                    [
+                        "--dp-size",
+                        str(data_parallel_size),
+                        "--tp-size",
+                        str(data_parallel_size),
+                        "--enable-dp-attention",
+                    ]
+                )
+
+            # Add per-worker KV events config for ZMQ publishing. SGLang DP
+            # ranks publish at base_port + dp_rank, so DP tests must reserve a
+            # contiguous port block and pass the block's base port here.
+            kv_events_port = self._kv_event_ports[worker_idx * kv_event_rank_span]
+            kv_events_config = f'{{"publisher":"zmq","topic":"kv-events","endpoint":"tcp://*:{kv_events_port}"}}'
+            command.extend(["--kv-events-config", kv_events_config])
+            command.extend(extra_args)
+
+            nccl_port = self._nccl_ports[worker_idx]
+            command.extend(["--nccl-port", str(nccl_port)])
+
+            # Each SGLang worker needs a unique DYN_SYSTEM_PORT to avoid conflicts.
+            # Ports are dynamically allocated for xdist-safe parallel execution.
+            system_port = self._system_ports[worker_idx]
+
+            env = os.environ.copy()  # Copy parent environment
+            env_vars = {
+                "CUDA_VISIBLE_DEVICES": gpu_device,
+                "DYN_NAMESPACE": self.namespace,
+                "DYN_REQUEST_PLANE": request_plane,
+                "DYN_SYSTEM_PORT": str(system_port),
+                "DYN_FORWARDPASS_METRIC_PORT": str(self._fpm_port),
+                "PYTHONHASHSEED": "0",  # for deterministic event id's
+            }
+            if enable_lora:
+                env_vars["DYN_LORA_ENABLED"] = "true"
+                env_vars["DYN_LORA_PATH"] = os.path.join(
+                    tempfile.gettempdir(), f"dynamo_loras_{self.namespace}"
+                )
+
+            # Add DYN_FILE_KV if using file storage backend
+            if self.store_backend == "file" and "DYN_FILE_KV" in os.environ:
+                env_vars["DYN_FILE_KV"] = os.environ["DYN_FILE_KV"]
+
+            env.update(env_vars)
+
+            # Create managed process for the worker
+            process = ManagedProcess(
+                command=command,
+                env=env,
+                timeout=120,  # Allow time for model loading
+                display_output=True,
+                health_check_ports=[],
+                # Gate each worker on its own /health, which reports ready once
+                # dynamo.sglang registers its health-check payload on generate.
+                health_check_urls=[
+                    (f"http://localhost:{system_port}/health", check_health_ready)
+                ],
+                log_dir=request.node.name,
+                terminate_all_matching_process_names=False,
+            )
+            self.worker_processes.append(process)
+            if data_parallel_size is not None:
+                logger.info(
+                    f"Created {data_parallel_size} DP ranks per worker on GPU(s) {gpu_device} "
+                    f"({mem_budget}, system_port={system_port}, kv_port={kv_events_port}, "
+                    f"nccl_port={nccl_port}) "
+                    f"with endpoint: {self.endpoint}"
+                )
+            else:
+                logger.info(
+                    f"Created SGLang worker {worker_idx} on GPU {gpu_device} "
+                    f"({mem_budget}, system_port={system_port}, kv_port={kv_events_port}, "
+                    f"nccl_port={nccl_port}) "
+                    f"with endpoint: {self.endpoint}"
+                )
+
+    process_name = "SGLang worker"
+    cleanup_name = "SGLang worker resources"
+
+    @property
+    def system_ports(self) -> list[int]:
+        return list(self._system_ports)
+
+
+@pytest.mark.e2e
+@pytest.mark.model(MODEL_NAME)
+@pytest.mark.pre_merge
+@pytest.mark.gpu_1
+@pytest.mark.profiled_vram_gib(12.0)
+@pytest.mark.requested_sglang_kv_tokens(2048)
+@pytest.mark.parametrize("request_plane", ["tcp"], indirect=True)
+@pytest.mark.timeout(270)  # 3x ~89s (sglang gpu_1 log)
+def test_sglang_kv_router_basic(
+    request,
+    runtime_services_dynamic_ports,
+    predownload_models,
+    set_ucx_tls_no_mm,
+    request_plane,
+):
+    run_basic_router_test(
+        engine_process_cls=SGLangProcess,
+        engine_args_name="sglang_args",
+        engine_args=SGLANG_ARGS,
+        num_workers=2,
+        single_gpu=True,
+        request=request,
+        request_plane=request_plane,
+        block_size=PAGE_SIZE,
+        model_name=MODEL_NAME,
+    )
+
+
+@pytest.mark.e2e
+@pytest.mark.model(MODEL_NAME)
+@pytest.mark.pre_merge
+@pytest.mark.gpu_1
+@pytest.mark.profiled_vram_gib(12.0)
+@pytest.mark.requested_sglang_kv_tokens(2048)
+@pytest.mark.timeout(300)
+@pytest.mark.parametrize("request_plane", ["tcp"], indirect=True)
+def test_router_decisions_sglang_multiple_workers(
+    request,
+    runtime_services_dynamic_ports,
+    predownload_models,
+    set_ucx_tls_no_mm,
+    request_plane,
+):
+    run_router_decisions_test(
+        engine_process_cls=SGLangProcess,
+        engine_args_name="sglang_args",
+        engine_args=SGLANG_ARGS,
+        request=request,
+        request_plane=request_plane,
+        model_name=MODEL_NAME,
+        block_size=PAGE_SIZE,
+        component_name="backend",
+        num_workers=2,
+        single_gpu=True,
+        test_dp_rank=False,
+    )
+
+
+LORA_MODEL_NAME = "Qwen/Qwen3-0.6B"
+
+
+@pytest.mark.e2e
+@pytest.mark.model(LORA_MODEL_NAME)
+@pytest.mark.model(DEFAULT_LORA_REPO)
+@pytest.mark.post_merge
+@pytest.mark.gpu_1
+@pytest.mark.profiled_vram_gib(7.0)  # two workers, peak 6.9 GiB on H200
+@pytest.mark.requested_sglang_kv_tokens(2048)
+@pytest.mark.timeout(150)  # 3x ~50s on H200
+@pytest.mark.parametrize("request_plane", ["tcp"], indirect=True)
+def test_router_lora_isolation_sglang(
+    request,
+    runtime_services_dynamic_ports,
+    predownload_models,
+    set_ucx_tls_no_mm,
+    request_plane,
+):
+    """Adapter requests reuse adapter blocks, and base-model requests with the
+    same prompt never match them."""
+    # predownload_models caches the adapter but leaves HF_HUB_OFFLINE set, and
+    # hf:// sources only trust Dynamo's own cache, so load the cached snapshot.
+    lora_dir = snapshot_download(DEFAULT_LORA_REPO, local_files_only=True)
+
+    run_lora_isolation_test(
+        engine_process_cls=SGLangProcess,
+        engine_args_name="sglang_args",
+        engine_args={
+            **SGLANG_ARGS,
+            "model": LORA_MODEL_NAME,
+            "enable_lora": True,
+        },
+        request=request,
+        request_plane=request_plane,
+        model_name=LORA_MODEL_NAME,
+        block_size=PAGE_SIZE,
+        component_name="backend",
+        lora_name=DEFAULT_LORA_NAME,
+        lora_uri=f"file://{lora_dir}",
+    )
+
+
+@pytest.mark.e2e
+@pytest.mark.model(MODEL_NAME)
+@pytest.mark.pre_merge
+@pytest.mark.gpu_1
+@pytest.mark.profiled_vram_gib(12.0)
+@pytest.mark.requested_sglang_kv_tokens(2048)
+@pytest.mark.timeout(300)
+@pytest.mark.parametrize("request_plane", ["tcp"], indirect=True)
+def test_router_cache_salt_isolation_sglang(
+    request,
+    runtime_services_dynamic_ports,
+    predownload_models,
+    set_ucx_tls_no_mm,
+    request_plane,
+):
+    run_cache_salt_isolation_test(
+        engine_process_cls=SGLangProcess,
+        engine_args_name="sglang_args",
+        engine_args=SGLANG_ARGS,
+        request=request,
+        request_plane=request_plane,
+        model_name=MODEL_NAME,
+        block_size=PAGE_SIZE,
+        component_name="backend",
+    )
+
+
+@pytest.mark.e2e
+@pytest.mark.model(MODEL_NAME)
+@pytest.mark.h100
+@pytest.mark.gpu_2
+@pytest.mark.nightly
+@pytest.mark.requested_sglang_kv_tokens(2048)
+@pytest.mark.parametrize("request_plane", ["tcp"], indirect=True)
+@pytest.mark.timeout(600)  # 10 min max (multi-GPU + DP startup variance)
+def test_router_decisions_sglang_dp(
+    request,
+    runtime_services_dynamic_ports,
+    predownload_models,
+    set_ucx_tls_no_mm,
+    request_plane,
+):
+    """Validate KV cache prefix reuse with SGLang by sending progressive requests with overlapping prefixes.
+    Same flow as test_router_decisions_sglang_multiple_workers; force first request to (worker_id, dp_rank=1).
+    Dump events from router and verify:
+        * All but one (worker_id, dp_rank) should have no events (due to prefix reuse)
+        * The (worker_id, dp_rank) with events should have exactly 4 events (one per request)
+        * All events should be on the forced (worker_id, dp_rank=1) (verifying forced routing and prefix reuse)
+    """
+    run_router_decisions_test(
+        engine_process_cls=SGLangProcess,
+        engine_args_name="sglang_args",
+        engine_args=SGLANG_ARGS,
+        request=request,
+        request_plane=request_plane,
+        model_name=MODEL_NAME,
+        block_size=PAGE_SIZE,
+        component_name="backend",
+        num_workers=1,
+        single_gpu=False,
+        test_dp_rank=True,
+        extra_process_kwargs={"data_parallel_size": 2},
+    )
+
+
+@pytest.mark.e2e
+@pytest.mark.model(MODEL_NAME)
+# DeepSeek's fused_topk_deepseek kernel is unsupported on the A10G runners.
+@pytest.mark.h100
+@pytest.mark.gpu_2
+@pytest.mark.nightly
+@pytest.mark.parametrize("request_plane", ["nats"], indirect=True)
+@pytest.mark.timeout(600)
+def test_router_decisions_sglang_disagg(
+    request,
+    runtime_services_dynamic_ports,
+    predownload_models,
+    set_ucx_tls_no_mm,
+    request_plane,
+):
+    """Check KV-aware routing across SGLang prefill and decode workers on H100."""
+    run_disagg_router_decisions_test(
+        engine_process_cls=SGLangProcess,
+        engine_args_name="sglang_args",
+        engine_args=SGLANG_ARGS,
+        request=request,
+        request_plane=request_plane,
+        model_name=MODEL_NAME,
+        block_size=PAGE_SIZE,
+        num_prefill_workers=2,
+        num_decode_workers=1,
+        prefill_process_kwargs={
+            "single_gpu": True,
+            "gpu_start_index": 0,
+            "disaggregation_mode": "prefill",
+        },
+        decode_process_kwargs={
+            "single_gpu": True,
+            "gpu_start_index": 1,
+            "disaggregation_mode": "decode",
+        },
+        test_kwargs={"enable_bootstrap": True},
+    )
+
+
+# EAGLE3 speculative decoding: same pair as launch/agg_spec_decoding.sh, both
+# ungated. An 8B base is needed because the test requires a real EAGLE3 draft
+# that accepts tokens, and there is no smaller ungated base+draft pair. The two
+# prefill workers share GPU0 (peak ~36 GiB), so the test is marked h100 and runs
+# in the nightly sglang-h100-test lane. Like the other gpu_2 tests here it has no
+# profiled_vram_gib, so it runs in that lane's sequential stage.
+EAGLE_MODEL_NAME = "Qwen/Qwen3-8B"
+EAGLE_DRAFT_MODEL_NAME = "Tengyunw/qwen3_8b_eagle3"
+SGLANG_EAGLE_ARGS: Dict[str, Any] = {
+    **SGLANG_ARGS,
+    "model": EAGLE_MODEL_NAME,
+    "extra_args": (
+        "--enable-metrics",
+        "--speculative-algorithm",
+        "EAGLE3",
+        "--speculative-draft-model-path",
+        EAGLE_DRAFT_MODEL_NAME,
+        "--speculative-num-steps",
+        "3",
+        "--speculative-eagle-topk",
+        "1",
+        "--speculative-num-draft-tokens",
+        "4",
+    ),
+}
+
+
+def _assert_decode_workers_speculated(
+    prefill_workers: SGLangProcess, decode_workers: SGLangProcess
+) -> None:
+    """Assert every decode worker ran EAGLE verify steps and accepted draft tokens."""
+    for port in decode_workers._system_ports:
+        response = requests.get(f"http://localhost:{port}/metrics", timeout=10)
+        response.raise_for_status()
+        content = response.text
+        SGLangSpecDecodeMetricsPayload(
+            body={},
+            repeat_count=1,
+            expected_log=[],
+            expected_response=[],
+            min_num_requests=4,
+        ).validate(None, content)
+
+
+@pytest.mark.e2e
+@pytest.mark.model(EAGLE_MODEL_NAME)
+@pytest.mark.model(EAGLE_DRAFT_MODEL_NAME)
+@pytest.mark.h100
+@pytest.mark.gpu_2
+@pytest.mark.nightly
+@pytest.mark.requested_sglang_kv_tokens(2048)
+@pytest.mark.parametrize("request_plane", ["nats"], indirect=True)
+# ~3x ~96s (2x H200, models pre-cached); peak ~36 GiB on the shared prefill GPU.
+@pytest.mark.timeout(300)
+def test_router_decisions_sglang_disagg_eagle(
+    request,
+    runtime_services_dynamic_ports,
+    predownload_models,
+    set_ucx_tls_no_mm,
+    request_plane,
+):
+    """EAGLE3 on both prefill and decode workers, behind the KV router.
+
+    On top of the disagg routing checks, this asserts that:
+        * the router predicts a KV hit on each shared-prefix request, i.e. the
+          prefill worker's EAGLE (bigram) KV event hashes match the router's
+        * the decode worker keeps speculating after the KV and EAGLE state
+          transfer, and accepts draft tokens
+    """
+    run_disagg_router_decisions_test(
+        engine_process_cls=SGLangProcess,
+        engine_args_name="sglang_args",
+        engine_args=SGLANG_EAGLE_ARGS,
+        request=request,
+        request_plane=request_plane,
+        model_name=EAGLE_MODEL_NAME,
+        block_size=PAGE_SIZE,
+        num_prefill_workers=2,
+        num_decode_workers=1,
+        prefill_process_kwargs={
+            "single_gpu": True,
+            "gpu_start_index": 0,
+            "disaggregation_mode": "prefill",
+        },
+        decode_process_kwargs={
+            "single_gpu": True,
+            "gpu_start_index": 1,
+            "disaggregation_mode": "decode",
+        },
+        # Enough decode steps for a stable tokens-per-verify ratio.
+        test_payload={
+            **build_test_payload(EAGLE_MODEL_NAME),
+            "max_tokens": 128,
+            "temperature": 0.0,
+        },
+        # enable_bootstrap=True skips the kv_transfer_estimated_latency_ms > 0
+        # check, which does not hold for SGLang. SGLang disagg always uses the
+        # bootstrap flow:
+        #   1. The router sends the request to a prefill worker.
+        #   2. The prefill worker replies at once with its bootstrap address,
+        #      before prefill has finished.
+        #   3. The router dispatches the request to a decode worker, so
+        #      prefill and decode now run in parallel.
+        #   4. The decode worker pulls the KV cache from the prefill worker and
+        #      emits its first token.
+        #   5. The prefill worker's response stream ends. Only now does the
+        #      router record prefill completion.
+        # The latency is (decode first token time - prefill completion time),
+        # clamped at 0. Steps 4 and 5 race, and when the first token arrives
+        # first the latency is exactly 0, so the > 0 check fails intermittently.
+        test_kwargs={"enable_bootstrap": True, "require_kv_hit": True},
+        post_check=_assert_decode_workers_speculated,
+    )
+
+
+# DYN-2784: fixture setup hangs instead of failing. Worker #2 dies during
+# SGLangProcess launch and KvRouter then blocks forever on
+# min_initial_workers=2; the timeout below cannot fire because the signal is
+# swallowed at a C-level syscall.
+#
+# Skipped outright, because the containment this previously relied on does not
+# hold. The note here used to read "passes reliably in pre_merge/post_merge, so
+# scope the skip to nightly" -- measured over five days that is 82% of nightly
+# runs but also 63% of post_merge, and the runs that do hang burn a whole job:
+# observed hangs of 3659s, 4235s and 6077s, each holding a 12 GiB reservation
+# with three more workers queued behind it, because the VRAM-aware parallel
+# orchestrator has no hard-kill for a child that outlives its declared timeout.
+# That came to roughly 220 runner-hours in five days.
+#
+# skip_in_nightly is kept but is not what makes this safe: it only drops the
+# test from the nightly marker filter, and the hang is not nightly-specific.
+#
+# Re-enable once the launch race is fixed, or once the orchestrator can kill a
+# hung child -- either one alone turns this from a lost job into a normal
+# failure. The scenario itself is worth keeping; it is the hang that is not
+# affordable.
+@pytest.mark.skip(
+    reason="hangs to the job step cap instead of failing; see the note above"
+)
+@pytest.mark.e2e
+@pytest.mark.model(MODEL_NAME)
+@pytest.mark.skip_in_nightly
+@pytest.mark.pre_merge
+@pytest.mark.gpu_1
+@pytest.mark.profiled_vram_gib(12.0)
+@pytest.mark.requested_sglang_kv_tokens(2048)
+@pytest.mark.parametrize("request_plane", ["tcp"], indirect=True)
+@pytest.mark.parametrize("event_plane", ["nats"], indirect=True)
+@pytest.mark.timeout(320)  # 3x ~106s (sglang gpu_1 log)
+def test_sglang_indexers_sync(
+    request,
+    runtime_services_dynamic_ports,
+    predownload_models,
+    set_ucx_tls_no_mm,
+    request_plane,
+    event_plane,
+):
+    run_indexers_sync_test(
+        engine_process_cls=SGLangProcess,
+        engine_args_name="sglang_args",
+        engine_args=SGLANG_ARGS,
+        request=request,
+        runtime_services_dynamic_ports=runtime_services_dynamic_ports,
+        store_backend="etcd",
+        request_plane=request_plane,
+        event_plane=event_plane,
+        block_size=PAGE_SIZE,
+        model_name=MODEL_NAME,
+        num_workers=2,
+    )

@@ -1,0 +1,170 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""
+Custom vLLM MediaConnector that wraps dynamo's ImageLoader.
+
+Register with vLLM by setting VLLM_MEDIA_CONNECTOR=dynamo before starting
+the frontend. The renderer will use dynamo's ImageLoader (with LRU cache +
+in-flight dedup) for all image fetching, eliminating data URI encoding and
+double downloads.
+
+Usage:
+    # Import this module to register the connector, then set the env var:
+    import dynamo.common.multimodal.media_connector  # noqa: F401
+    os.environ["VLLM_MEDIA_CONNECTOR"] = "dynamo"
+"""
+
+import asyncio
+import logging
+from collections.abc import Callable
+from typing import Any
+
+from PIL import Image
+
+from dynamo.common.http import HttpConfigurationError, HttpStatusError, fetch_bytes
+from dynamo.common.http.media_reference import max_media_bytes
+from dynamo.common.http.url_validator import (
+    UrlValidationError,
+    UrlValidationPolicy,
+    check_remote_url_allowed,
+    validate_media_url,
+)
+from dynamo.common.multimodal.image_loader import ImageLoader
+
+logger = logging.getLogger(__name__)
+
+# Download timeout when vLLM passes none, as ImageLoader and AudioLoader use.
+_DEFAULT_FETCH_TIMEOUT_S = 30.0
+
+# Shared ImageLoader singleton — survives across connector instances.
+# The MEDIA_CONNECTOR_REGISTRY creates a new connector per request,
+# so the cache must live outside the connector.
+_shared_image_loader: ImageLoader | None = None
+
+
+def _get_shared_image_loader(
+    to_rgb: Callable[[Image.Image], Image.Image] | None = None,
+) -> ImageLoader:
+    global _shared_image_loader
+    if _shared_image_loader is None:
+        _shared_image_loader = (
+            ImageLoader() if to_rgb is None else ImageLoader(to_rgb=to_rgb)
+        )
+        logger.info(
+            "DynamoMediaConnector: shared ImageLoader initialized (cache_size=%d)",
+            _shared_image_loader._cache_size,
+        )
+    return _shared_image_loader
+
+
+# Lazy registration — only register if vLLM is available.
+try:
+    from urllib3.util import parse_url
+    from vllm.multimodal.image import convert_image_mode, normalize_image
+    from vllm.multimodal.media import MEDIA_CONNECTOR_REGISTRY, MediaConnector
+
+    @MEDIA_CONNECTOR_REGISTRY.register("dynamo")
+    class DynamoMediaConnector(MediaConnector):
+        """MediaConnector that uses dynamo's ImageLoader for image fetching.
+
+        Benefits over the default HTTP connector:
+        - In-memory LRU cache (configurable via DYN_MM_IMAGE_CACHE_SIZE)
+        - In-flight request deduplication (concurrent requests for the same
+          URL share a single fetch task)
+        - Async-native with proper cancellation handling
+        """
+
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self._image_loader = _get_shared_image_loader(
+                lambda image: convert_image_mode(normalize_image(image), "RGB")
+            )
+
+        async def fetch_image_async(
+            self,
+            image_url: str,
+            *,
+            image_mode: str = "RGB",
+        ) -> Image.Image:
+            """Async image fetch via dynamo's ImageLoader with LRU cache."""
+            # ImageLoader bypasses the parent's download, so apply vLLM's
+            # --allowed-media-domains here, as it does for audio and video.
+            url_spec = parse_url(image_url)
+            if url_spec.scheme and url_spec.scheme.lower().startswith("http"):
+                self._assert_url_in_allowed_media_domains(url_spec)
+            try:
+                img = await self._image_loader.load_image(image_url)
+            except (UrlValidationError, HttpStatusError, HttpConfigurationError):
+                # These are deliberate client-error verdicts, not signals that
+                # another loader should retry the same rejected URL.
+                raise
+            except (ValueError, FileNotFoundError, OSError) as exc:
+                # Fall back to parent for unsupported URL schemes or local
+                # file paths that ImageLoader doesn't handle.
+                logger.debug(
+                    "DynamoMediaConnector: falling back to parent for %s (%s)",
+                    image_url[:80],
+                    exc,
+                )
+                return await super().fetch_image_async(image_url, image_mode=image_mode)
+            if image_mode != "RGB" and img.mode != image_mode:
+                img = img.convert(image_mode)
+            return img
+
+        # The sync path, which the renderer does not use, still downloads
+        # through vLLM's own client, so only DYN_MM_ALLOW_REMOTE_URLS is
+        # checked before it.
+        def load_from_url(self, url: str, media_io: Any, **kwargs: Any) -> Any:
+            check_remote_url_allowed(url, UrlValidationPolicy.from_env())
+            return super().load_from_url(url, media_io, **kwargs)
+
+        async def load_from_url_async(
+            self,
+            url: str,
+            media_io: Any,
+            *,
+            fetch_timeout: float | None = None,
+        ) -> Any:
+            """Load audio, video, or an image ImageLoader passed back.
+
+            http(s) media is downloaded with dynamo's fetcher, as AudioLoader
+            does: it applies the DYN_MM_* URL rules to every redirect hop,
+            while vLLM's own client follows redirects without re-checking
+            them. vLLM's media_io still decodes the bytes, so the renderer
+            gets the same objects as from the parent. data: URLs and local
+            files don't touch the network and stay with the parent, once
+            they pass the same checks: DYN_MM_MAX_DATA_URL_MB for a data:
+            URL, as ImageLoader applies to images, and DYN_MM_LOCAL_PATH for
+            a local file.
+            """
+            policy = UrlValidationPolicy.from_env()
+            await validate_media_url(url, policy)
+            if url[:5].lower() == "data:":
+                return await super().load_from_url_async(
+                    url, media_io, fetch_timeout=fetch_timeout
+                )
+            url_spec = parse_url(url)
+            if not (url_spec.scheme and url_spec.scheme.lower() in ("http", "https")):
+                return await super().load_from_url_async(
+                    url, media_io, fetch_timeout=fetch_timeout
+                )
+
+            self._assert_url_in_allowed_media_domains(url_spec)
+            limits = [
+                limit
+                for limit in (media_io.get_max_bytes(), max_media_bytes())
+                if limit
+            ]
+            content = await fetch_bytes(
+                url,
+                fetch_timeout or _DEFAULT_FETCH_TIMEOUT_S,
+                policy=policy,
+                max_bytes=min(limits) if limits else None,
+            )
+            return await asyncio.to_thread(media_io.load_bytes, content)
+
+    logger.debug("Registered 'dynamo' MediaConnector with vLLM")
+
+except ImportError:
+    logger.debug("vLLM not available, skipping DynamoMediaConnector registration")

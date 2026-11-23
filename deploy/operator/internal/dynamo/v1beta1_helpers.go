@@ -1,0 +1,601 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+package dynamo
+
+import (
+	"encoding/json"
+	"fmt"
+	"maps"
+
+	v1alpha1 "github.com/ai-dynamo/dynamo/deploy/operator/api/v1alpha1"
+	"github.com/ai-dynamo/dynamo/deploy/operator/api/v1beta1"
+	commonconsts "github.com/ai-dynamo/dynamo/deploy/operator/internal/consts"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
+	"k8s.io/apimachinery/pkg/util/validation/field"
+)
+
+// ComponentPodTemplates returns every authored complete PodTemplate source.
+// A valid component has either the component template or role templates, never
+// both. The broader result keeps dependency discovery complete for invalid
+// objects observed before admission is active.
+func ComponentPodTemplates(component *v1beta1.DynamoComponentDeploymentSharedSpec) []*corev1.PodTemplateSpec {
+	if component == nil {
+		return nil
+	}
+	templates := make([]*corev1.PodTemplateSpec, 0, 1+len(component.Roles))
+	if component.PodTemplate != nil {
+		templates = append(templates, component.PodTemplate)
+	}
+	for i := range component.Roles {
+		if component.Roles[i].PodTemplate != nil {
+			templates = append(templates, component.Roles[i].PodTemplate)
+		}
+	}
+	return templates
+}
+
+// HasRolePodTemplates reports whether at least one authored role defines a
+// complete PodTemplate source.
+func HasRolePodTemplates(component *v1beta1.DynamoComponentDeploymentSharedSpec) bool {
+	if component == nil {
+		return false
+	}
+	for i := range component.Roles {
+		if component.Roles[i].PodTemplate != nil {
+			return true
+		}
+	}
+	return false
+}
+
+// HasCompleteMultinodeRolePodTemplates reports whether both leader and worker
+// roles declare a PodTemplate. A nil component has no role templates. Template
+// contents and duplicate role names are checked by the shared role validation.
+func HasCompleteMultinodeRolePodTemplates(component *v1beta1.DynamoComponentDeploymentSharedSpec) bool {
+	if component == nil {
+		return false
+	}
+
+	// Check each required role independently of the authored role order.
+	var leader, worker bool
+	for i := range component.Roles {
+		role := &component.Roles[i]
+		if role.PodTemplate == nil {
+			continue
+		}
+		switch role.Name {
+		case v1beta1.ComponentRoleLeader:
+			leader = true
+		case v1beta1.ComponentRoleWorker:
+			worker = true
+		}
+	}
+	return leader && worker
+}
+
+// EffectiveComponentForRole returns an independently owned component whose
+// component-level PodTemplate is the complete source selected for role.
+// component must not be nil. Invalid or incomplete template-source modes are
+// returned as errors rather than repaired during lowering.
+func EffectiveComponentForRole(
+	component *v1beta1.DynamoComponentDeploymentSharedSpec,
+	role Role,
+) (*v1beta1.DynamoComponentDeploymentSharedSpec, error) {
+	if component == nil {
+		return nil, fmt.Errorf("component is nil")
+	}
+
+	// Global-template mode uses the same complete source for every role.
+	if component.PodTemplate != nil || !HasRolePodTemplates(component) {
+		return component.DeepCopy(), nil
+	}
+
+	// Role-template mode selects by semantic role name, not generated workload name.
+	for i := range component.Roles {
+		roleSpec := &component.Roles[i]
+		if roleSpec.Name != string(role) {
+			continue
+		}
+		if roleSpec.PodTemplate == nil {
+			return nil, fmt.Errorf("role %q has no podTemplate", role)
+		}
+		effective := component.DeepCopy()
+		effective.PodTemplate = roleSpec.PodTemplate.DeepCopy()
+		effective.Roles = nil
+		return effective, nil
+	}
+	return nil, fmt.Errorf("role %q has no complete podTemplate source", role)
+}
+
+// ComponentsByName returns the graph deployment components indexed by their
+// stable v1beta1 component name.
+func ComponentsByName(dgd *v1beta1.DynamoGraphDeployment) map[string]*v1beta1.DynamoComponentDeploymentSharedSpec {
+	if dgd == nil {
+		return nil
+	}
+	components := make(map[string]*v1beta1.DynamoComponentDeploymentSharedSpec, len(dgd.Spec.Components))
+	for i := range dgd.Spec.Components {
+		component := &dgd.Spec.Components[i]
+		components[component.ComponentName] = component
+	}
+	return components
+}
+
+// GetPodTemplateAnnotations returns the component pod-template annotations, if
+// a pod template is present.
+func GetPodTemplateAnnotations(component *v1beta1.DynamoComponentDeploymentSharedSpec) map[string]string {
+	if component == nil || component.PodTemplate == nil {
+		return nil
+	}
+	return component.PodTemplate.Annotations
+}
+
+// GetPodTemplateLabels returns the component pod-template labels, if a pod
+// template is present.
+func GetPodTemplateLabels(component *v1beta1.DynamoComponentDeploymentSharedSpec) map[string]string {
+	if component == nil || component.PodTemplate == nil {
+		return nil
+	}
+	return component.PodTemplate.Labels
+}
+
+func ensurePodTemplate(component *v1beta1.DynamoComponentDeploymentSharedSpec) *corev1.PodTemplateSpec {
+	if component.PodTemplate == nil {
+		component.PodTemplate = &corev1.PodTemplateSpec{}
+	}
+	if component.PodTemplate.Labels == nil {
+		component.PodTemplate.Labels = map[string]string{}
+	}
+	if component.PodTemplate.Annotations == nil {
+		component.PodTemplate.Annotations = map[string]string{}
+	}
+	return component.PodTemplate
+}
+
+func ensureMainContainer(podTemplate *corev1.PodTemplateSpec) *corev1.Container {
+	for i := range podTemplate.Spec.Containers {
+		if podTemplate.Spec.Containers[i].Name == commonconsts.MainContainerName {
+			return &podTemplate.Spec.Containers[i]
+		}
+	}
+	podTemplate.Spec.Containers = append([]corev1.Container{{Name: commonconsts.MainContainerName}}, podTemplate.Spec.Containers...)
+	return &podTemplate.Spec.Containers[0]
+}
+
+// GetMainContainer returns the well-known main container from the component pod
+// template, if one exists.
+func GetMainContainer(component *v1beta1.DynamoComponentDeploymentSharedSpec) *corev1.Container {
+	if component == nil || component.PodTemplate == nil {
+		return nil
+	}
+	return GetMainContainerFromPodSpec(&component.PodTemplate.Spec)
+}
+
+// GetMainContainerFromPodSpec returns main, or nil for an absent PodSpec or container.
+func GetMainContainerFromPodSpec(podSpec *corev1.PodSpec) *corev1.Container {
+	if podSpec == nil {
+		return nil
+	}
+	for i := range podSpec.Containers {
+		if podSpec.Containers[i].Name == commonconsts.MainContainerName {
+			return &podSpec.Containers[i]
+		}
+	}
+	return nil
+}
+
+// GetDynamoSidecar returns the init container named runtime, or nil when absent.
+// A nil component or pod template has no sidecar. Presence selects sidecar mode;
+// admission validates its image and restart policy separately.
+func GetDynamoSidecar(component *v1beta1.DynamoComponentDeploymentSharedSpec) *corev1.Container {
+	if component == nil || component.PodTemplate == nil {
+		return nil
+	}
+	return findRuntimeInitContainer(&component.PodTemplate.Spec)
+}
+
+// GetComponentDynamoSidecar returns the component's runtime declaration, including
+// the leader in role-template mode. It does not imply a sidecar runs in every Pod.
+// A nil component has no sidecar.
+func GetComponentDynamoSidecar(component *v1beta1.DynamoComponentDeploymentSharedSpec) *corev1.Container {
+	if runtime := GetDynamoSidecar(component); runtime != nil {
+		return runtime
+	}
+	if component != nil {
+		for i := range component.Roles {
+			role := &component.Roles[i]
+			if role.Name == v1beta1.ComponentRoleLeader && role.PodTemplate != nil {
+				return findRuntimeInitContainer(&role.PodTemplate.Spec)
+			}
+		}
+	}
+	return nil
+}
+
+// GetDynamoContainer returns the container hosting the Dynamo runtime, or nil
+// when its template entry is absent. A nil component is treated as absent.
+func GetDynamoContainer(component *v1beta1.DynamoComponentDeploymentSharedSpec) *corev1.Container {
+	if runtime := GetDynamoSidecar(component); runtime != nil {
+		return runtime
+	}
+	return GetMainContainer(component)
+}
+
+// GetMainContainerResources returns the main container resources, or an empty
+// resource requirements struct when no main container exists.
+func GetMainContainerResources(component *v1beta1.DynamoComponentDeploymentSharedSpec) corev1.ResourceRequirements {
+	if main := GetMainContainer(component); main != nil {
+		return main.Resources
+	}
+	return corev1.ResourceRequirements{}
+}
+
+// GetDCDKubeLabels returns the labels rendered onto Kubernetes workloads for a
+// DCD before controller-specific role labels are added.
+func GetDCDKubeLabels(dcd *v1beta1.DynamoComponentDeployment) map[string]string {
+	if dcd == nil {
+		return map[string]string{}
+	}
+	return GetDCDKubeLabelsForComponent(dcd, &dcd.Spec.DynamoComponentDeploymentSharedSpec)
+}
+
+// GetDCDKubeLabelsForComponent returns workload labels using component as the
+// selected PodTemplate metadata source.
+func GetDCDKubeLabelsForComponent(
+	dcd *v1beta1.DynamoComponentDeployment,
+	component *v1beta1.DynamoComponentDeploymentSharedSpec,
+) map[string]string {
+	labels := map[string]string{}
+	if dcd == nil {
+		return labels
+	}
+
+	objectLabels := dcd.GetLabels()
+	maps.Copy(labels, objectLabels)
+	maps.Copy(labels, GetDCDPreservedAlphaLabels(dcd))
+	maps.Copy(labels, GetPodTemplateLabels(component))
+	AddBaseModelLabel(labels, dcd.Spec.ModelRef)
+	if subComponentType := GetDCDSubComponentType(dcd); subComponentType != "" {
+		labels[commonconsts.KubeLabelDynamoSubComponentType] = subComponentType
+	}
+	if componentName := GetDCDComponentName(dcd); componentName != "" {
+		labels[commonconsts.KubeLabelDynamoComponent] = componentName
+	}
+	if dynamoNamespace := GetDCDDynamoNamespace(dcd); dynamoNamespace != "" {
+		labels[commonconsts.KubeLabelDynamoNamespace] = dynamoNamespace
+	}
+	for _, key := range []string{
+		commonconsts.KubeLabelDynamoComponent,
+		commonconsts.KubeLabelDynamoNamespace,
+		commonconsts.KubeLabelDynamoGraphDeploymentName,
+		commonconsts.KubeLabelDynamoWorkerHash,
+		commonconsts.KubeLabelDynamoComponentClass,
+	} {
+		if value := objectLabels[key]; value != "" {
+			labels[key] = value
+		}
+	}
+	return labels
+}
+
+// GetDCDKubeAnnotations returns the annotations rendered onto Kubernetes
+// workloads for a DCD.
+func GetDCDKubeAnnotations(dcd *v1beta1.DynamoComponentDeployment) map[string]string {
+	if dcd == nil {
+		return map[string]string{}
+	}
+	return GetDCDKubeAnnotationsForComponent(dcd, &dcd.Spec.DynamoComponentDeploymentSharedSpec)
+}
+
+// GetDCDKubeAnnotationsForComponent returns workload annotations using
+// component as the selected PodTemplate metadata source.
+func GetDCDKubeAnnotationsForComponent(
+	dcd *v1beta1.DynamoComponentDeployment,
+	component *v1beta1.DynamoComponentDeploymentSharedSpec,
+) map[string]string {
+	annotations := map[string]string{}
+	if dcd == nil {
+		return annotations
+	}
+
+	maps.Copy(annotations, GetDCDPreservedAlphaAnnotations(dcd))
+	maps.Copy(annotations, GetPodTemplateAnnotations(component))
+	AddBaseModelAnnotation(annotations, dcd.Spec.ModelRef)
+	delete(annotations, commonconsts.KubeAnnotationDynamoOperatorOriginVersion)
+	for _, annotationKey := range commonconsts.KubeTopologySourceAnnotationKeys() {
+		delete(annotations, annotationKey)
+	}
+
+	// Propagate topology metadata from DCD metadata to pods so the topology
+	// label controller can discover which node labels to copy.
+	for _, annotationKey := range commonconsts.KubeTopologySourceAnnotationKeys() {
+		if v := dcd.Annotations[annotationKey]; v != "" {
+			annotations[annotationKey] = v
+		}
+	}
+	if v := dcd.Annotations[commonconsts.KubeAnnotationTopologyClusterTopologyName]; v != "" {
+		annotations[commonconsts.KubeAnnotationTopologyClusterTopologyName] = v
+	}
+
+	return annotations
+}
+
+// GetGPUMemoryService returns the component GPU memory service config from the
+// v1beta1 experimental block.
+func GetGPUMemoryService(component *v1beta1.DynamoComponentDeploymentSharedSpec) *v1beta1.GPUMemoryServiceSpec {
+	if component == nil || component.Experimental == nil {
+		return nil
+	}
+	return component.Experimental.GPUMemoryService
+}
+
+// GetCheckpoint returns the component checkpoint config from the v1beta1
+// experimental block.
+func GetCheckpoint(component *v1beta1.DynamoComponentDeploymentSharedSpec) *v1beta1.ComponentCheckpointConfig {
+	if component == nil || component.Experimental == nil {
+		return nil
+	}
+	if checkpoint := component.Experimental.Checkpoint; checkpoint != nil && checkpoint.Enabled {
+		return checkpoint
+	}
+	return nil
+}
+
+// ToAlphaCheckpointConfig converts a v1beta1 checkpoint config into the
+// controller's v1alpha1 compatibility shape.
+func ToAlphaCheckpointConfig(src *v1beta1.ComponentCheckpointConfig) *v1alpha1.ServiceCheckpointConfig {
+	if src == nil {
+		return nil
+	}
+	dst := &v1alpha1.ServiceCheckpointConfig{}
+	v1alpha1.ConvertToServiceCheckpointConfig(src, dst)
+	return dst
+}
+
+// ToBetaSharedMemorySize converts the v1alpha1 shared-memory compatibility
+// shape into the v1beta1 scalar field.
+func ToBetaSharedMemorySize(src *v1alpha1.SharedMemorySpec) *resource.Quantity {
+	if src == nil || (!src.Disabled && src.Size.IsZero()) {
+		return nil
+	}
+	dst := &resource.Quantity{}
+	v1alpha1.ConvertFromSharedMemorySpec(src, dst)
+	return dst
+}
+
+// GetDCDComponentName returns the stable component identity for a standalone
+// DCD, including any alpha compatibility value restored by API conversion.
+func GetDCDComponentName(dcd *v1beta1.DynamoComponentDeployment) string {
+	if dcd == nil {
+		return ""
+	}
+	if dcd.Spec.ComponentName != "" {
+		return dcd.Spec.ComponentName
+	}
+	if dcd.Labels != nil {
+		if componentName := dcd.Labels[commonconsts.KubeLabelDynamoComponent]; componentName != "" {
+			return componentName
+		}
+	}
+	if spec := getDCDAlphaSharedSpec(dcd); spec != nil && spec.ServiceName != "" {
+		return spec.ServiceName
+	}
+	return dcd.Name
+}
+
+// GetDCDDynamoNamespace returns the Dynamo namespace for a standalone DCD,
+// including any alpha compatibility value restored by API conversion.
+func GetDCDDynamoNamespace(dcd *v1beta1.DynamoComponentDeployment) string {
+	if dcd == nil {
+		return ""
+	}
+	if spec := getDCDAlphaSharedSpec(dcd); spec != nil {
+		if spec.DynamoNamespace != nil {
+			return *spec.DynamoNamespace
+		}
+	}
+	if dcd.Labels != nil {
+		if dynamoNamespace := dcd.Labels[commonconsts.KubeLabelDynamoNamespace]; dynamoNamespace != "" {
+			return dynamoNamespace
+		}
+	}
+	parentName := dcd.GetParentGraphDeploymentName()
+	if parentName == "" && dcd.Labels != nil {
+		parentName = dcd.Labels[commonconsts.KubeLabelDynamoGraphDeploymentName]
+	}
+	if parentName == "" {
+		parentName = dcd.Name
+	}
+	return v1beta1.ComputeDynamoNamespace(dcd.Spec.GlobalDynamoNamespace, dcd.GetNamespace(), parentName)
+}
+
+// ComponentRuntimeNamespace returns the effective Dynamo runtime namespace for a
+// component. Worker-class components append their active worker hash suffix.
+func ComponentRuntimeNamespace(dynamoNamespace string, componentType string, workerHashSuffix string) string {
+	if dynamoNamespace == "" {
+		return ""
+	}
+	if IsWorkerComponent(componentType) && workerHashSuffix != "" {
+		return dynamoNamespace + "-" + workerHashSuffix
+	}
+	return dynamoNamespace
+}
+
+// GetDCDEffectiveWorkerHash returns the worker hash rendered into worker pod
+// templates for this DCD. A worker-hash label on the DCD metadata takes
+// precedence over one on the DCD pod template.
+func GetDCDEffectiveWorkerHash(dcd *v1beta1.DynamoComponentDeployment) string {
+	if dcd == nil || !IsWorkerComponent(string(dcd.Spec.ComponentType)) {
+		return ""
+	}
+	if workerHash := dcd.GetLabels()[commonconsts.KubeLabelDynamoWorkerHash]; workerHash != "" {
+		return workerHash
+	}
+	labels := GetPodTemplateLabels(&dcd.Spec.DynamoComponentDeploymentSharedSpec)
+	return labels[commonconsts.KubeLabelDynamoWorkerHash]
+}
+
+// GetDCDRuntimeNamespace returns the effective Dynamo runtime namespace used by
+// pods generated for this DCD. It uses the same effective worker hash source as
+// pod rendering, which may come from DCD metadata or the pod template.
+func GetDCDRuntimeNamespace(dcd *v1beta1.DynamoComponentDeployment) string {
+	if dcd == nil {
+		return ""
+	}
+	return ComponentRuntimeNamespace(
+		GetDCDDynamoNamespace(dcd),
+		string(dcd.Spec.ComponentType),
+		GetDCDEffectiveWorkerHash(dcd),
+	)
+}
+
+// GetDCDSubComponentType returns the alpha subcomponent type restored by API
+// conversion, when one was preserved.
+func GetDCDSubComponentType(dcd *v1beta1.DynamoComponentDeployment) string {
+	if dcd == nil {
+		return ""
+	}
+	if spec := getDCDAlphaSharedSpec(dcd); spec != nil {
+		return spec.SubComponentType
+	}
+	return ""
+}
+
+// GetDCDWorkloadComponentType returns the component type that existing
+// Kubernetes workloads should be rendered with. Converted v1alpha1 DCDs for
+// disaggregated workers preserve the old selector contract:
+// component-type=worker plus sub-component-type=prefill/decode.
+func GetDCDWorkloadComponentType(dcd *v1beta1.DynamoComponentDeployment) string {
+	if legacyType := legacyAlphaWorkloadComponentType(dcd); legacyType != "" {
+		return legacyType
+	}
+	if dcd == nil {
+		return ""
+	}
+	return string(dcd.Spec.ComponentType)
+}
+
+func legacyAlphaWorkloadComponentType(dcd *v1beta1.DynamoComponentDeployment) string {
+	if dcd == nil || dcd.Labels == nil {
+		return ""
+	}
+	labels := dcd.Labels
+	if labels[commonconsts.KubeLabelDynamoGraphDeploymentName] == "" ||
+		labels[commonconsts.KubeLabelDynamoWorkerHash] == "" {
+		return ""
+	}
+	legacyType := labels[commonconsts.KubeLabelDynamoComponentType]
+	specType := string(dcd.Spec.ComponentType)
+	if legacyType != commonconsts.ComponentTypeWorker {
+		return ""
+	}
+	if specType != commonconsts.ComponentTypePrefill && specType != commonconsts.ComponentTypeDecode {
+		return ""
+	}
+	if subComponentType := labels[commonconsts.KubeLabelDynamoSubComponentType]; subComponentType != "" && subComponentType != specType {
+		return ""
+	}
+	return legacyType
+}
+
+// GetDCDPreservedAlphaAnnotations returns alpha compatibility annotations
+// restored by API conversion.
+func GetDCDPreservedAlphaAnnotations(dcd *v1beta1.DynamoComponentDeployment) map[string]string {
+	if spec := getDCDAlphaSharedSpec(dcd); spec != nil {
+		return spec.Annotations
+	}
+	return nil
+}
+
+// GetDCDPreservedAlphaLabels returns alpha compatibility labels restored by
+// API conversion.
+func GetDCDPreservedAlphaLabels(dcd *v1beta1.DynamoComponentDeployment) map[string]string {
+	if spec := getDCDAlphaSharedSpec(dcd); spec != nil {
+		return spec.Labels
+	}
+	return nil
+}
+
+// GetDCDPreservedAlphaIngressSpec returns an alpha ingress compatibility shape
+// restored by API conversion.
+func GetDCDPreservedAlphaIngressSpec(dcd *v1beta1.DynamoComponentDeployment) (IngressSpec, bool, error) {
+	if dcd == nil {
+		return IngressSpec{}, false, nil
+	}
+	alpha, err := convertDCDToAlpha(dcd)
+	if err != nil {
+		return IngressSpec{}, false, err
+	}
+	if alpha == nil || alpha.Spec.Ingress == nil {
+		return IngressSpec{}, false, nil
+	}
+	data, err := json.Marshal(alpha.Spec.Ingress)
+	if err != nil {
+		return IngressSpec{}, false, err
+	}
+	var ingressSpec IngressSpec
+	if err := json.Unmarshal(data, &ingressSpec); err != nil {
+		return IngressSpec{}, false, err
+	}
+	return ingressSpec, true, nil
+}
+
+func getDCDAlphaSharedSpec(dcd *v1beta1.DynamoComponentDeployment) *v1alpha1.DynamoComponentDeploymentSharedSpec {
+	alpha, err := convertDCDToAlpha(dcd)
+	if err != nil || alpha == nil {
+		return nil
+	}
+	return &alpha.Spec.DynamoComponentDeploymentSharedSpec
+}
+
+func convertDCDToAlpha(dcd *v1beta1.DynamoComponentDeployment) (*v1alpha1.DynamoComponentDeployment, error) {
+	if dcd == nil {
+		return nil, nil
+	}
+	alpha := &v1alpha1.DynamoComponentDeployment{}
+	if err := alpha.ConvertFrom(dcd); err != nil {
+		return nil, err
+	}
+	return alpha.DeepCopy(), nil
+}
+
+func mergeLowPriorityMetadata(dst, src map[string]string) map[string]string {
+	if len(src) == 0 {
+		return dst
+	}
+	if dst == nil {
+		dst = map[string]string{}
+	}
+	for k, v := range src {
+		if _, exists := dst[k]; !exists {
+			dst[k] = v
+		}
+	}
+	return dst
+}
+
+// lowerComponentForRole validates sidecar declarations before selecting a role.
+// It preserves component-wide mode for native workers that have no runtime container.
+// component must not be nil. The returned component is an independent copy.
+func lowerComponentForRole(component *v1beta1.DynamoComponentDeploymentSharedSpec, role Role) (*v1beta1.DynamoComponentDeploymentSharedSpec, roleLaunchOwnership, bool, error) {
+	// Validate the authored component while both role declarations are available.
+	if errs := ValidateComponentSidecarConfiguration(component, field.NewPath("spec")); len(errs) > 0 {
+		return nil, roleLaunchOwnedByOperator, false, errs.ToAggregate()
+	}
+
+	// Select launch ownership and sidecar mode before removing the other role.
+	ownership := roleLaunchOwnedByOperator
+	if HasRolePodTemplates(component) {
+		ownership = roleLaunchOwnedByPodTemplate
+	}
+	nativeSidecar := GetComponentDynamoSidecar(component) != nil
+	effective, err := EffectiveComponentForRole(component, role)
+	if err != nil {
+		return nil, ownership, nativeSidecar, fmt.Errorf("failed to resolve component role %q: %w", role, err)
+	}
+	return effective, ownership, nativeSidecar, nil
+}

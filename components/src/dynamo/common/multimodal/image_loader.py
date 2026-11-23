@@ -1,0 +1,737 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+import asyncio
+import errno
+import hashlib
+import logging
+import os
+from collections import OrderedDict
+from collections.abc import Callable, Mapping
+from io import BytesIO
+from typing import Any, Coroutine, Dict, Final, List, Literal, overload
+from urllib.parse import urlsplit
+
+from PIL import Image
+
+from dynamo.common.constants import IMAGE_FETCH_ERROR_MESSAGES, UUID_ONLY_VARIANT_KEY
+from dynamo.common.utils import nvtx_utils as _nvtx
+from dynamo.common.utils.runtime import run_async
+
+from ..http import (
+    HttpConnectionError,
+    HttpError,
+    HttpStatusError,
+    HttpTimeoutError,
+    fetch_bytes,
+)
+from ..http.media_reference import max_media_bytes
+from ..http.url_validator import (
+    MediaSizeError,
+    UrlValidationError,
+    UrlValidationPolicy,
+    describe_media_source,
+    validate_media_url,
+)
+from .media_source import decode_data_uri
+from .shared_image_cache import SharedImageCache, SharedImageCacheStats
+
+logger = logging.getLogger(__name__)
+
+# Constants for multimodal data variants
+URL_VARIANT_KEY: Final = "Url"
+DECODED_VARIANT_KEY: Final = "Decoded"
+IMAGE_CACHE_SCOPE_KEY: Final = "image_cache_scope"
+IMAGE_CACHE_SESSION_SCOPED_ENV: Final = "DYN_MM_IMAGE_CACHE_SESSION_SCOPED"
+
+
+# Pillow reports a codec allocation failure as an OSError without errno.
+_PILLOW_CODEC_OOM_MESSAGE: Final = "out of memory when reading image file"
+
+
+def _is_host_resource_error(e: OSError) -> bool:
+    """True when a decode OSError comes from host resource exhaustion rather
+    than from the image bytes."""
+    if e.errno in (errno.EMFILE, errno.ENFILE, errno.ENOMEM):
+        return True
+    return e.errno is None and _PILLOW_CODEC_OOM_MESSAGE in str(e)
+
+
+def image_cache_scope_from_request(request: Mapping[str, Any]) -> str | None:
+    """Return a non-empty frontend-derived image-cache scope, if present."""
+    scope = request.get(IMAGE_CACHE_SCOPE_KEY)
+    if not isinstance(scope, str):
+        return None
+    scope = scope.strip()
+    return scope or None
+
+
+def image_cache_session_scoped_from_env() -> bool:
+    """Return whether multimodal caches must be partitioned by request scope."""
+    value = os.environ.get(IMAGE_CACHE_SESSION_SCOPED_ENV, "0")
+    if value not in ("0", "1"):
+        raise ValueError(
+            f"{IMAGE_CACHE_SESSION_SCOPED_ENV} must be '0' or '1', got {value!r}"
+        )
+    return value == "1"
+
+
+def scope_image_cache_key(
+    cache_key: str,
+    cache_scope: str | None,
+    *,
+    session_scoped_cache: bool,
+) -> str | None:
+    """Apply the common session-scope policy to a multimodal cache key.
+
+    When session scoping is disabled, the original key remains stable. When it
+    is enabled, a valid scope partitions the key and a missing scope returns
+    ``None`` so the caller bypasses its cache.
+    """
+    if not session_scoped_cache:
+        return cache_key
+    if cache_scope is None or not cache_scope.strip():
+        return None
+    scope_digest = hashlib.sha256(cache_scope.strip().encode("utf-8")).hexdigest()
+    return f"{scope_digest}:{cache_key}"
+
+
+def _normalize_http_url_key(normalized_url: str) -> str:
+    """Normalize only URL components that are case-insensitive at the origin."""
+
+    parsed_url = urlsplit(normalized_url)
+    userinfo, at, hostport = parsed_url.netloc.rpartition("@")
+    if hostport.startswith("["):
+        closing_bracket = hostport.find("]")
+        if closing_bracket != -1:
+            host = hostport[: closing_bracket + 1]
+            port = hostport[closing_bracket + 1 :]
+            zone_marker = host.find("%")
+            if zone_marker == -1:
+                host = host.lower()
+            else:
+                host = host[:zone_marker].lower() + host[zone_marker:]
+            hostport = host + port
+        else:
+            hostport = hostport.lower()
+    else:
+        hostport = hostport.lower()
+    return parsed_url._replace(
+        scheme=parsed_url.scheme.lower(),
+        netloc=f"{userinfo}{at}{hostport}",
+        fragment="",
+    ).geturl()
+
+
+def _create_nixl_connector() -> Any:
+    try:
+        import dynamo.nixl_connect as nixl_connect
+    except ImportError as exc:
+        raise RuntimeError(
+            "NIXL is required for frontend image decoding; install "
+            "dynamo.nixl_connect to enable decoded image transfers."
+        ) from exc
+
+    return nixl_connect.Connector()
+
+
+async def read_decoded_media_via_nixl(*args: Any, **kwargs: Any) -> Any:
+    try:
+        from dynamo.common.utils.media_nixl import (
+            read_decoded_media_via_nixl as _read_decoded_media_via_nixl,
+        )
+    except ImportError as exc:
+        raise RuntimeError(
+            "NIXL media utilities are required for frontend image decoding."
+        ) from exc
+
+    return await _read_decoded_media_via_nixl(*args, **kwargs)
+
+
+def _pillow_rgb(image: Image.Image) -> Image.Image:
+    return image.convert("RGB")
+
+
+class ImageLoader:
+    CACHE_SIZE_MAXIMUM = int(os.environ.get("DYN_MM_IMAGE_CACHE_SIZE", "8"))
+
+    def __init__(
+        self,
+        cache_size: int = CACHE_SIZE_MAXIMUM,
+        http_timeout: float = 30.0,
+        enable_frontend_decoding: bool = False,
+        url_policy: UrlValidationPolicy | None = None,
+        max_bytes: int | None = None,
+        session_scoped_cache: bool | None = None,
+        max_pixels: int | None = None,
+        to_rgb: Callable[[Image.Image], Image.Image] = _pillow_rgb,
+    ):
+        """
+        Initialize the ImageLoader with caching, HTTP settings, and optional NIXL config for
+        receiving frontend decoding.
+
+        Args:
+            cache_size: Maximum number of images to store in the in-memory LRU cache.
+                Zero or less disables caching. Defaults to CACHE_SIZE_MAXIMUM.
+            http_timeout: Timeout in seconds for HTTP requests when fetching remote images.
+                Defaults to 30.0 seconds.
+            enable_frontend_decoding: If True, enables NIXL RDMA for transferring
+                decoded images directly from frontend memory, bypassing standard
+                network transport. Defaults to False.
+            url_policy: Policy for validating URLs. Defaults to UrlValidationPolicy.from_env().
+            max_bytes: Maximum remote or inline image size in bytes. When omitted,
+                resolve DYN_MM_MAX_FILE_SIZE_MB for each request.
+            session_scoped_cache: Include a caller-provided cache scope in local,
+                in-flight, and shared-cache keys. ``None`` (default) reads
+                DYN_MM_IMAGE_CACHE_SESSION_SCOPED (default off). When enabled,
+                HTTP loads without a scope bypass all image caches.
+            max_pixels: Optional per-image pixel limit, checked before RGB decode.
+            to_rgb: Converts a decoded image to RGB. The default drops alpha, as
+                Pillow's ``convert("RGB")`` does. A backend whose own loader treats
+                transparency differently passes that conversion. It must return an
+                RGB image and be safe to call from a worker thread. Frontend-decoded
+                arrays that are already RGB skip it.
+        """
+        self._http_timeout = http_timeout
+        self._cache_size = cache_size
+        self._configured_max_bytes = max_bytes
+        if max_pixels is not None and (
+            isinstance(max_pixels, bool)
+            or not isinstance(max_pixels, int)
+            or max_pixels < 1
+        ):
+            raise ValueError("max_pixels must be a positive integer")
+        self._max_pixels = max_pixels
+        self._to_rgb = to_rgb
+        if session_scoped_cache is None:
+            session_scoped_cache = image_cache_session_scoped_from_env()
+        self._session_scoped_cache = session_scoped_cache
+        self._image_cache: OrderedDict[str, Image.Image] = OrderedDict()
+        self._inflight: dict[str, asyncio.Task[Image.Image]] = {}
+        self._shared_image_cache = SharedImageCache.from_env()
+        self._enable_frontend_decoding = enable_frontend_decoding
+        self._url_policy = url_policy or UrlValidationPolicy.from_env()
+        self._nixl_connector = None
+        if self._enable_frontend_decoding:
+            self._nixl_connector = _create_nixl_connector()
+            run_async(self._nixl_connector.warmup)
+
+    def _max_bytes(self) -> int:
+        if self._configured_max_bytes is not None:
+            return self._configured_max_bytes
+        return max_media_bytes()
+
+    @property
+    def cache_entries(self) -> int:
+        """Current number of cached images (read by metrics export)."""
+        return len(self._image_cache)
+
+    @property
+    def session_scoped_cache(self) -> bool:
+        """Whether all multimodal cache keys require a request scope."""
+        return self._session_scoped_cache
+
+    @property
+    def shared_image_cache_stats(self) -> SharedImageCacheStats | None:
+        """Latency samples for the optional shared encoded-image cache."""
+        if self._shared_image_cache is None:
+            return None
+        return self._shared_image_cache.stats
+
+    def _cache_key(
+        self, normalized_url: str, cache_scope: str | None = None
+    ) -> str | None:
+        """Return the LRU/inflight/shared-cache key for a validated http(s) URL.
+
+        ``None`` means the caller must bypass all image caches: session
+        scoping is enabled but no valid scope was provided for this load.
+        """
+        url_key = _normalize_http_url_key(normalized_url)
+
+        return scope_image_cache_key(
+            url_key,
+            cache_scope,
+            session_scoped_cache=self._session_scoped_cache,
+        )
+
+    @staticmethod
+    def _open_image_sync(
+        image_data: BytesIO,
+        max_pixels: int | None = None,
+        to_rgb: Callable[[Image.Image], Image.Image] = _pillow_rgb,
+    ) -> Image.Image:
+        """Open, validate, and decode an image from raw bytes. Runs in a thread."""
+        # formats= is the allowlist. Its JPEG plugin also opens multi-picture JPEGs
+        # (most phone cameras), which report image.format == "MPO".
+        try:
+            image = Image.open(image_data, formats=["JPEG", "PNG", "WEBP"])
+        except Image.DecompressionBombError as exc:
+            raise HttpStatusError(
+                413, "Image exceeds the decoded pixel limit", "image"
+            ) from exc
+        with image:
+            if max_pixels is not None and image.width * image.height > max_pixels:
+                raise HttpStatusError(
+                    413, "Image exceeds the decoded pixel limit", "image"
+                )
+            # Image.open() is lazy — check dimensions before RGB expansion.
+            # Decode here: to_rgb may return its argument, and the file closes on exit.
+            image.load()
+            return to_rgb(image)
+
+    @staticmethod
+    async def _open_image(
+        image_data: BytesIO,
+        max_pixels: int | None = None,
+        to_rgb: Callable[[Image.Image], Image.Image] = _pillow_rgb,
+    ) -> Image.Image:
+        """Open and validate an image from raw bytes, converting to RGB."""
+        with _nvtx.annotate("mm:img:pil_open_convert", color="lime"):
+            return await asyncio.to_thread(
+                ImageLoader._open_image_sync, image_data, max_pixels, to_rgb
+            )
+
+    def _cache_put(self, key: str, image: Image.Image) -> None:
+        """Insert into cache if not already present. Sync — no awaits."""
+        # A capacity of zero or less means caching is off. Falling through would
+        # try to evict from an empty OrderedDict and raise KeyError.
+        if self._cache_size <= 0:
+            return
+        if key not in self._image_cache:
+            if len(self._image_cache) >= self._cache_size:
+                self._image_cache.popitem(last=False)
+            self._image_cache[key] = image
+
+    async def _fetch_and_process(
+        self, key: str | None, image_url: str, max_pixels: int | None = None
+    ) -> Image.Image:
+        """Fetch image via HTTP(S), decode with PIL, return RGB Image.
+
+        Checks the optional shared encoded-image cache before hitting the
+        origin and refills it after a successful origin fetch. A ``None`` key
+        bypasses the shared cache (session scoping without a valid scope).
+        All exception normalization happens here so shared callers see
+        identical error types.
+        """
+        try:
+            if self._shared_image_cache is not None and key is not None:
+                cached_content = await self._shared_image_cache.get(key)
+                if cached_content is not None:
+                    if len(cached_content) > self._max_bytes():
+                        raise MediaSizeError("Cached image exceeds the byte limit")
+                    try:
+                        return await self._open_image(
+                            BytesIO(cached_content),
+                            max_pixels if max_pixels is not None else self._max_pixels,
+                            self._to_rgb,
+                        )
+                    except (OSError, ValueError) as exc:
+                        logger.warning(
+                            "Discarding invalid shared image cache entry for '%s': %s",
+                            describe_media_source(image_url),
+                            type(exc).__name__,
+                        )
+                        await self._shared_image_cache.delete(key)
+
+            with _nvtx.annotate("mm:img:http_fetch", color="lime"):
+                content = await fetch_bytes(
+                    image_url,
+                    self._http_timeout,
+                    policy=self._url_policy,
+                    max_bytes=self._max_bytes(),
+                )
+                if not content:
+                    raise ValueError("Empty response content from image URL")
+                image_data = BytesIO(content)
+
+            # Only the decode is covered: fetch failures (SSRF blocks, aiohttp
+            # connector errors) are OSErrors too and must not read as bad data.
+            try:
+                image = await self._open_image(
+                    image_data,
+                    max_pixels if max_pixels is not None else self._max_pixels,
+                    self._to_rgb,
+                )
+            except Image.UnidentifiedImageError:
+                raise
+            except (OSError, SyntaxError) as e:
+                # Pillow: OSError for truncated or corrupt data, SyntaxError for a
+                # broken PNG chunk. Host resource exhaustion is a server fault.
+                if isinstance(e, OSError) and _is_host_resource_error(e):
+                    raise
+                raise HttpStatusError(
+                    400, "Invalid or truncated image data", image_url
+                ) from e
+            if self._shared_image_cache is not None and key is not None:
+                # Cache fills are awaited deliberately so Redis acknowledges a
+                # successful write before this request returns. A cache outage
+                # remains fail-open, but can add up to the configured Redis I/O
+                # timeout to a miss; a bounded async queue could avoid that later.
+                await self._shared_image_cache.put(key, content)
+            return image
+
+        except HttpStatusError as e:
+            logger.error(
+                "HTTP %s loading image: '%s'",
+                e.status,
+                describe_media_source(image_url),
+            )
+            if message := IMAGE_FETCH_ERROR_MESSAGES.get(e.status):
+                raise HttpStatusError(400, message, image_url) from e
+            raise
+        except HttpTimeoutError as e:
+            logger.error(
+                "%s loading image: '%s' (timeout=%ss)",
+                type(e).__name__,
+                describe_media_source(image_url),
+                self._http_timeout,
+            )
+            raise HttpStatusError(
+                408,
+                f"Timeout loading image: '{describe_media_source(image_url)}' "
+                f"(timeout={self._http_timeout}s)",
+                image_url,
+            ) from e
+        except HttpConnectionError as e:
+            # Treat a user-supplied unreachable URL as a client error (400)
+            # rather than an internal server fault.
+            logger.error(
+                "%s loading image: '%s'",
+                type(e).__name__,
+                describe_media_source(image_url),
+            )
+            raise HttpStatusError(
+                400,
+                "Connection error loading image: "
+                f"'{describe_media_source(image_url)}': {e}",
+                image_url,
+            ) from e
+        except HttpError as e:
+            # Exception messages can repeat signed URLs; preserve the exception
+            # for callers, but log only its type and a redacted source label.
+            logger.error(
+                "%s loading image: '%s'",
+                type(e).__name__,
+                describe_media_source(image_url),
+            )
+            raise
+        except Image.UnidentifiedImageError as e:
+            logger.error(
+                "Unsupported image format loading: '%s'",
+                describe_media_source(image_url),
+            )
+            raise HttpStatusError(415, "Unsupported Media Type", image_url) from e
+        except UrlValidationError:
+            # Keep the type (must precede ValueError, its base) so the batch
+            # caller can still map this client error to a 4xx, not a 500.
+            logger.error(
+                "URL rejected loading image: '%s'", describe_media_source(image_url)
+            )
+            raise
+        except ValueError as e:
+            logger.error(
+                "%s loading image: '%s'",
+                type(e).__name__,
+                describe_media_source(image_url),
+            )
+            raise ValueError(
+                f"Failed to load image: '{describe_media_source(image_url)}': {e}"
+            ) from e
+        except Exception as e:
+            logger.error(
+                "%s loading image: '%s'",
+                type(e).__name__,
+                describe_media_source(image_url),
+            )
+            raise
+
+    async def _fetch_and_cache(self, key: str, image_url: str) -> Image.Image:
+        """Shared task: fetch, cache, then remove from _inflight."""
+        try:
+            image = await self._fetch_and_process(key, image_url)
+            self._cache_put(key, image)
+            return image
+        finally:
+            self._inflight.pop(key, None)
+
+    async def _read_and_convert_nixl_image(
+        self, metadata: Dict[str, Any]
+    ) -> Image.Image:
+        """Read decoded image via NIXL and convert numpy array to PIL Image."""
+        assert self._nixl_connector is not None
+        arr = await read_decoded_media_via_nixl(self._nixl_connector, metadata)
+        if arr.ndim == 3 and arr.shape[-1] == 1:
+            arr = arr.squeeze(axis=-1)
+        image = Image.fromarray(arr)
+        return image if image.mode == "RGB" else self._to_rgb(image)
+
+    @_nvtx.annotate("mm:img:load_image", color="lime")
+    async def load_image(
+        self,
+        image_url: str,
+        *,
+        cache_scope: str | None = None,
+        max_pixels: int | None = None,
+    ) -> Image.Image:
+        """Load one image, optionally with a request-specific remaining pixel budget.
+
+        A request-specific budget uses a cancellable private fetch on cache miss;
+        it cannot join an in-flight decode with a different budget. Completed
+        cache entries remain shareable and are checked against the caller's limit.
+        """
+        private_fetch = max_pixels is not None
+        if self._max_pixels is not None:
+            max_pixels = (
+                self._max_pixels
+                if max_pixels is None
+                else min(max_pixels, self._max_pixels)
+            )
+        if max_pixels is not None and max_pixels < 1:
+            raise HttpStatusError(413, "Image exceeds the decoded pixel limit", "image")
+
+        parsed_url = urlsplit(image_url)
+        if parsed_url.scheme in ("", "file"):
+            raise ValueError(
+                "Invalid image source scheme: local file access is not allowed"
+            )
+        normalized_url = await validate_media_url(image_url, self._url_policy)
+        parsed_url = urlsplit(normalized_url)
+
+        if parsed_url.scheme in ("http", "https"):
+            key = self._cache_key(normalized_url, cache_scope)
+
+            if key is None:
+                return await self._fetch_and_process(None, normalized_url, max_pixels)
+
+            if key in self._image_cache:
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        "Image found in cache for URL: %s",
+                        describe_media_source(image_url),
+                    )
+                self._image_cache.move_to_end(key)
+                image = self._image_cache[key]
+                if max_pixels is not None and image.width * image.height > max_pixels:
+                    raise HttpStatusError(
+                        413, "Image exceeds the decoded pixel limit", "image"
+                    )
+                return image
+
+            if private_fetch:
+                image = await self._fetch_and_process(key, normalized_url, max_pixels)
+                self._cache_put(key, image)
+                return image
+
+            if key not in self._inflight:
+                task = asyncio.create_task(self._fetch_and_cache(key, normalized_url))
+                # Suppress "exception was never retrieved" if all waiters cancel
+                task.add_done_callback(
+                    lambda t: t.exception() if not t.cancelled() else None
+                )
+                self._inflight[key] = task
+
+            return await asyncio.shield(self._inflight[key])
+
+        if parsed_url.scheme == "data":
+            try:
+                with _nvtx.annotate("mm:img:base64_decode", color="lime"):
+                    if not parsed_url.path.startswith("image/"):
+                        raise ValueError("Data URL must be an image type")
+
+                    image_bytes = decode_data_uri(
+                        normalized_url, max_bytes=self._max_bytes()
+                    )
+                    image_data = BytesIO(image_bytes)
+                return await self._open_image(image_data, max_pixels, self._to_rgb)
+            except Image.UnidentifiedImageError as e:
+                logger.error(
+                    "Unsupported image format decoding: '%s'",
+                    describe_media_source(image_url),
+                )
+                raise HttpStatusError(415, "Unsupported Media Type", image_url) from e
+            except MediaSizeError:
+                raise
+            except UrlValidationError as e:
+                raise ValueError(f"Failed to decode image: {e}") from e
+            except ValueError as e:
+                source = describe_media_source(image_url)
+                logger.error("%s decoding image: '%s': %s", type(e).__name__, source, e)
+                raise ValueError(f"Failed to decoding image: '{source}': {e}") from e
+            except (OSError, SyntaxError) as e:
+                logger.error(
+                    "Invalid or truncated image data: '%s'",
+                    describe_media_source(image_url),
+                )
+                raise HttpStatusError(
+                    400, "Invalid or truncated image data", image_url
+                ) from e
+            except Exception:
+                logger.error(
+                    "Unexpected error decoding image: '%s'",
+                    describe_media_source(image_url),
+                )
+                raise
+
+        # It's not file:, http:, https:, or data:
+        raise ValueError(f"Invalid image source scheme: {parsed_url.scheme}")
+
+    @overload
+    async def load_image_batch(
+        self,
+        image_mm_items: List[Dict[str, Any]],
+        *,
+        preserve_uuid_slots: Literal[False] = False,
+        cache_scope: str | None = None,
+    ) -> list[Image.Image]:
+        ...
+
+    @overload
+    async def load_image_batch(
+        self,
+        image_mm_items: List[Dict[str, Any]],
+        *,
+        preserve_uuid_slots: Literal[True],
+        cache_scope: str | None = None,
+    ) -> list[Image.Image | None]:
+        ...
+
+    async def load_image_batch(
+        self,
+        image_mm_items: List[Dict[str, Any]],
+        *,
+        preserve_uuid_slots: bool = False,
+        cache_scope: str | None = None,
+    ) -> list[Any]:
+        """
+        Load a batch of images from multimodal data items.
+
+        Supports three paths:
+        1. Url variant: Download and decode image from URL (default)
+        2. Decoded variant: Read pre-decoded image via NIXL RDMA (requires enable_frontend_decoding=True)
+        3. UuidOnly variant: Preserve an aligned empty slot for backend cache lookup
+           when preserve_uuid_slots=True
+
+        Args:
+            image_mm_items: List of multimodal data items for images
+            preserve_uuid_slots: Allow UUID-only items and preserve their positions
+                as None. This is enabled only by backends that resolve such slots.
+            cache_scope: Stable session or request identifier used when
+                DYN_MM_IMAGE_CACHE_SESSION_SCOPED is enabled.
+
+        Returns:
+            Loaded images, with None for UUID-only cache slots
+
+        Raises:
+            HttpStatusError: If any image fails with an HTTP status error
+                (e.g. 415 Unsupported Media Type), or with a transport error
+                (timeout mapped to 408, connection error mapped to 400); the
+                status is preserved so the frontend returns the correct
+                client-error code instead of 500.
+            UrlValidationError: If a media URL is rejected by the SSRF policy;
+                preserved as a ValueError so the frontend returns a 4xx, not 500.
+            ValueError: If any image fails client-side input validation (e.g.
+                a malformed data: URI — invalid base64, missing ;base64 marker,
+                or non-image MIME).
+            Exception: If any image fails to load for any other reason
+            ValueError: If enable_frontend_decoding=True but nixl_connector is None
+            ValueError: If a UUID-only slot is received without opting in
+        """
+        image_futures: list[Coroutine[Any, Any, Image.Image]] = []
+        slot_to_future_idx: list[int | None] = []
+
+        for idx, item in enumerate(image_mm_items):
+            if isinstance(item, dict) and URL_VARIANT_KEY in item:
+                # URL path: download and decode in Python backend
+                url = item[URL_VARIANT_KEY]
+                slot_to_future_idx.append(len(image_futures))
+                image_futures.append(self.load_image(url, cache_scope=cache_scope))
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        "Preparing to load image from URL: %s",
+                        describe_media_source(url),
+                    )
+            elif isinstance(item, dict) and DECODED_VARIANT_KEY in item:
+                if self._enable_frontend_decoding:
+                    metadata = item[DECODED_VARIANT_KEY]
+                    if self._nixl_connector is None:
+                        raise RuntimeError("NIXL connector is not initialized")
+                    slot_to_future_idx.append(len(image_futures))
+                    image_futures.append(self._read_and_convert_nixl_image(metadata))
+                else:
+                    logger.error(
+                        "Received Decoded multimodal data but enable_frontend_decoding=False. "
+                        "Set enable_frontend_decoding=True to enable NIXL RDMA image transfer."
+                    )
+                    raise ValueError("Could not load decoded media from frontend")
+            elif isinstance(item, dict) and UUID_ONLY_VARIANT_KEY in item:
+                if not preserve_uuid_slots:
+                    raise ValueError(
+                        "UUID-only image slots require preserve_uuid_slots=True"
+                    )
+                slot_to_future_idx.append(None)
+            else:
+                raise ValueError(
+                    f"Invalid image multimodal item at index {idx}. "
+                    "Expected dict with 'Url', 'Decoded', or 'UuidOnly' key."
+                )
+
+        # Process images in parallel
+        results = await asyncio.gather(*image_futures, return_exceptions=True)
+        loaded_images: list[Image.Image | None] = []
+        collective_exceptions = ""
+        status_error: HttpStatusError | None = None
+        url_error: UrlValidationError | None = None
+        value_error: ValueError | None = None
+        for media_item, future_idx in zip(
+            image_mm_items, slot_to_future_idx, strict=True
+        ):
+            if future_idx is None:
+                loaded_images.append(None)
+                continue
+            result = results[future_idx]
+            if isinstance(result, BaseException):
+                # asyncio.gather(..., return_exceptions=True) may return a
+                # cancellation (a BaseException, but not an Exception). Keep
+                # cancellation semantics instead of folding it into a batch
+                # image-loading error.
+                if not isinstance(result, Exception):
+                    raise result
+                source = describe_media_source(
+                    media_item.get(URL_VARIANT_KEY, "decoded")
+                )
+                logger.error(
+                    "Failed to load image from %s: %s", source, type(result).__name__
+                )
+                collective_exceptions += (
+                    f"Failed to load image from {source}: {result}\n"
+                )
+                # Preserve HTTP status semantics (e.g. 415 Unsupported Media Type).
+                # Folding an HttpStatusError into a generic Exception below would
+                # strip the status and force the frontend back to a 500. Surface
+                # the first one so single-item batches keep their client-error code.
+                if status_error is None and isinstance(result, HttpStatusError):
+                    status_error = result
+                # Same for a rejected URL (UrlValidationError is a ValueError):
+                # preserve it so the frontend still gets a 4xx, not a 500.
+                elif url_error is None and isinstance(result, UrlValidationError):
+                    url_error = result
+                # The bindings map ValueError to Backend(InvalidArgument) → 400,
+                # so preserve the type so the frontend still gets a 4xx.
+                elif value_error is None and isinstance(result, ValueError):
+                    value_error = result
+                continue
+            loaded_images.append(result)
+
+        if status_error is not None:
+            raise status_error
+
+        if url_error is not None:
+            raise url_error
+
+        if value_error is not None:
+            raise value_error
+
+        if collective_exceptions:
+            raise Exception(collective_exceptions)
+
+        return loaded_images

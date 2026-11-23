@@ -1,0 +1,745 @@
+
+# Image URL to use all building/pushing image targets
+IMG ?= controller:latest
+PYTHON ?= python3
+
+# ENVTEST_K8S_VERSION refers to the version of kubebuilder assets to be downloaded by envtest binary.
+ENVTEST_K8S_VERSION = 1.30.0
+ENVTEST_PACKAGES ?= ./internal/controller/... ./internal/webhook/defaulting ./internal/webhook/validation ./cmd/crd-apply ./internal/dgdrrunpublisher
+ENVTEST_ASSETS_CMD = $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path
+
+CLUSTERTEST_PACKAGES ?= ./internal/testing/clusterenv ./internal/controller/...
+CLUSTERTEST_TIMEOUT ?= 30m
+UPGRADE_TEST_PARALLELISM ?= 2
+CLUSTERTEST_KIND_NAME ?= dynamo-clustertest-v136
+CLUSTERTEST_CONTEXT = kind-$(CLUSTERTEST_KIND_NAME)
+CLUSTERTEST_REUSE ?= true
+UPGRADE_RELEASE_TAG ?=
+UPGRADE_CANDIDATE_SHA ?=
+UPGRADE_CANDIDATE_OUTPUT ?=
+CLUSTERTEST_OWNERSHIP_FILE ?=
+CLUSTERTEST_KUBECONFIG ?= $(LOCALBIN)/clustertest.kubeconfig
+CLUSTERTEST_NODE_IMAGE ?= kindest/node:v1.36.1@sha256:3489c7674813ba5d8b1a9977baea8a6e553784dab7b84759d1014dbd78f7ebd5
+CLUSTERTEST_PROFILER_IMAGE ?= $(DYNAMO_CLUSTERTEST_PROFILER_IMAGE)
+CLUSTERTEST_OPERATOR_IMAGE ?= $(DYNAMO_CLUSTERTEST_OPERATOR_IMAGE)
+CLUSTERTEST_PLATFORM ?= linux/$(GOARCH)
+CLUSTERTEST_LWS_VERSION = $(shell go list -m -f '{{.Version}}' sigs.k8s.io/lws)
+CLUSTERTEST_LWS_CRD_DIR = $(shell go env GOMODCACHE)/sigs.k8s.io/lws@$(CLUSTERTEST_LWS_VERSION)/config/crd/bases
+CLUSTERTEST_VOLCANO_VERSION = $(shell go list -m -f '{{.Version}}' volcano.sh/apis)
+CLUSTERTEST_VOLCANO_PODGROUP_CRD_URL = https://raw.githubusercontent.com/volcano-sh/volcano/$(CLUSTERTEST_VOLCANO_VERSION)/config/crd/volcano/bases/scheduling.volcano.sh_podgroups.yaml
+
+# Get the currently used golang install path (in GOPATH/bin, unless GOBIN is set)
+ifeq (,$(shell go env GOBIN))
+GOBIN := $(shell go env GOPATH)/bin
+else
+GOBIN := $(shell go env GOBIN)
+endif
+
+# Platform detection for downloading pre-built binaries.
+GOOS := $(shell go env GOOS)
+GOARCH := $(shell go env GOARCH)
+CURL_RETRIES ?= 3
+
+# CONTAINER_TOOL defines the container tool to be used for building images.
+# Be aware that the target commands are only tested with Docker which is
+# scaffolded by default. However, you might want to replace it to use other
+# tools. (i.e. podman)
+CONTAINER_TOOL ?= docker
+
+# Setting SHELL to bash allows bash commands to be executed by recipes.
+# Options are set to exit when a recipe line exits non-zero or a piped command fails.
+SHELL = /usr/bin/env bash -o pipefail
+.SHELLFLAGS = -ec
+
+.PHONY: all
+all: build
+
+##@ General
+
+# The help target prints out all targets with their descriptions organized
+# beneath their categories. The categories are represented by '##@' and the
+# target descriptions by '##'. The awk command is responsible for reading the
+# entire set of makefiles included in this invocation, looking for lines of the
+# file as xyz: ## something, and then pretty-format the target and help. Then,
+# if there's a line with ##@ something, that gets pretty-printed as a category.
+# More info on the usage of ANSI control characters for terminal formatting:
+# https://en.wikipedia.org/wiki/ANSI_escape_code#SGR_parameters
+# More info on the awk command:
+# http://linuxcommand.org/lc3_adv_awk.php
+
+.PHONY: help
+help: ## Display this help.
+	@awk 'BEGIN {FS = ":.*##"; printf "\nUsage:\n  make \033[36m<target>\033[0m\n"} /^[a-zA-Z_0-9-]+:.*?##/ { printf "  \033[36m%-15s\033[0m %s\n", $$1, $$2 } /^##@/ { printf "\n\033[1m%s\033[0m\n", substr($$0, 5) } ' $(MAKEFILE_LIST)
+
+##@ Container Images
+
+# Build/push the framework and dynamo container images from this branch. These
+# render Dockerfiles via container/render.py and build with the repo root as the
+# Docker build context (../.. relative to this directory), since the images pull
+# in components/, lib/, and container/.
+#
+# DISCLAIMER: These build/push targets are a developer convenience only. They are
+# not the supported/official way to produce release images and carry no stability
+# or compatibility guarantees. For production images, use the official build and
+# release pipeline.
+#
+# Examples:
+#   make docker-build-planner REGISTRY=<your-registry>          # build planner
+#   make docker-build-trtllm  REGISTRY=<your-registry>          # build trtllm runtime
+#   make docker-push-planner  REGISTRY=<your-registry>          # push planner
+#   make docker-build-all     REGISTRY=<your-registry> TAG=dev  # build everything
+
+# Container registry prefix (e.g. "<your-registry>", "nvcr.io/nvidia/ai-dynamo").
+# When set, images are tagged as REGISTRY/IMAGE_NAME:TAG.
+REGISTRY ?=
+
+# Image tag applied to all built images.
+TAG ?= latest
+
+# CUDA versions used by render.py. Override for non-default builds.
+# Valid values are constrained by container/render.py (currently 13.0 / 13.4).
+CUDA_VERSION ?= 13.0
+CUDA_VERSION_TRTLLM ?= 13.4
+# CUDA version for the dynamo-framework images (planner, frontend).
+CUDA_VERSION_DYNAMO ?= 13.0
+
+# Platform passed to render.py (not used for multi-arch buildx here).
+PLATFORM ?= linux/amd64
+
+# Make-level build parallelism. Each docker-build-* target is a heavy container
+# build, so running several at once under `make -j` can exhaust RAM/disk. By
+# default we force serial execution even when -j is passed (NOTE: .NOTPARALLEL is
+# Makefile-wide, so this also serializes other targets under -j). Set
+# PARALLEL_BUILDS=1 on a machine with ample resources to allow concurrent builds;
+# each target renders its own Dockerfile, so this is safe for correctness.
+#   make docker-build-all                        -> serial
+#   make -j docker-build-all                     -> serial (default)
+#   make -j docker-build-all PARALLEL_BUILDS=1   -> concurrent
+PARALLEL_BUILDS ?=
+ifndef PARALLEL_BUILDS
+.NOTPARALLEL:
+endif
+
+# Image-name prefix derived from REGISTRY.
+_prefix = $(if $(REGISTRY),$(REGISTRY)/,)
+
+PLANNER_IMG  = $(_prefix)dynamo-planner:$(TAG)
+FRONTEND_IMG = $(_prefix)dynamo-frontend:$(TAG)
+VLLM_IMG     = $(_prefix)vllm-runtime:$(TAG)
+TRTLLM_IMG   = $(_prefix)tensorrtllm-runtime:$(TAG)
+SGLANG_IMG   = $(_prefix)sglang-runtime:$(TAG)
+OPERATOR_IMG = $(_prefix)dynamo-operator:$(TAG)
+
+# render.py (in ../../container) generates a Dockerfile from Jinja2 templates.
+# Without --output-short-filename it emits a unique path per framework/target/arch:
+#   ../../container/<framework>-<target>-cuda<cuda_version>-<arch>-rendered.Dockerfile
+# Unique names (vs the shared rendered.Dockerfile) keep the docker-build-* targets
+# safe under parallel make: each build reads its own rendered Dockerfile and cannot
+# clobber another target's. All such files match *rendered.Dockerfile in .gitignore.
+RENDER = python3 ../../container/render.py --platform $(PLATFORM)
+
+# Architecture component of the rendered filename: render.py strips the
+# "linux/" prefix from --platform (e.g. linux/amd64 -> amd64).
+_arch = $(lastword $(subst /, ,$(PLATFORM)))
+
+# rendered_dockerfile(framework,target,cuda_version) -> path render.py writes to,
+# relative to this directory (the repo container/ dir is ../../container).
+rendered_dockerfile = ../../container/$(1)-$(2)-cuda$(3)-$(_arch)-rendered.Dockerfile
+
+PLANNER_DOCKERFILE  = $(call rendered_dockerfile,dynamo,planner,$(CUDA_VERSION_DYNAMO))
+FRONTEND_DOCKERFILE = $(call rendered_dockerfile,dynamo,frontend,$(CUDA_VERSION_DYNAMO))
+VLLM_DOCKERFILE     = $(call rendered_dockerfile,vllm,runtime,$(CUDA_VERSION))
+TRTLLM_DOCKERFILE   = $(call rendered_dockerfile,trtllm,runtime,$(CUDA_VERSION_TRTLLM))
+SGLANG_DOCKERFILE   = $(call rendered_dockerfile,sglang,runtime,$(CUDA_VERSION))
+
+# Repo root is the Docker build context for the framework/dynamo images.
+BUILD_CONTEXT = ../..
+
+.PHONY: docker-build-planner
+docker-build-planner: ## Build the planner image.
+	$(RENDER) --framework dynamo --target planner --cuda-version $(CUDA_VERSION_DYNAMO)
+	$(CONTAINER_TOOL) build -t $(PLANNER_IMG) -f $(PLANNER_DOCKERFILE) $(BUILD_CONTEXT)
+
+.PHONY: docker-build-frontend
+docker-build-frontend: ## Build the frontend image.
+	$(RENDER) --framework dynamo --target frontend --cuda-version $(CUDA_VERSION_DYNAMO)
+	$(CONTAINER_TOOL) build -t $(FRONTEND_IMG) -f $(FRONTEND_DOCKERFILE) $(BUILD_CONTEXT)
+
+.PHONY: docker-build-vllm
+docker-build-vllm: ## Build the vLLM runtime image.
+	$(RENDER) --framework vllm --target runtime --cuda-version $(CUDA_VERSION)
+	$(CONTAINER_TOOL) build -t $(VLLM_IMG) -f $(VLLM_DOCKERFILE) $(BUILD_CONTEXT)
+
+.PHONY: docker-build-trtllm
+docker-build-trtllm: ## Build the TensorRT-LLM runtime image.
+	$(RENDER) --framework trtllm --target runtime --cuda-version $(CUDA_VERSION_TRTLLM)
+	$(CONTAINER_TOOL) build -t $(TRTLLM_IMG) -f $(TRTLLM_DOCKERFILE) $(BUILD_CONTEXT)
+
+.PHONY: docker-build-sglang
+docker-build-sglang: ## Build the SGLang runtime image.
+	$(RENDER) --framework sglang --target runtime --cuda-version $(CUDA_VERSION)
+	$(CONTAINER_TOOL) build -t $(SGLANG_IMG) -f $(SGLANG_DOCKERFILE) $(BUILD_CONTEXT)
+
+.PHONY: docker-build-operator
+docker-build-operator: ## Build the operator image with dynamo naming (REGISTRY/TAG).
+	$(MAKE) docker-build IMG=$(OPERATOR_IMG)
+
+.PHONY: docker-build-all
+docker-build-all: docker-build-planner docker-build-frontend docker-build-vllm docker-build-trtllm docker-build-sglang docker-build-operator ## Build all images.
+
+.PHONY: docker-push-planner
+docker-push-planner: ## Push the planner image.
+	$(CONTAINER_TOOL) push $(PLANNER_IMG)
+
+.PHONY: docker-push-frontend
+docker-push-frontend: ## Push the frontend image.
+	$(CONTAINER_TOOL) push $(FRONTEND_IMG)
+
+.PHONY: docker-push-vllm
+docker-push-vllm: ## Push the vLLM runtime image.
+	$(CONTAINER_TOOL) push $(VLLM_IMG)
+
+.PHONY: docker-push-trtllm
+docker-push-trtllm: ## Push the TensorRT-LLM runtime image.
+	$(CONTAINER_TOOL) push $(TRTLLM_IMG)
+
+.PHONY: docker-push-sglang
+docker-push-sglang: ## Push the SGLang runtime image.
+	$(CONTAINER_TOOL) push $(SGLANG_IMG)
+
+.PHONY: docker-push-operator
+docker-push-operator: ## Push the operator image with dynamo naming (REGISTRY/TAG).
+	$(MAKE) docker-push IMG=$(OPERATOR_IMG)
+
+.PHONY: docker-push-all
+docker-push-all: docker-push-planner docker-push-frontend docker-push-vllm docker-push-trtllm docker-push-sglang docker-push-operator ## Push all images.
+
+##@ Development
+
+.PHONY: check
+check: generate manifests generate-api-docs generate-helm-docs check-aisimulate-schema
+	@echo "> Checking for uncommitted changes"
+	@if [ -n "$$(git status --porcelain)" ]; then \
+		echo "ERROR: Git tree is dirty after running validation steps."; \
+		echo "Please check the diff to identify the step that dirtied the tree."; \
+		git --no-pager status; \
+		git --no-pager diff; \
+		exit 1; \
+	fi
+	@echo "> Check complete"
+
+.PHONY: generate-aisimulate-schema
+generate-aisimulate-schema: ## Export the pinned AISimulate Pydantic schema and active Go version.
+	$(PYTHON) hack/generate_aisimulate_schema.py
+
+.PHONY: check-aisimulate-schema
+check-aisimulate-schema: ## Reject a missing or stale AISimulate schema after dependency changes.
+	$(PYTHON) hack/generate_aisimulate_schema.py --check
+
+
+.PHONY: tilt-up
+tilt-up: kubectl helm ## Start Tilt for local operator development.
+	@if [ ! -f tilt-settings.yaml ]; then \
+		echo "WARNING: tilt-settings.yaml not found — using defaults."; \
+	fi
+	tilt up
+
+
+HELM_MANAGER_RBAC_DIR := ../helm/charts/platform/components/operator/files
+
+.PHONY: manifests
+manifests: controller-gen yq ## Generate WebhookConfiguration, ClusterRole and CustomResourceDefinition objects.
+	# Use a large maxDescLen to ensure all field comments are included as OpenAPI descriptions
+	# allowDangerousTypes=true is needed for float fields in the API (e.g. kvTransferPolicy.preferredWeight)
+	$(CONTROLLER_GEN) rbac:roleName=manager-role,headerFile=hack/boilerplate.yaml.txt crd:maxDescLen=100000,allowDangerousTypes=true,generateEmbeddedObjectMeta=true webhook paths="./..." output:rbac:artifacts:config=$(HELM_MANAGER_RBAC_DIR) output:crd:artifacts:config=config/crd/bases
+	echo "Removing name from mainContainer required fields"
+	for file in config/crd/bases/*.yaml; do \
+		$(YQ) eval '(.. | select(has("mainContainer")) | .mainContainer.required) |= (. - ["name"])' -i --indent 2 $$file || exit 1; \
+	done
+	echo "Removing containers from extraPodSpec required fields"
+	for file in config/crd/bases/*.yaml; do \
+		$(YQ) eval '(.. | select(has("extraPodSpec")) | .extraPodSpec.required) |= (. - ["containers"])' -i --indent 2 $$file || exit 1; \
+	done
+	echo "Removing name from standalone v1beta1 DynamoComponentDeployment required fields"
+	$(YQ) eval '(.spec.versions[] | select(.name == "v1beta1") | .schema.openAPIV3Schema.properties.spec.required) |= (. - ["name"])' -i --indent 2 config/crd/bases/nvidia.com_dynamocomponentdeployments.yaml
+	echo "Removing DGD-only provider overrides from standalone DynamoComponentDeployment schemas"
+	$(YQ) eval '(.spec.versions[].schema.openAPIV3Schema.properties.spec.properties) |= del(.providerOverride) | (.spec.versions[].schema.openAPIV3Schema.properties.spec.properties.roles.items.properties) |= del(.providerOverride)' -i --indent 2 config/crd/bases/nvidia.com_dynamocomponentdeployments.yaml
+	echo "Removing DGD-only LPX fields and validation rules from standalone DynamoComponentDeployment schemas"
+	$(YQ) eval '(.spec.versions[].schema.openAPIV3Schema.properties.spec) |= (del(.properties.lpx) | (select(has("x-kubernetes-validations"))."x-kubernetes-validations") |= map(select(.rule | test("\\b(self|oldSelf)\\.lpx\\b") | not)))' -i --indent 2 config/crd/bases/nvidia.com_dynamocomponentdeployments.yaml
+	# PodTemplateSpec is an external Kubernetes type, so its item-level markers cannot be declared on the API field.
+	# Item-scoped rules avoid unbounded list comprehensions without imposing maxItems on the public API.
+	# The annotation value bound matches Kubernetes' total annotation size limit.
+	echo "Adding nested v1beta1 pod template CEL validation"
+	$(YQ) eval 'with(.spec.versions[] | select(.name == "v1beta1") | .schema.openAPIV3Schema.properties.spec.properties.podTemplate.properties; .spec.properties.containers.items."x-kubernetes-validations" = [{"rule": "self.name == \"main\" || (has(self.image) && self.image != \"\")", "message": "sidecar containers must specify a non-empty image"}] | .spec.properties.initContainers.items."x-kubernetes-validations" = [{"rule": "has(self.image) && self.image != \"\"", "message": "init containers must specify a non-empty image"}] | .metadata.properties.annotations."x-kubernetes-validations" = [{"rule": "!(\"nvidia.com/vllm-distributed-executor-backend\" in self) || self[\"nvidia.com/vllm-distributed-executor-backend\"].lowerAscii() in [\"mp\", \"ray\"]", "message": "podTemplate backend annotation must be mp or ray, case-insensitively"}] | .metadata.properties.annotations.additionalProperties.maxLength = 262144)' -i --indent 2 config/crd/bases/nvidia.com_dynamocomponentdeployments.yaml
+	$(YQ) eval 'with(.spec.versions[] | select(.name == "v1beta1") | .schema.openAPIV3Schema.properties.spec.properties.roles.items.properties.podTemplate.properties; .spec.properties.containers.items."x-kubernetes-validations" = [{"rule": "self.name == \"main\" || (has(self.image) && self.image != \"\")", "message": "sidecar containers must specify a non-empty image"}] | .spec.properties.initContainers.items."x-kubernetes-validations" = [{"rule": "has(self.image) && self.image != \"\"", "message": "init containers must specify a non-empty image"}] | .metadata.properties.annotations."x-kubernetes-validations" = [{"rule": "!(\"nvidia.com/vllm-distributed-executor-backend\" in self) || self[\"nvidia.com/vllm-distributed-executor-backend\"].lowerAscii() in [\"mp\", \"ray\"]", "message": "podTemplate backend annotation must be mp or ray, case-insensitively"}] | .metadata.properties.annotations.additionalProperties.maxLength = 262144)' -i --indent 2 config/crd/bases/nvidia.com_dynamocomponentdeployments.yaml
+	$(YQ) eval 'with(.spec.versions[] | select(.name == "v1beta1") | .schema.openAPIV3Schema.properties.spec.properties.components.items.properties.podTemplate.properties; .spec.properties.containers.items."x-kubernetes-validations" = [{"rule": "self.name == \"main\" || (has(self.image) && self.image != \"\")", "message": "sidecar containers must specify a non-empty image"}] | .spec.properties.initContainers.items."x-kubernetes-validations" = [{"rule": "has(self.image) && self.image != \"\"", "message": "init containers must specify a non-empty image"}] | .metadata.properties.annotations."x-kubernetes-validations" = [{"rule": "!(\"nvidia.com/vllm-distributed-executor-backend\" in self) || self[\"nvidia.com/vllm-distributed-executor-backend\"].lowerAscii() in [\"mp\", \"ray\"]", "message": "podTemplate backend annotation must be mp or ray, case-insensitively"}] | .metadata.properties.annotations.additionalProperties.maxLength = 262144)' -i --indent 2 config/crd/bases/nvidia.com_dynamographdeployments.yaml
+	$(YQ) eval 'with(.spec.versions[] | select(.name == "v1beta1") | .schema.openAPIV3Schema.properties.spec.properties.components.items.properties.roles.items.properties.podTemplate.properties; .spec.properties.containers.items."x-kubernetes-validations" = [{"rule": "self.name == \"main\" || (has(self.image) && self.image != \"\")", "message": "sidecar containers must specify a non-empty image"}] | .spec.properties.initContainers.items."x-kubernetes-validations" = [{"rule": "has(self.image) && self.image != \"\"", "message": "init containers must specify a non-empty image"}] | .metadata.properties.annotations."x-kubernetes-validations" = [{"rule": "!(\"nvidia.com/vllm-distributed-executor-backend\" in self) || self[\"nvidia.com/vllm-distributed-executor-backend\"].lowerAscii() in [\"mp\", \"ray\"]", "message": "podTemplate backend annotation must be mp or ray, case-insensitively"}] | .metadata.properties.annotations.additionalProperties.maxLength = 262144)' -i --indent 2 config/crd/bases/nvidia.com_dynamographdeployments.yaml
+	echo "Adding probe handler validation to DGD and DCD schemas"
+	for file in config/crd/bases/nvidia.com_dynamocomponentdeployments.yaml config/crd/bases/nvidia.com_dynamographdeployments.yaml; do \
+		for probe in startupProbe livenessProbe readinessProbe; do \
+			PROBE=$$probe $(YQ) eval 'strenv(PROBE) as $$probe | (.. | select(has("properties")) | select(.properties | has($$probe)))."x-kubernetes-validations" += [{"rule": "!has(self." + $$probe + ") || (has(self." + $$probe + ".exec) ? 1 : 0) + (has(self." + $$probe + ".httpGet) ? 1 : 0) + (has(self." + $$probe + ".tcpSocket) ? 1 : 0) + (has(self." + $$probe + ".grpc) ? 1 : 0) == 1", "message": $$probe + " must define exactly one handler", "fieldPath": "." + $$probe}]' -i --indent 2 $$file || exit 1; \
+		done; \
+	done
+	echo "Fixing PluginSpec parameters field: json.RawMessage needs x-kubernetes-preserve-unknown-fields instead of type: string"
+	for file in config/crd/bases/*.yaml; do \
+		$(YQ) eval '(.. | select(has("parameters")) | .parameters | select(has("format") and .format == "byte")) |= (del(.format) | del(.type) | .x-kubernetes-preserve-unknown-fields = true)' -i --indent 2 $$file || exit 1; \
+	done
+	echo "Adding CA-less conversion webhook to multi-version CRD files"
+	for file in config/crd/bases/*.yaml; do \
+		$(YQ) eval 'with(select(.spec.versions | length > 1); .spec.conversion = {"strategy": "Webhook", "webhook": {"clientConfig": {"service": {"namespace": "dynamo-system", "name": "dynamo-operator-webhook-service", "path": "/convert"}}, "conversionReviewVersions": ["v1"]}} | .spec.conversion.webhook.clientConfig head_comment = "CA will be patched in by the Dynamo operator or other means, depending on cert mode auto or manual")' -i --indent 2 $$file || exit 1; \
+	done
+	echo "Adding NVIDIA header to CRD files"
+	for file in config/crd/bases/*.yaml; do \
+		if ! head -20 "$$file" | grep -q "NVIDIA CORPORATION"; then \
+			{ printf '%s\n' \
+				'# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.' \
+				'# SPDX-License-Identifier: Apache-2.0' \
+				''; \
+			  cat "$$file"; \
+			} > "$$file.tmp" && mv "$$file.tmp" "$$file"; \
+		fi; \
+	done
+	echo "Adding helm.sh/resource-policy: keep annotation to CRD files"
+	for file in config/crd/bases/*.yaml; do \
+		if ! $(YQ) eval '.metadata.annotations."helm.sh/resource-policy"' "$$file" | grep -q "keep"; then \
+			$(YQ) eval '.metadata.annotations."helm.sh/resource-policy" = "keep"' -i "$$file"; \
+		fi; \
+	done
+.PHONY: generate
+generate: controller-gen generate-pydantic ## Generate code containing DeepCopy, DeepCopyInto, and DeepCopyObject method implementations.
+	$(CONTROLLER_GEN) object:headerFile="hack/boilerplate.go.txt_" paths="./..."
+
+.PHONY: generate-pydantic
+generate-pydantic: ## Generate Python Pydantic models from v1beta1 Go types (requires Python 3 + pydantic)
+	@python3 -c "import pydantic" 2>/dev/null || { echo "Error: pydantic not found. Install with: pip install pydantic"; exit 1; }
+	@echo "Generating Pydantic models from v1beta1 DGDR types..."
+	@python3 api/scripts/generate_pydantic_from_go.py
+	@echo "Running Pydantic validation tests..."
+	@python3 api/scripts/validate_pydantic_models.py
+
+.PHONY: fmt
+fmt: ## Run go fmt against code.
+	go fmt ./...
+
+.PHONY: vet
+vet: ## Run go vet against code.
+	go vet ./...
+
+.PHONY: test
+test: manifests generate fmt vet setup-envtest ## Run tests.
+	KUBEBUILDER_ASSETS="$$($(ENVTEST_ASSETS_CMD))" go test $$(go list ./... | grep -vE '/cmd($$|/)') ./cmd/crd-apply -coverprofile cover.out
+
+.PHONY: envtest
+envtest: setup-envtest ## Run envtest-backed operator tests.
+	KUBEBUILDER_ASSETS="$$($(ENVTEST_ASSETS_CMD))" go test $(ENVTEST_PACKAGES)
+
+.PHONY: setup-clustertest-kind
+setup-clustertest-kind: kubectl kind ## Create or explicitly reuse the pinned Kind cluster.
+	@clusters="$$($(KIND) get clusters)"; \
+	if echo "$$clusters" | grep -Fxq '$(CLUSTERTEST_KIND_NAME)'; then \
+		test '$(CLUSTERTEST_REUSE)' = true || { echo "Error: fresh Kind cluster already exists"; exit 1; }; \
+		echo "Reusing Kind cluster $(CLUSTERTEST_KIND_NAME)"; \
+		$(KIND) export kubeconfig --name '$(CLUSTERTEST_KIND_NAME)' --kubeconfig '$(CLUSTERTEST_KUBECONFIG)'; \
+	else \
+		if [[ -n '$(CLUSTERTEST_OWNERSHIP_FILE)' ]]; then touch '$(CLUSTERTEST_OWNERSHIP_FILE)'; fi; \
+		$(KIND) create cluster --name '$(CLUSTERTEST_KIND_NAME)' --image '$(CLUSTERTEST_NODE_IMAGE)' --kubeconfig '$(CLUSTERTEST_KUBECONFIG)'; \
+	fi
+
+.PHONY: setup-clustertest-crds-in-cluster
+setup-clustertest-crds-in-cluster: kubectl ## Install shared CRDs into the explicitly selected context.
+	@test -n "$${DYNAMO_CLUSTERTEST_CONTEXT:-}" || { echo "DYNAMO_CLUSTERTEST_CONTEXT is required"; exit 1; }
+	$(KUBECTL) --kubeconfig '$(CLUSTERTEST_KUBECONFIG)' --context "$${DYNAMO_CLUSTERTEST_CONTEXT}" apply --server-side -f config/crd/bases
+	go mod download sigs.k8s.io/lws@$(CLUSTERTEST_LWS_VERSION)
+	$(KUBECTL) --kubeconfig '$(CLUSTERTEST_KUBECONFIG)' --context "$${DYNAMO_CLUSTERTEST_CONTEXT}" apply --server-side -f '$(CLUSTERTEST_LWS_CRD_DIR)'
+	# Dependency controllers do not run in clustertests; retain the pinned alpha schema without webhook conversion.
+	go run ./hack/prepare_grove_test_crds | \
+		$(KUBECTL) --kubeconfig '$(CLUSTERTEST_KUBECONFIG)' --context "$${DYNAMO_CLUSTERTEST_CONTEXT}" apply --server-side -f -
+	curl --fail --location --silent --show-error --max-time 60 --retry 3 '$(CLUSTERTEST_VOLCANO_PODGROUP_CRD_URL)' | \
+		$(KUBECTL) --kubeconfig '$(CLUSTERTEST_KUBECONFIG)' --context "$${DYNAMO_CLUSTERTEST_CONTEXT}" apply --server-side -f -
+	$(KUBECTL) --kubeconfig '$(CLUSTERTEST_KUBECONFIG)' --context "$${DYNAMO_CLUSTERTEST_CONTEXT}" wait --for=condition=Established crd --all --timeout=2m
+
+.PHONY: setup-clustertest-images
+setup-clustertest-images: kind ## Prepare and load the production images for ordinary clustertests.
+	@test -n '$(CLUSTERTEST_PROFILER_IMAGE)' || { echo "Error: DYNAMO_CLUSTERTEST_PROFILER_IMAGE must name a locally available production planner image"; exit 1; }
+	@$(CONTAINER_TOOL) image inspect '$(CLUSTERTEST_PROFILER_IMAGE)' >/dev/null 2>&1 || { echo "Error: planner image $(CLUSTERTEST_PROFILER_IMAGE) is not available locally"; exit 1; }
+	@test -n '$(CLUSTERTEST_OPERATOR_IMAGE)' || { echo "Error: DYNAMO_CLUSTERTEST_OPERATOR_IMAGE must name a locally available production operator image"; exit 1; }
+	@$(CONTAINER_TOOL) image inspect '$(CLUSTERTEST_OPERATOR_IMAGE)' >/dev/null 2>&1 || { echo "Error: operator image $(CLUSTERTEST_OPERATOR_IMAGE) is not available locally"; exit 1; }
+	@for image in '$(CLUSTERTEST_PROFILER_IMAGE)' '$(CLUSTERTEST_OPERATOR_IMAGE)'; do \
+		printf 'FROM %s\n' "$$image" | $(CONTAINER_TOOL) build --platform '$(CLUSTERTEST_PLATFORM)' --provenance=false --tag "$$image" --file - .; \
+	done
+	$(KIND) load docker-image --name '$(CLUSTERTEST_KIND_NAME)' '$(CLUSTERTEST_PROFILER_IMAGE)'
+	$(KIND) load docker-image --name '$(CLUSTERTEST_KIND_NAME)' '$(CLUSTERTEST_OPERATOR_IMAGE)'
+
+.PHONY: setup-clustertest
+setup-clustertest: ## Create or reuse the ordinary clustertest cluster, CRDs and images.
+	$(MAKE) setup-clustertest-kind
+	DYNAMO_CLUSTERTEST_CONTEXT='$(CLUSTERTEST_CONTEXT)' $(MAKE) setup-clustertest-crds-in-cluster
+	$(MAKE) setup-clustertest-images
+
+.PHONY: clustertest
+clustertest: ## Run Pod- and Job-backed controller tests against the explicitly unlocked cluster.
+	@test -n "$${DYNAMO_CLUSTERTEST_CONTEXT:-}" || { echo "Error: DYNAMO_CLUSTERTEST_CONTEXT must be set"; exit 1; }
+	@test -n "$${DYNAMO_CLUSTERTEST_PROFILER_IMAGE:-}" || { echo "Error: DYNAMO_CLUSTERTEST_PROFILER_IMAGE must be set"; exit 1; }
+	@test -n "$${DYNAMO_CLUSTERTEST_OPERATOR_IMAGE:-}" || { echo "Error: DYNAMO_CLUSTERTEST_OPERATOR_IMAGE must be set"; exit 1; }
+	# History preparation and webhook suites mutate the same cluster-wide CRDs and admission.
+	go test -p 1 -tags=clustertest $(CLUSTERTEST_PACKAGES) \
+		-run '^TestCluster' -count=1 -v -timeout=$(CLUSTERTEST_TIMEOUT)
+
+.PHONY: integration
+integration: envtest setup-clustertest ## Run envtests and clustertests, creating the standard Kind cluster.
+	KUBECONFIG='$(CLUSTERTEST_KUBECONFIG)' \
+		DYNAMO_CLUSTERTEST_CONTEXT='$(CLUSTERTEST_CONTEXT)' \
+		DYNAMO_CLUSTERTEST_PROFILER_IMAGE='$(CLUSTERTEST_PROFILER_IMAGE)' \
+		DYNAMO_CLUSTERTEST_OPERATOR_IMAGE='$(CLUSTERTEST_OPERATOR_IMAGE)' \
+		$(MAKE) clustertest
+
+.PHONY: lint
+lint: golangci-lint lint-api ## Run golangci-lint linter, the Kubernetes API linter & yamllint
+	$(GOLANGCI_LINT) run
+
+.PHONY: lint-fix
+lint-fix: golangci-lint ## Run golangci-lint linter and perform fixes
+	$(GOLANGCI_LINT) run --fix
+
+.PHONY: lint-api
+lint-api: kube-api-linter ## Check the CRD API types against Kubernetes API conventions
+	$(KUBE_API_LINTER) run -c .golangci-kal.yml ./api/...
+
+##@ Build
+
+.PHONY: build
+build: manifests generate fmt vet ## Build manager binary.
+	go build -o bin/manager cmd/main.go
+
+.PHONY: run
+run: manifests generate fmt vet ## Run a controller from your host.
+	go run ./cmd/main.go
+
+# If you wish to build the manager image targeting other platforms you can use the --platform flag.
+# (i.e. docker build --platform linux/arm64). However, you must enable docker buildKit for it.
+# More info: https://docs.docker.com/develop/develop-images/build_enhancements/
+.PHONY: docker-build
+docker-build: ## Build docker image with the manager.
+	$(CONTAINER_TOOL) build -t ${IMG} .
+
+.PHONY: docker-push
+docker-push: ## Push docker image with the manager.
+	$(CONTAINER_TOOL) push ${IMG}
+
+# PLATFORMS defines the target platforms for the manager image be built to provide support to multiple
+# architectures. (i.e. make docker-buildx IMG=myregistry/mypoperator:0.0.1). To use this option you need to:
+# - be able to use docker buildx. More info: https://docs.docker.com/build/buildx/
+# - have enabled BuildKit. More info: https://docs.docker.com/develop/develop-images/build_enhancements/
+# - be able to push the image to your registry (i.e. if you do not set a valid value via IMG=<myregistry/image:<tag>> then the export will fail)
+# To adequately provide solutions that are compatible with multiple platforms, you should consider using this option.
+PLATFORMS ?= linux/arm64,linux/amd64,linux/s390x,linux/ppc64le
+.PHONY: docker-buildx
+docker-buildx: ## Build and push docker image for the manager for cross-platform support
+	# copy existing Dockerfile and insert --platform=${BUILDPLATFORM} into Dockerfile.cross, and preserve the original Dockerfile
+	sed -e '1 s/\(^FROM\)/FROM --platform=\$$\{BUILDPLATFORM\}/; t' -e ' 1,// s//FROM --platform=\$$\{BUILDPLATFORM\}/' Dockerfile > Dockerfile.cross
+	- $(CONTAINER_TOOL) buildx create --name project-v3-builder
+	$(CONTAINER_TOOL) buildx use project-v3-builder
+	- $(CONTAINER_TOOL) buildx build --push --platform=$(PLATFORMS) --tag ${IMG} -f Dockerfile.cross .
+	- $(CONTAINER_TOOL) buildx rm project-v3-builder
+	rm Dockerfile.cross
+
+##@ Deployment
+
+GPU_OPERATOR_NAMESPACE ?= gpu-operator
+GPU_OPERATOR_EXTRA_HELM_ARGS ?=
+
+.PHONY: install-gpu-operator
+install-gpu-operator: helm ## Install NVIDIA GPU Operator if not already present.
+	@if $(HELM) list -n $(GPU_OPERATOR_NAMESPACE) -q 2>/dev/null | grep -q '^gpu-operator$$'; then \
+		echo "GPU Operator is already installed — skipping."; \
+	else \
+		echo "Installing NVIDIA GPU Operator..."; \
+		$(HELM) repo add nvidia https://helm.ngc.nvidia.com/nvidia --force-update; \
+		$(HELM) repo update nvidia; \
+		$(HELM) upgrade --install gpu-operator nvidia/gpu-operator \
+			--namespace $(GPU_OPERATOR_NAMESPACE) --create-namespace \
+			$(GPU_OPERATOR_EXTRA_HELM_ARGS) \
+			--wait --timeout=600s; \
+		echo "GPU Operator installed successfully."; \
+	fi
+
+.PHONY: install-gpu-operator-no-driver
+install-gpu-operator-no-driver: ## Install NVIDIA GPU Operator, skipping driver install (for AKS, etc. that provide their own).
+	$(MAKE) install-gpu-operator GPU_OPERATOR_EXTRA_HELM_ARGS="--set driver.enabled=false --set toolkit.enabled=false --set operator.runtimeClass=nvidia-container-runtime"
+
+##@ Cleanup
+
+# Namespace and Helm release used by Tilt dev-loop (matches Tiltfile defaults).
+DYNAMO_NAMESPACE ?= dynamo-system
+DYNAMO_HELM_RELEASE ?= dynamo
+# Grace period (seconds) before force-deleting stuck resources.
+TEARDOWN_GRACE_PERIOD ?= 30
+
+.PHONY: tilt-down
+tilt-down: ## Stop Tilt and remove all Tilt-managed resources.
+	@echo "Stopping Tilt..."
+	@tilt down 2>/dev/null || echo "Tilt was not running — skipping."
+
+.PHONY: clean-tilt
+clean-tilt: tilt-down ## Stop Tilt, remove its build artifacts, and delete the dev namespace.
+	@echo "Removing Tilt build artifacts..."
+	@rm -rf tilt_bin
+	@echo "Deleting Tilt dev namespace $(DYNAMO_NAMESPACE)..."
+	@$(KUBECTL) delete namespace $(DYNAMO_NAMESPACE) --ignore-not-found --timeout=$(TEARDOWN_GRACE_PERIOD)s 2>/dev/null || { \
+		echo "WARNING: namespace $(DYNAMO_NAMESPACE) stuck terminating — force-removing finalizers..."; \
+		$(KUBECTL) get namespace $(DYNAMO_NAMESPACE) -o json \
+			| sed 's/"kubernetes"//' \
+			| $(KUBECTL) replace --raw "/api/v1/namespaces/$(DYNAMO_NAMESPACE)/finalize" -f - 2>/dev/null || true; \
+	}
+
+.PHONY: clean-dynamo-crds
+clean-dynamo-crds: kubectl ## Delete all Dynamo CRDs (these survive helm uninstall due to resource-policy: keep).
+	@echo "Deleting Dynamo custom resources..."
+	@for crd in $$($(KUBECTL) get crd -o name 2>/dev/null | grep 'nvidia.com' | sed 's|customresourcedefinition.apiextensions.k8s.io/||'); do \
+		echo "  Deleting all $$crd instances..."; \
+		$(KUBECTL) delete "$$crd" --all -A --timeout=$(TEARDOWN_GRACE_PERIOD)s 2>/dev/null || { \
+			echo "  Timed out — stripping finalizers from remaining $$crd instances..."; \
+			$(KUBECTL) get "$$crd" -A -o jsonpath='{range .items[*]}{.metadata.namespace}{" "}{.metadata.name}{"\n"}{end}' 2>/dev/null | \
+			while read -r ns name; do \
+				[ -z "$$name" ] && continue; \
+				$(KUBECTL) patch "$$crd" "$$name" -n "$$ns" --type=merge -p '{"metadata":{"finalizers":null}}' 2>/dev/null || true; \
+			done; \
+			$(KUBECTL) delete "$$crd" --all -A --force --grace-period=0 2>/dev/null || true; \
+		}; \
+	done
+	@echo "Deleting Dynamo CRDs..."
+	@$(KUBECTL) get crd -o name 2>/dev/null | grep 'nvidia.com' | xargs -r $(KUBECTL) delete --timeout=$(TEARDOWN_GRACE_PERIOD)s 2>/dev/null || \
+		$(KUBECTL) get crd -o name 2>/dev/null | grep 'nvidia.com' | xargs -r $(KUBECTL) delete --force --grace-period=0 2>/dev/null || \
+		echo "No Dynamo CRDs found or already removed."
+
+.PHONY: clean-dynamo-helm
+clean-dynamo-helm: helm ## Uninstall Dynamo Helm releases and delete their namespaces.
+	@echo "Uninstalling Dynamo Helm releases..."
+	@$(HELM) uninstall $(DYNAMO_HELM_RELEASE) --namespace $(DYNAMO_NAMESPACE) --wait --timeout=120s 2>/dev/null || \
+		$(HELM) uninstall $(DYNAMO_HELM_RELEASE) --namespace $(DYNAMO_NAMESPACE) --no-hooks 2>/dev/null || \
+		echo "No Helm release '$(DYNAMO_HELM_RELEASE)' in namespace '$(DYNAMO_NAMESPACE)' — skipped."
+	@$(HELM) uninstall dynamo-platform --namespace dynamo --wait --timeout=120s 2>/dev/null || \
+		$(HELM) uninstall dynamo-platform --namespace dynamo --no-hooks 2>/dev/null || \
+		echo "No Helm release 'dynamo-platform' in namespace 'dynamo' — skipped."
+	@echo "Deleting Dynamo namespaces..."
+	@for ns in $(DYNAMO_NAMESPACE) dynamo; do \
+		if $(KUBECTL) get namespace "$$ns" >/dev/null 2>&1; then \
+			echo "  Deleting namespace $$ns..."; \
+			$(KUBECTL) delete namespace "$$ns" --timeout=$(TEARDOWN_GRACE_PERIOD)s 2>/dev/null || { \
+				echo "  WARNING: namespace $$ns stuck terminating — force-removing finalizers..."; \
+				$(KUBECTL) get namespace "$$ns" -o json \
+					| sed 's/"kubernetes"//' \
+					| $(KUBECTL) replace --raw "/api/v1/namespaces/$$ns/finalize" -f - 2>/dev/null || true; \
+			}; \
+		fi; \
+	done
+
+.PHONY: clean-gpu-operator
+clean-gpu-operator: helm ## Uninstall the NVIDIA GPU Operator and delete its namespace.
+	@if $(HELM) list -n $(GPU_OPERATOR_NAMESPACE) -q 2>/dev/null | grep -q '^gpu-operator$$'; then \
+		echo "Uninstalling GPU Operator..."; \
+		$(HELM) uninstall gpu-operator --namespace $(GPU_OPERATOR_NAMESPACE) --wait --timeout=120s 2>/dev/null || \
+			$(HELM) uninstall gpu-operator --namespace $(GPU_OPERATOR_NAMESPACE) --no-hooks; \
+		echo "Deleting GPU Operator namespace $(GPU_OPERATOR_NAMESPACE)..."; \
+		$(KUBECTL) delete namespace $(GPU_OPERATOR_NAMESPACE) --ignore-not-found --timeout=$(TEARDOWN_GRACE_PERIOD)s 2>/dev/null || { \
+			echo "WARNING: namespace $(GPU_OPERATOR_NAMESPACE) stuck terminating — force-removing finalizers..."; \
+			$(KUBECTL) get namespace $(GPU_OPERATOR_NAMESPACE) -o json \
+				| sed 's/"kubernetes"//' \
+				| $(KUBECTL) replace --raw "/api/v1/namespaces/$(GPU_OPERATOR_NAMESPACE)/finalize" -f - 2>/dev/null || true; \
+		}; \
+		echo "GPU Operator removed."; \
+	else \
+		echo "GPU Operator is not installed — skipping."; \
+	fi
+
+.PHONY: clean-cluster
+clean-cluster: kubectl helm ## Remove ALL Dynamo resources from the cluster and local build artifacts.
+	@echo ""
+	@echo "================================================================"
+	@echo "  Dynamo Full Cluster Cleanup"
+	@echo "================================================================"
+	@echo ""
+	$(MAKE) clean-dynamo-crds
+	$(MAKE) clean-tilt
+	$(MAKE) clean-dynamo-helm
+	$(MAKE) clean-gpu-operator
+	$(MAKE) clean-bin
+	@echo ""
+	@echo "================================================================"
+	@echo "  Cluster is clean."
+	@echo "================================================================"
+	@echo ""
+
+##@ Dependencies
+
+## Location to install dependencies to
+LOCALBIN ?= $(CURDIR)/bin
+$(LOCALBIN):
+	mkdir -p $(LOCALBIN)
+
+.PHONY: clean-bin
+clean-bin: ## Remove all downloaded tool binaries.
+	rm -rf $(LOCALBIN)
+
+## Prefer project-local binaries over system-wide ones.
+export PATH := $(LOCALBIN):$(PATH)
+
+## Tool Versions
+KUBECTL_VERSION ?= v1.36.1
+KIND_VERSION ?= v0.32.0
+HELM_VERSION ?= v3.17.3
+YQ_VERSION ?= v4.45.4
+CONTROLLER_TOOLS_VERSION ?= v0.17.3
+ENVTEST_VERSION ?= release-0.19
+GOLANGCI_LINT_VERSION ?= v2.15.0
+# kube-api-linter publishes no tags; this pseudo-version is its 2026-10-12 main.
+KUBE_API_LINTER_VERSION ?= v0.0.0-20261012124120-79b557aa8c8d
+
+## Tool Binaries
+KUBECTL ?= $(LOCALBIN)/kubectl-$(KUBECTL_VERSION)
+KIND ?= $(LOCALBIN)/kind-$(KIND_VERSION)
+HELM ?= $(LOCALBIN)/helm-$(HELM_VERSION)
+YQ ?= $(LOCALBIN)/yq-$(YQ_VERSION)
+CONTROLLER_GEN ?= $(LOCALBIN)/controller-gen-$(CONTROLLER_TOOLS_VERSION)
+ENVTEST ?= $(LOCALBIN)/setup-envtest-$(ENVTEST_VERSION)
+GOLANGCI_LINT = $(LOCALBIN)/golangci-lint-$(GOLANGCI_LINT_VERSION)
+KUBE_API_LINTER = $(LOCALBIN)/golangci-lint-kube-api-linter-$(KUBE_API_LINTER_VERSION)
+
+## ---------- Binary download targets ----------
+
+.PHONY: kubectl
+kubectl: $(KUBECTL) ## Download kubectl locally if necessary.
+$(KUBECTL):
+	mkdir -p $(LOCALBIN)
+	rm -f $(LOCALBIN)/kubectl-*
+	curl --retry $(CURL_RETRIES) -fsL \
+		https://dl.k8s.io/release/$(KUBECTL_VERSION)/bin/$(GOOS)/$(GOARCH)/kubectl \
+		-o $(KUBECTL)
+	ln -sf $(KUBECTL) $(LOCALBIN)/kubectl
+	chmod +x $(KUBECTL) $(LOCALBIN)/kubectl
+
+.PHONY: kind
+kind: $(KIND) ## Download kind locally if necessary.
+$(KIND):
+	mkdir -p $(LOCALBIN)
+	rm -f $(LOCALBIN)/kind-*
+	curl --retry $(CURL_RETRIES) -fsL \
+		https://kind.sigs.k8s.io/dl/$(KIND_VERSION)/kind-$(GOOS)-$(GOARCH) \
+		-o $(KIND)
+	ln -sf $(KIND) $(LOCALBIN)/kind
+	chmod +x $(KIND) $(LOCALBIN)/kind
+
+.PHONY: helm
+helm: $(HELM) ## Download helm locally if necessary.
+$(HELM):
+	mkdir -p $(LOCALBIN)
+	rm -f $(LOCALBIN)/helm-*
+	curl --retry $(CURL_RETRIES) -fsSL https://get.helm.sh/helm-$(HELM_VERSION)-$(GOOS)-$(GOARCH).tar.gz \
+		| tar xzf - --strip-components=1 -C $(LOCALBIN) $(GOOS)-$(GOARCH)/helm
+	mv $(LOCALBIN)/helm $(HELM)
+	ln -sf $(HELM) $(LOCALBIN)/helm
+	chmod +x $(HELM) $(LOCALBIN)/helm
+
+.PHONY: yq
+yq: $(YQ) ## Download yq locally if necessary.
+$(YQ):
+	mkdir -p $(LOCALBIN)
+	rm -f $(LOCALBIN)/yq-*
+	curl --retry $(CURL_RETRIES) -fsL \
+		https://github.com/mikefarah/yq/releases/download/$(YQ_VERSION)/yq_$(GOOS)_$(GOARCH) \
+		-o $(YQ)
+	ln -sf $(YQ) $(LOCALBIN)/yq
+	chmod +x $(YQ) $(LOCALBIN)/yq
+
+.PHONY: controller-gen
+controller-gen: $(CONTROLLER_GEN) ## Download controller-gen locally if necessary.
+$(CONTROLLER_GEN): $(LOCALBIN)
+	$(call go-install-tool,$(CONTROLLER_GEN),sigs.k8s.io/controller-tools/cmd/controller-gen,$(CONTROLLER_TOOLS_VERSION))
+
+.PHONY: setup-envtest
+setup-envtest: $(ENVTEST) ## Download setup-envtest and envtest Kubernetes assets locally if necessary.
+	$(ENVTEST_ASSETS_CMD) >/dev/null
+$(ENVTEST): $(LOCALBIN)
+	$(call go-install-tool,$(ENVTEST),sigs.k8s.io/controller-runtime/tools/setup-envtest,$(ENVTEST_VERSION))
+
+.PHONY: golangci-lint
+golangci-lint: $(GOLANGCI_LINT) ## Download golangci-lint locally if necessary.
+$(GOLANGCI_LINT): $(LOCALBIN)
+	$(call go-install-tool,$(GOLANGCI_LINT),github.com/golangci/golangci-lint/v2/cmd/golangci-lint,${GOLANGCI_LINT_VERSION})
+
+.PHONY: kube-api-linter
+kube-api-linter: $(KUBE_API_LINTER) ## Build the golangci-lint that includes kube-api-linter locally if necessary.
+$(KUBE_API_LINTER): $(LOCALBIN)
+	$(call go-install-tool,$(KUBE_API_LINTER),sigs.k8s.io/kube-api-linter/cmd/golangci-lint-kube-api-linter,${KUBE_API_LINTER_VERSION})
+
+# go-install-tool will 'go install' any package with custom target and name of binary, if it doesn't exist
+# $1 - target path with name of binary (ideally with version)
+# $2 - package url which can be installed
+# $3 - specific version of package
+define go-install-tool
+@[ -f $(1) ] || { \
+set -e; \
+package=$(2)@$(3) ;\
+echo "Downloading $${package}" ;\
+GOBIN=$(LOCALBIN) go install $${package} ;\
+mv "$$(echo "$(1)" | sed "s/-$(3)$$//")" $(1) ;\
+}
+endef
+
+######################### CRD Reference Docs
+CRD_REF_DOCS_VERSION ?= v0.3.0
+CRD_REF_DOCS ?= $(LOCALBIN)/crd-ref-docs
+
+.PHONY: crd-ref-docs
+crd-ref-docs: $(CRD_REF_DOCS) ## Download crd-ref-docs locally if necessary.
+$(CRD_REF_DOCS): $(LOCALBIN)
+	@echo "Installing crd-ref-docs $(CRD_REF_DOCS_VERSION)"
+	@GOBIN=$(LOCALBIN) go install github.com/elastic/crd-ref-docs@$(CRD_REF_DOCS_VERSION)
+	@echo "✅ crd-ref-docs $(CRD_REF_DOCS_VERSION) installed successfully"
+
+.PHONY: generate-api-docs
+generate-api-docs: crd-ref-docs ## Generate API reference documentation from CRDs
+	@echo "📚 Generating CRD API reference documentation..."
+	@mkdir -p docs
+	@$(CRD_REF_DOCS) \
+		--source-path=api \
+		--config=docs/crd-ref-docs-config.yaml \
+		--renderer=markdown \
+		--output-path=./docs/api_reference.md
+	@echo "✅ Generated API reference at ./docs/api_reference.md"
+	# concatenate header.md, api_reference.md, and footer.md
+	cat docs/header.md ./docs/api_reference.md docs/footer.md > ../../docs/fern/pages/reference/kubernetes-api/additional-resources/api-reference-k8s.md
+	rm ./docs/api_reference.md
+	@echo "✅ Concatenated header.md, api_reference.md, and footer.md"
+	# Post-process duplicate anchors and fields pruned from standalone DCD CRDs.
+	python3 docs/fix-api-anchors.py ../../docs/fern/pages/reference/kubernetes-api/additional-resources/api-reference-k8s.md
+	python3 ../../docs/fern/scripts/gen_kubernetes_api.py
+
+HELM_CHART_DIR := ../helm/charts/platform
+
+.PHONY: generate-helm-docs
+generate-helm-docs: ## Generate Helm chart README from values.yaml and template
+	@$(MAKE) -C $(HELM_CHART_DIR) generate-helm-docs
+
+.PHONY: coverage
+coverage: test
+	go tool cover -func=cover.out
+
+.PHONY: clustertest-upgrade-contract clustertest-upgrade-contract-in-cluster
+clustertest-upgrade-contract: kind kubectl ## Replay in a fresh exclusive Kind cluster; clean up on exit.
+	KIND_BIN='$(KIND)' bash hack/run_upgrade_clustertest.sh clustertest-upgrade-contract-in-cluster
+
+clustertest-upgrade-contract-in-cluster: ## Replay in an explicitly selected, exclusively owned cluster.
+	@test -n "$${DYNAMO_CLUSTERTEST_CONTEXT:-}" || { echo "DYNAMO_CLUSTERTEST_CONTEXT is required"; exit 1; }
+	python3 hack/generate_upgrade_fixtures.py --check
+	go test -tags=clustertest ./internal/testing/clusterenv -run '^TestCluster(HistoryStorage|ComponentHistoryBlocksWorkloads)$$' -count=1 -v -timeout=3m
+	go test -tags='clustertest upgradecontract' ./internal/controller -run '^TestClusterOperatorUpgrade$$' -parallel=$(UPGRADE_TEST_PARALLELISM) -count=1 -v -timeout=30m
+
+.PHONY: clustertest-upgrade-fixtures-regen clustertest-upgrade-fixtures-regen-in-cluster
+clustertest-upgrade-fixtures-regen: kind kubectl ## Capture a pinned release tree in a fresh exclusive Kind cluster.
+	python3 hack/generate_upgrade_fixtures.py --check-release-matrix $(if $(UPGRADE_RELEASE_TAG),--release-tag "$(UPGRADE_RELEASE_TAG)")
+	KIND_BIN='$(KIND)' bash hack/run_upgrade_clustertest.sh clustertest-upgrade-fixtures-regen-in-cluster
+
+clustertest-upgrade-fixtures-regen-in-cluster: ## Capture the selected released tag, or save provisional candidate evidence.
+	@test -n "$${DYNAMO_CLUSTERTEST_CONTEXT:-}" || { echo "DYNAMO_CLUSTERTEST_CONTEXT is required"; exit 1; }
+	python3 hack/generate_upgrade_fixtures.py --regenerate $(if $(UPGRADE_RELEASE_TAG),--release-tag "$(UPGRADE_RELEASE_TAG)") $(if $(UPGRADE_CANDIDATE_SHA),--candidate-sha "$(UPGRADE_CANDIDATE_SHA)") $(if $(UPGRADE_CANDIDATE_OUTPUT),--candidate-output "$(UPGRADE_CANDIDATE_OUTPUT)")

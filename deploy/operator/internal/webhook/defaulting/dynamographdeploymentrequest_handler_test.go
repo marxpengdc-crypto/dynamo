@@ -1,0 +1,201 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package defaulting
+
+import (
+	"context"
+	"testing"
+
+	nvidiacomv1beta1 "github.com/ai-dynamo/dynamo/deploy/operator/api/v1beta1"
+	admissionv1 "k8s.io/api/admission/v1"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
+)
+
+func TestDefaultPlannerImageFor(t *testing.T) {
+	// Note: the default planner image is only published starting from Dynamo 1.1.0,
+	// so these tests use 1.1.0 as the earliest known valid version.
+	tests := []struct {
+		name            string
+		operatorVersion string
+		defaultImage    string
+		expectedImage   string
+	}{
+		{
+			name:            "explicit default image bypasses version derivation",
+			operatorVersion: "1.4.0-dev.20260810.ga3a3c24",
+			defaultImage:    "nvcr.io/nvidia/ai-dynamo/dynamo-planner-nightly:20260810-a3a3c24",
+			expectedImage:   "nvcr.io/nvidia/ai-dynamo/dynamo-planner-nightly:20260810-a3a3c24",
+		},
+		{
+			name:            "known version produces default image",
+			operatorVersion: "1.1.0",
+			expectedImage:   "nvcr.io/nvidia/ai-dynamo/dynamo-planner:1.1.0",
+		},
+		{
+			name:            "pre-release version is valid",
+			operatorVersion: "1.1.0-rc1",
+			expectedImage:   "nvcr.io/nvidia/ai-dynamo/dynamo-planner:1.1.0-rc1",
+		},
+		{
+			name:            "partial version is normalized",
+			operatorVersion: "1.2",
+			expectedImage:   "nvcr.io/nvidia/ai-dynamo/dynamo-planner:1.2.0",
+		},
+		{
+			name:            "leading v is normalized",
+			operatorVersion: "v1.2.3",
+			expectedImage:   "nvcr.io/nvidia/ai-dynamo/dynamo-planner:1.2.3",
+		},
+		{
+			name:            "unknown operator version cannot be defaulted",
+			operatorVersion: "unknown",
+			expectedImage:   "",
+		},
+		{
+			name:            "empty operator version cannot be defaulted",
+			operatorVersion: "",
+			expectedImage:   "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := PlannerImageFor(tt.operatorVersion, tt.defaultImage)
+			if got != tt.expectedImage {
+				t.Errorf("PlannerImageFor() = %q, want %q", got, tt.expectedImage)
+			}
+		})
+	}
+}
+
+func makeAdmissionCtx(op admissionv1.Operation) context.Context {
+	req := admission.Request{
+		Operation: op,
+		Kind: metav1.GroupVersionKind{
+			Group:   nvidiacomv1beta1.DynamoGraphDeploymentRequestGVK.Group,
+			Version: nvidiacomv1beta1.DynamoGraphDeploymentRequestGVK.Version,
+			Kind:    nvidiacomv1beta1.DynamoGraphDeploymentRequestGVK.Kind,
+		},
+	}
+	return admission.NewContextWithRequest(context.Background(), req)
+}
+
+func TestDGDRDefaulter_Default(t *testing.T) {
+	tests := []struct {
+		name          string
+		version       string
+		operation     admissionv1.Operation
+		initialImage  string
+		expectedImage string
+	}{
+		{
+			name:          "CREATE with preset image is not overwritten",
+			version:       "1.1.0",
+			operation:     admissionv1.Create,
+			initialImage:  "my-registry/my-image:custom",
+			expectedImage: "my-registry/my-image:custom",
+		},
+		{
+			name:          "CREATE with unknown operator version leaves image empty",
+			version:       "unknown",
+			operation:     admissionv1.Create,
+			initialImage:  "",
+			expectedImage: "",
+		},
+		{
+			name:          "UPDATE does not default image",
+			version:       "1.1.0",
+			operation:     admissionv1.Update,
+			initialImage:  "",
+			expectedImage: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			d := NewDGDRDefaulter(tt.version, "")
+			dgdr := &nvidiacomv1beta1.DynamoGraphDeploymentRequest{
+				Name: "test", Namespace: "default",
+				Spec: nvidiacomv1beta1.DynamoGraphDeploymentRequestSpec{Image: tt.initialImage},
+			}
+			ctx := makeAdmissionCtx(tt.operation)
+			if err := d.Default(ctx, dgdr); err != nil {
+				t.Fatalf("Default() unexpected error: %v", err)
+			}
+			if dgdr.Spec.Image != tt.expectedImage {
+				t.Errorf("after Default(): spec.image = %q, want %q", dgdr.Spec.Image, tt.expectedImage)
+			}
+		})
+	}
+}
+
+func TestDGDRDefaulter_DefaultsNativeV1Beta1Fields(t *testing.T) {
+	dgdr := &nvidiacomv1beta1.DynamoGraphDeploymentRequest{}
+	if err := NewDGDRDefaulter("1.1.0", "").Default(makeAdmissionCtx(admissionv1.Create), dgdr); err != nil {
+		t.Fatalf("Default() error = %v", err)
+	}
+
+	if dgdr.Spec.Backend != nvidiacomv1beta1.BackendTypeAuto {
+		t.Errorf("spec.backend = %q, want %q", dgdr.Spec.Backend, nvidiacomv1beta1.BackendTypeAuto)
+	}
+	if dgdr.Spec.SearchStrategy != nvidiacomv1beta1.SearchStrategyRapid {
+		t.Errorf("spec.searchStrategy = %q, want %q", dgdr.Spec.SearchStrategy, nvidiacomv1beta1.SearchStrategyRapid)
+	}
+	if dgdr.Spec.AutoApply == nil || !*dgdr.Spec.AutoApply {
+		t.Errorf("spec.autoApply = %v, want true", dgdr.Spec.AutoApply)
+	}
+}
+
+func TestDGDRDefaulter_DoesNotDefaultV1Beta2Envelope(t *testing.T) {
+	dgdr := &nvidiacomv1beta1.DynamoGraphDeploymentRequest{
+		Spec: nvidiacomv1beta1.DynamoGraphDeploymentRequestSpec{
+			V1Beta2: &apiextensionsv1.JSON{Raw: []byte(`{"modelRef":{"name":"test"}}`)},
+		},
+	}
+	if err := NewDGDRDefaulter("1.1.0", "").Default(makeAdmissionCtx(admissionv1.Create), dgdr); err != nil {
+		t.Fatalf("Default() error = %v", err)
+	}
+
+	if dgdr.Spec.Backend != "" || dgdr.Spec.SearchStrategy != "" || dgdr.Spec.AutoApply != nil || dgdr.Spec.Image != "" {
+		t.Fatalf("envelope received native defaults: %#v", dgdr.Spec)
+	}
+}
+
+func TestDGDRDefaulter_DefaultsNativeFieldsOnUpdate(t *testing.T) {
+	t.Log("Update a native v1beta1 request after removing all migrated defaulted fields")
+	dgdr := &nvidiacomv1beta1.DynamoGraphDeploymentRequest{}
+	if err := NewDGDRDefaulter("1.1.0", "").Default(makeAdmissionCtx(admissionv1.Update), dgdr); err != nil {
+		t.Fatalf("Default() error = %v", err)
+	}
+
+	t.Log("Require API defaults to return without deriving the create-only image")
+	if dgdr.Spec.Backend != nvidiacomv1beta1.BackendTypeAuto {
+		t.Errorf("spec.backend = %q, want %q", dgdr.Spec.Backend, nvidiacomv1beta1.BackendTypeAuto)
+	}
+	if dgdr.Spec.SearchStrategy != nvidiacomv1beta1.SearchStrategyRapid {
+		t.Errorf("spec.searchStrategy = %q, want %q", dgdr.Spec.SearchStrategy, nvidiacomv1beta1.SearchStrategyRapid)
+	}
+	if dgdr.Spec.AutoApply == nil || !*dgdr.Spec.AutoApply {
+		t.Errorf("spec.autoApply = %v, want true", dgdr.Spec.AutoApply)
+	}
+	if dgdr.Spec.Image != "" {
+		t.Errorf("spec.image = %q, want empty on update", dgdr.Spec.Image)
+	}
+}

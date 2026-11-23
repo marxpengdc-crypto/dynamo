@@ -1,0 +1,182 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+package dynamo
+
+import (
+	"fmt"
+	"strconv"
+
+	"github.com/ai-dynamo/dynamo/deploy/operator/api/v1beta1"
+	commonconsts "github.com/ai-dynamo/dynamo/deploy/operator/internal/consts"
+	runtimefeatures "github.com/ai-dynamo/dynamo/deploy/operator/internal/features/runtime"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
+)
+
+// WorkerDefaults implements ComponentDefaults for Worker components
+type WorkerDefaults struct {
+	*BaseComponentDefaults
+}
+
+func NewWorkerDefaults() *WorkerDefaults {
+	return &WorkerDefaults{&BaseComponentDefaults{}}
+}
+
+func (w *WorkerDefaults) GetBaseContainer(context ComponentContext) (corev1.Container, error) {
+	container := w.getCommonContainer(context)
+	canaryHealthChecksEnabled := runtimefeatures.CanaryHealthChecks.Enabled(context.RuntimeVersion)
+	livenessFailureThreshold := int32(1)
+	if runtimefeatures.IncreasedWorkerFailureThreshold.Enabled(context.RuntimeVersion) {
+		livenessFailureThreshold = 3
+	}
+
+	// Add system port
+	container.Ports = []corev1.ContainerPort{
+		{
+			Protocol:      corev1.ProtocolTCP,
+			Name:          commonconsts.DynamoSystemPortName,
+			ContainerPort: int32(commonconsts.DynamoSystemPort),
+		},
+		{
+			Protocol:      corev1.ProtocolTCP,
+			Name:          commonconsts.DynamoNixlPortName,
+			ContainerPort: int32(commonconsts.DynamoNixlPort),
+		},
+	}
+
+	// Restart legacy workers after one failed liveness check and newer workers after three.
+	container.LivenessProbe = &corev1.Probe{
+		HTTPGet: &corev1.HTTPGetAction{
+			Path: "/live",
+			Port: intstr.FromString(commonconsts.DynamoSystemPortName),
+		},
+		PeriodSeconds:    5,
+		TimeoutSeconds:   4, // TimeoutSeconds should be < PeriodSeconds
+		FailureThreshold: livenessFailureThreshold,
+	}
+
+	// ReadinessProbe in Dynamo worker context doesn't determine that the worker is ready to receive traffic
+	// Since worker registration is done through external KvStore and Transport does not use Kubernetes Service
+	// Still important for external depencies that rely on Pod Readiness
+	container.ReadinessProbe = &corev1.Probe{
+		HTTPGet: &corev1.HTTPGetAction{
+			Path: "/health",
+			Port: intstr.FromString(commonconsts.DynamoSystemPortName),
+		},
+		PeriodSeconds:    10,
+		TimeoutSeconds:   4,
+		FailureThreshold: 3,
+	}
+
+	container.StartupProbe = &corev1.Probe{
+		HTTPGet: &corev1.HTTPGetAction{
+			Path: "/live",
+			Port: intstr.FromString(commonconsts.DynamoSystemPortName),
+		},
+		PeriodSeconds:    10,
+		TimeoutSeconds:   5,
+		FailureThreshold: 720, // 10s * 720 = 7200s = 2h
+	}
+
+	container.Env = append(container.Env, []corev1.EnvVar{
+		{
+			Name:  "DYN_SYSTEM_ENABLED",
+			Value: "true",
+		},
+		{
+			Name:  "DYN_SYSTEM_USE_ENDPOINT_HEALTH_STATUS",
+			Value: "[\"generate\"]",
+		},
+		{
+			Name:  "DYN_SYSTEM_PORT",
+			Value: fmt.Sprintf("%d", commonconsts.DynamoSystemPort),
+		},
+		{
+			Name:  "DYN_HEALTH_CHECK_ENABLED",
+			Value: strconv.FormatBool(canaryHealthChecksEnabled),
+		},
+		{
+			Name:  "NIXL_TELEMETRY_ENABLE",
+			Value: "n",
+		},
+		{
+			Name:  "NIXL_TELEMETRY_EXPORTER",
+			Value: "prometheus",
+		},
+		{
+			Name:  "NIXL_TELEMETRY_PROMETHEUS_PORT",
+			Value: fmt.Sprintf("%d", commonconsts.DynamoNixlPort),
+		},
+		{
+			Name:  "DYN_FORWARDPASS_METRIC_PORT",
+			Value: fmt.Sprintf("%d", commonconsts.DynamoFPMBasePort),
+		},
+	}...)
+
+	if context.WorkerHashSuffix != "" {
+		container.Env = append(container.Env, []corev1.EnvVar{
+			{
+				Name:  commonconsts.DynamoNamespaceWorkerSuffixEnvVar,
+				Value: context.WorkerHashSuffix,
+			},
+		}...)
+	}
+
+	return container, nil
+}
+
+const (
+	topologyVolumeName = "topology-labels"
+	topologyMountPath  = "/etc/dynamo/topology"
+)
+
+// TopologyLabelVolume returns a Downward API volume that projects topology pod
+// labels into files. The volume updates dynamically when labels are added or
+// changed, so the runtime can poll until the files have content.
+func TopologyLabelVolume(policy *v1beta1.KvTransferPolicy, groveClusterTopologyDomains []v1beta1.TopologyDomain) corev1.Volume {
+	return corev1.Volume{
+		Name: topologyVolumeName,
+		DownwardAPI: &corev1.DownwardAPIVolumeSource{
+			Items: topologyLabelVolumeItems(policy, groveClusterTopologyDomains),
+		},
+	}
+}
+
+func topologyLabelVolumeItems(policy *v1beta1.KvTransferPolicy, groveClusterTopologyDomains []v1beta1.TopologyDomain) []corev1.DownwardAPIVolumeFile {
+	if policy == nil {
+		return nil
+	}
+	if policy.LabelKey != "" {
+		return []corev1.DownwardAPIVolumeFile{
+			{
+				Path: string(policy.Domain),
+				FieldRef: &corev1.ObjectFieldSelector{
+					FieldPath: fmt.Sprintf("metadata.labels['%s']", policy.LabelKey),
+				},
+			},
+		}
+	}
+
+	items := make([]corev1.DownwardAPIVolumeFile, 0, len(groveClusterTopologyDomains))
+	for _, domain := range groveClusterTopologyDomains {
+		items = append(items, corev1.DownwardAPIVolumeFile{
+			Path: string(domain),
+			FieldRef: &corev1.ObjectFieldSelector{
+				FieldPath: fmt.Sprintf("metadata.labels['%s']", commonconsts.DynamoTopologyLabelKey(string(domain))),
+			},
+		})
+	}
+	return items
+}
+
+// TopologyLabelVolumeMount returns the volume mount for the topology label volume.
+func TopologyLabelVolumeMount() corev1.VolumeMount {
+	return corev1.VolumeMount{
+		Name:      topologyVolumeName,
+		MountPath: topologyMountPath,
+		ReadOnly:  true,
+	}
+}

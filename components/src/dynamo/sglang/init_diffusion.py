@@ -1,0 +1,275 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+import asyncio
+import logging
+import os
+from typing import Awaitable, Callable
+
+import sglang as sgl
+
+from dynamo.common.model_taints import register_model_taint_route
+from dynamo.common.storage import get_fs
+from dynamo.common.utils.endpoint_types import parse_endpoint_types
+from dynamo.llm import WorkerType
+from dynamo.runtime import DistributedRuntime
+from dynamo.sglang._compat import diffusers_text_encoder_precision_kwargs
+from dynamo.sglang.args import Config, _diffusion_generator_kwargs
+from dynamo.sglang.health_check import (
+    ImageDiffusionHealthCheckPayload,
+    SglangHealthCheckPayload,
+    VideoGenerationHealthCheckPayload,
+)
+from dynamo.sglang.publisher import (
+    finish_worker_teardown,
+    handle_non_leader_node,
+    set_forward_pass_metrics_worker_id,
+    setup_sgl_metrics,
+)
+from dynamo.sglang.register import (
+    register_image_diffusion_model,
+    register_model_with_readiness_gate,
+    register_video_generation_model,
+)
+from dynamo.sglang.request_handlers import (
+    DiffusionWorkerHandler,
+    ImageDiffusionWorkerHandler,
+    VideoGenerationWorkerHandler,
+)
+
+
+async def init_llm_diffusion(
+    runtime: DistributedRuntime,
+    config: Config,
+    shutdown_event: asyncio.Event,
+    shutdown_endpoints: list,
+    run_deferred_handlers: Callable[[], Awaitable[None]] | None = None,
+) -> None:
+    """Initialize diffusion language model worker component"""
+    server_args, dynamo_args = config.server_args, config.dynamo_args
+
+    logging.info(
+        f"Initializing diffusion worker with algorithm: {server_args.dllm_algorithm}"
+    )
+    if server_args.dllm_algorithm_config:
+        logging.info(
+            f"Using diffusion algorithm config: {server_args.dllm_algorithm_config}"
+        )
+
+    if server_args.node_rank >= 1:
+        os.environ["SGLANG_BLOCK_NONZERO_RANK_CHILDREN"] = "0"
+
+    generate_endpoint = runtime.endpoint(
+        f"{dynamo_args.namespace}.{dynamo_args.component}.{dynamo_args.endpoint}"
+    )
+    set_forward_pass_metrics_worker_id(server_args, generate_endpoint)
+
+    engine = sgl.Engine(server_args=server_args)
+    server_args = config.use_resolved_server_args(engine.server_args)
+
+    shutdown_endpoints[:] = [generate_endpoint]
+
+    publisher, metrics_task, metrics_labels = await setup_sgl_metrics(
+        engine, config, generate_endpoint
+    )
+    # ``setup_sgl_metrics`` only returns ``None`` for embedding workers,
+    # which take a different init path entirely. Narrow for mypy.
+    assert publisher is not None, "setup_sgl_metrics returned None on chat path"
+
+    if server_args.node_rank >= 1:
+        await handle_non_leader_node(runtime, engine, publisher, metrics_task)
+        return
+
+    ready_event = asyncio.Event()
+
+    handler = DiffusionWorkerHandler(
+        engine, config, publisher, generate_endpoint, shutdown_event
+    )
+    handler.register_engine_routes(runtime)
+
+    health_check_payload = SglangHealthCheckPayload(
+        engine, use_text_input=dynamo_args.use_sglang_tokenizer
+    ).to_dict()
+
+    logging.info(
+        f"Registering diffusion model with endpoint types: {dynamo_args.endpoint_types}"
+    )
+
+    body_failed = True
+    try:
+        await asyncio.gather(
+            generate_endpoint.serve_endpoint(
+                handler.generate,
+                graceful_shutdown=True,
+                metrics_labels=metrics_labels,
+                health_check_payload=health_check_payload,
+            ),
+            register_model_with_readiness_gate(
+                engine,
+                generate_endpoint,
+                server_args,
+                dynamo_args,
+                output_type=parse_endpoint_types(dynamo_args.endpoint_types),
+                readiness_gate=ready_event,
+                worker_type=WorkerType.Aggregated,
+                needs=[],
+            ),
+        )
+    except Exception as e:
+        logging.error(f"Failed to serve diffusion endpoints: {e}")
+        raise
+    else:
+        body_failed = False
+    finally:
+        await finish_worker_teardown(
+            metrics_task,
+            handler.cleanup,
+            run_deferred_handlers,
+            body_failed=body_failed,
+        )
+
+
+async def init_image_diffusion(
+    runtime: DistributedRuntime,
+    config: Config,
+    shutdown_endpoints: list,
+    run_deferred_handlers: Callable[[], Awaitable[None]] | None = None,
+) -> None:
+    """Initialize image diffusion worker component"""
+    server_args, dynamo_args = config.server_args, config.dynamo_args
+
+    from sglang.multimodal_gen import DiffGenerator
+
+    if not server_args.model_path:
+        raise ValueError("--model is required for diffusion workers")
+
+    generator = DiffGenerator.from_pretrained(
+        **diffusers_text_encoder_precision_kwargs(
+            _diffusion_generator_kwargs(server_args)
+        )
+    )
+
+    fs_url = dynamo_args.media_output_fs_url
+
+    generate_endpoint = runtime.endpoint(
+        f"{dynamo_args.namespace}.{dynamo_args.component}.{dynamo_args.endpoint}"
+    )
+
+    shutdown_endpoints[:] = [generate_endpoint]
+
+    handler = ImageDiffusionWorkerHandler(
+        generator,
+        config,
+        publisher=None,
+        fs=get_fs(fs_url),
+    )
+
+    health_check_payload = ImageDiffusionHealthCheckPayload(
+        model_path=server_args.model_path
+    ).to_dict()
+
+    ready_event = asyncio.Event()
+
+    # The global --output-modalities default is ["text"] which is wrong for
+    # image diffusion workers -- it causes the Rust registration path to look
+    # for config.json (LLM artefacts).  Only override when the user hasn't
+    # explicitly chosen a non-default value.
+    output_modalities = dynamo_args.output_modalities
+    if output_modalities is None or output_modalities == ["text"]:
+        output_modalities = ["image"]
+        logging.info(
+            "Overriding output_modalities to ['image'] for image diffusion worker"
+        )
+
+    register_model_taint_route(runtime, generate_endpoint)
+    try:
+        await asyncio.gather(
+            generate_endpoint.serve_endpoint(
+                handler.generate,
+                graceful_shutdown=True,
+                metrics_labels=[],
+                health_check_payload=health_check_payload,
+            ),
+            register_image_diffusion_model(
+                generator,
+                generate_endpoint,
+                server_args,
+                output_modalities=output_modalities,
+                readiness_gate=ready_event,
+            ),
+        )
+    except Exception as e:
+        logging.error(f"Failed to serve image diffusion endpoints: {e}")
+        raise
+    finally:
+        handler.cleanup()
+        if run_deferred_handlers is not None:
+            logging.info("Running deferred handlers")
+            await run_deferred_handlers()
+
+
+async def init_video_diffusion(
+    runtime: DistributedRuntime,
+    config: Config,
+    shutdown_endpoints: list,
+    run_deferred_handlers: Callable[[], Awaitable[None]] | None = None,
+) -> None:
+    """Initialize video generation worker component"""
+    server_args, dynamo_args = config.server_args, config.dynamo_args
+
+    from sglang.multimodal_gen import DiffGenerator
+
+    if not server_args.model_path:
+        raise ValueError("--model is required for video generation workers")
+
+    generator = DiffGenerator.from_pretrained(
+        **diffusers_text_encoder_precision_kwargs(
+            _diffusion_generator_kwargs(server_args)
+        )
+    )
+
+    fs_url = dynamo_args.media_output_fs_url
+
+    generate_endpoint = runtime.endpoint(
+        f"{dynamo_args.namespace}.{dynamo_args.component}.{dynamo_args.endpoint}"
+    )
+
+    shutdown_endpoints[:] = [generate_endpoint]
+
+    handler = VideoGenerationWorkerHandler(
+        generator,
+        config,
+        publisher=None,
+        fs=get_fs(fs_url),
+    )
+
+    health_check_payload = VideoGenerationHealthCheckPayload(
+        model_path=server_args.model_path
+    ).to_dict()
+
+    ready_event = asyncio.Event()
+
+    register_model_taint_route(runtime, generate_endpoint)
+    try:
+        await asyncio.gather(
+            generate_endpoint.serve_endpoint(
+                handler.generate,
+                graceful_shutdown=True,
+                metrics_labels=[],
+                health_check_payload=health_check_payload,
+            ),
+            register_video_generation_model(
+                generator,
+                generate_endpoint,
+                server_args,
+                readiness_gate=ready_event,
+            ),
+        )
+    except Exception as e:
+        logging.error(f"Failed to serve video generation endpoints: {e}")
+        raise
+    finally:
+        handler.cleanup()
+        if run_deferred_handlers is not None:
+            logging.info("Running deferred handlers")
+            await run_deferred_handlers()

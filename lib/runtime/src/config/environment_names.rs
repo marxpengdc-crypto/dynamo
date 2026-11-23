@@ -1,0 +1,1359 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+//! Environment variable name constants for centralized management across the codebase
+//!
+//! This module provides centralized environment variable name constants to ensure
+//! consistency and avoid duplication across the codebase, similar to how
+//! `prometheus_names.rs` manages metric names.
+//!
+//! ## Organization
+//!
+//! Environment variables are organized by functional area:
+//! - **Logging**: Log level, configuration, and OTLP tracing
+//! - **Runtime**: Tokio runtime configuration and system server settings
+//! - **NATS**: NATS client connection and authentication
+//! - **ETCD**: ETCD client connection and authentication
+//! - **TCP Request Callback**: bidirectional request callback listener port and host
+//! - **Event Plane**: Event transport selection (NATS)
+//! - **LLM**: Language model inference configuration
+//! - **Model**: Model loading and caching
+//! - **Worker**: Worker lifecycle and shutdown
+//! - **Testing**: Test-specific configuration
+//! - **Mocker**: Mocker (mock scheduler/KV manager) configuration
+
+/// Logging and tracing environment variables
+pub mod logging {
+    /// Log level (e.g., "debug", "info", "warn", "error")
+    pub const DYN_LOG: &str = "DYN_LOG";
+
+    /// Path to logging configuration file
+    pub const DYN_LOGGING_CONFIG_PATH: &str = "DYN_LOGGING_CONFIG_PATH";
+
+    /// Enable JSONL logging format
+    pub const DYN_LOGGING_JSONL: &str = "DYN_LOGGING_JSONL";
+
+    /// Console log format: "readable" or "jsonl"; blank uses the legacy fallback
+    pub const DYN_LOGGING_CONSOLE_FORMAT: &str = "DYN_LOGGING_CONSOLE_FORMAT";
+
+    /// Disable ANSI terminal colors in logs
+    pub const DYN_SDK_DISABLE_ANSI_LOGGING: &str = "DYN_SDK_DISABLE_ANSI_LOGGING";
+
+    /// Use local timezone for logging timestamps (default is UTC)
+    pub const DYN_LOG_USE_LOCAL_TZ: &str = "DYN_LOG_USE_LOCAL_TZ";
+
+    /// Enable span event logging (create/close events)
+    pub const DYN_LOGGING_SPAN_EVENTS: &str = "DYN_LOGGING_SPAN_EVENTS";
+
+    /// OTLP (OpenTelemetry Protocol) tracing and logging configuration
+    pub mod otlp {
+        /// Enable OTLP export for traces and logs (set to "1" to enable)
+        pub const OTEL_EXPORT_ENABLED: &str = "OTEL_EXPORT_ENABLED";
+
+        /// OTLP exporter transport protocol. Supported values: "grpc", "http/protobuf".
+        pub const OTEL_EXPORTER_OTLP_PROTOCOL: &str = "OTEL_EXPORTER_OTLP_PROTOCOL";
+
+        /// OTLP exporter transport protocol for traces. Defaults to OTEL_EXPORTER_OTLP_PROTOCOL.
+        pub const OTEL_EXPORTER_OTLP_TRACES_PROTOCOL: &str = "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL";
+
+        /// OTLP exporter transport protocol for logs. Defaults to OTEL_EXPORTER_OTLP_PROTOCOL.
+        pub const OTEL_EXPORTER_OTLP_LOGS_PROTOCOL: &str = "OTEL_EXPORTER_OTLP_LOGS_PROTOCOL";
+
+        /// Generic OTLP exporter endpoint URL used when signal-specific endpoints are unset.
+        pub const OTEL_EXPORTER_OTLP_ENDPOINT: &str = "OTEL_EXPORTER_OTLP_ENDPOINT";
+
+        /// OTLP exporter endpoint URL for traces
+        /// Spec: <https://opentelemetry.io/docs/specs/otel/protocol/exporter/>
+        pub const OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: &str = "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT";
+
+        /// OTLP exporter endpoint URL for logs. Falls back to OTEL_EXPORTER_OTLP_ENDPOINT or the protocol default when unset.
+        pub const OTEL_EXPORTER_OTLP_LOGS_ENDPOINT: &str = "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT";
+
+        /// Trace sampling ratio used when set. Example: "0.01" samples roughly 1% of traces.
+        pub const OTEL_TRACES_SAMPLE_RATIO: &str = "OTEL_TRACES_SAMPLE_RATIO";
+
+        /// Service name for OTLP traces and logs
+        pub const OTEL_SERVICE_NAME: &str = "OTEL_SERVICE_NAME";
+
+        /// Set to "otlp" to export metrics over OTLP. Any other value disables it.
+        /// Prometheus scraping is unaffected either way.
+        pub const OTEL_METRICS_EXPORTER: &str = "OTEL_METRICS_EXPORTER";
+
+        /// OTLP exporter endpoint URL for metrics. Falls back to OTEL_EXPORTER_OTLP_ENDPOINT.
+        pub const OTEL_EXPORTER_OTLP_METRICS_ENDPOINT: &str = "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT";
+
+        /// OTLP exporter transport protocol for metrics. Defaults to OTEL_EXPORTER_OTLP_PROTOCOL.
+        pub const OTEL_EXPORTER_OTLP_METRICS_PROTOCOL: &str = "OTEL_EXPORTER_OTLP_METRICS_PROTOCOL";
+
+        /// Headers sent with every OTLP request, as `key=value` pairs separated
+        /// by commas. Used for authenticated collectors (bearer token, API key).
+        pub const OTEL_EXPORTER_OTLP_HEADERS: &str = "OTEL_EXPORTER_OTLP_HEADERS";
+
+        /// Headers for metrics specifically. Replaces OTEL_EXPORTER_OTLP_HEADERS
+        /// when set, rather than merging with it, per the OTLP exporter spec.
+        pub const OTEL_EXPORTER_OTLP_METRICS_HEADERS: &str = "OTEL_EXPORTER_OTLP_METRICS_HEADERS";
+
+        /// Headers for traces specifically. Replaces OTEL_EXPORTER_OTLP_HEADERS when set.
+        pub const OTEL_EXPORTER_OTLP_TRACES_HEADERS: &str = "OTEL_EXPORTER_OTLP_TRACES_HEADERS";
+
+        /// Headers for logs specifically. Replaces OTEL_EXPORTER_OTLP_HEADERS when set.
+        pub const OTEL_EXPORTER_OTLP_LOGS_HEADERS: &str = "OTEL_EXPORTER_OTLP_LOGS_HEADERS";
+
+        /// Resource attributes applied to every exported signal, as `key=value`
+        /// pairs separated by commas.
+        pub const OTEL_RESOURCE_ATTRIBUTES: &str = "OTEL_RESOURCE_ATTRIBUTES";
+
+        /// Metric export interval in milliseconds. Spec default is 60000.
+        pub const OTEL_METRIC_EXPORT_INTERVAL: &str = "OTEL_METRIC_EXPORT_INTERVAL";
+    }
+}
+
+/// Request-lifecycle tracing environment variables.
+pub mod lifecycle_tracing {
+    /// Enable the native request-lifecycle OpenTelemetry span convention.
+    ///
+    /// This is independent from `DYN_LOG`: lifecycle spans are exported through
+    /// the OpenTelemetry tracing layer only.
+    pub const DYN_LIFECYCLE_TRACE_ENABLED: &str = "DYN_LIFECYCLE_TRACE_ENABLED";
+
+    /// Lifecycle detail mode. Defaults to `core`.
+    pub const DYN_LIFECYCLE_TRACE_MODE: &str = "DYN_LIFECYCLE_TRACE_MODE";
+}
+
+/// Runtime configuration environment variables
+///
+/// These control the Tokio runtime, system health/metrics server, and worker behavior
+pub mod runtime {
+    /// Number of async worker threads for Tokio runtime
+    pub const DYN_RUNTIME_NUM_WORKER_THREADS: &str = "DYN_RUNTIME_NUM_WORKER_THREADS";
+
+    /// Maximum number of blocking threads for Tokio runtime
+    pub const DYN_RUNTIME_MAX_BLOCKING_THREADS: &str = "DYN_RUNTIME_MAX_BLOCKING_THREADS";
+
+    /// Maximum time to wait for graceful endpoint drain during runtime shutdown.
+    pub const DYN_RUNTIME_GRACEFUL_SHUTDOWN_TIMEOUT_SECS: &str =
+        "DYN_RUNTIME_GRACEFUL_SHUTDOWN_TIMEOUT_SECS";
+
+    /// Maximum duration for local worker inhibition after a request failure. Zero disables it.
+    pub const DYN_RUNTIME_INHIBITED_DURATION_SECS: &str = "DYN_RUNTIME_INHIBITED_DURATION_SECS";
+
+    /// Enable Tokio task poll-time histogram (calls enable_metrics_poll_time_histogram on builder).
+    /// Set to "1", "true", or "yes" to enable. Adds ~2× overhead of Instant::now() per task poll.
+    pub const DYN_ENABLE_POLL_HISTOGRAM: &str = "DYN_ENABLE_POLL_HISTOGRAM";
+
+    /// System status server configuration
+    pub mod system {
+        /// Enable system status server for health and metrics endpoints
+        /// ⚠️ DEPRECATED: will be removed soon
+        pub const DYN_SYSTEM_ENABLED: &str = "DYN_SYSTEM_ENABLED";
+
+        /// System status server host
+        pub const DYN_SYSTEM_HOST: &str = "DYN_SYSTEM_HOST";
+
+        /// System status server port
+        pub const DYN_SYSTEM_PORT: &str = "DYN_SYSTEM_PORT";
+
+        /// Use endpoint health status for system health
+        /// ⚠️ DEPRECATED: No longer used
+        pub const DYN_SYSTEM_USE_ENDPOINT_HEALTH_STATUS: &str =
+            "DYN_SYSTEM_USE_ENDPOINT_HEALTH_STATUS";
+
+        /// Starting health status for the system
+        pub const DYN_SYSTEM_STARTING_HEALTH_STATUS: &str = "DYN_SYSTEM_STARTING_HEALTH_STATUS";
+
+        /// Health check endpoint path
+        pub const DYN_SYSTEM_HEALTH_PATH: &str = "DYN_SYSTEM_HEALTH_PATH";
+
+        /// Liveness check endpoint path
+        pub const DYN_SYSTEM_LIVE_PATH: &str = "DYN_SYSTEM_LIVE_PATH";
+    }
+
+    /// Compute configuration
+    pub mod compute {
+        /// Prefix for compute-related environment variables
+        pub const PREFIX: &str = "DYN_COMPUTE_";
+    }
+
+    /// Canary deployment configuration
+    pub mod canary {
+        /// Wait time in seconds for canary deployments
+        pub const DYN_CANARY_WAIT_TIME: &str = "DYN_CANARY_WAIT_TIME";
+    }
+}
+
+/// Worker lifecycle environment variables
+pub mod worker {
+    /// Graceful shutdown timeout in seconds
+    pub const DYN_WORKER_GRACEFUL_SHUTDOWN_TIMEOUT: &str = "DYN_WORKER_GRACEFUL_SHUTDOWN_TIMEOUT";
+}
+
+/// NATS transport environment variables
+pub mod nats {
+    /// NATS server address (e.g., "nats://localhost:4222")
+    pub const NATS_SERVER: &str = "NATS_SERVER";
+
+    /// NATS request/reply timeout in seconds. Unset = async-nats default (10 s).
+    pub const DYN_NATS_REQUEST_TIMEOUT_SECS: &str = "DYN_NATS_REQUEST_TIMEOUT_SECS";
+
+    /// Maximum time in seconds to establish the initial NATS connection.
+    pub const NATS_STARTUP_CONNECT_TIMEOUT_SECONDS: &str = "NATS_STARTUP_CONNECT_TIMEOUT_SECONDS";
+
+    /// NATS authentication environment variables (checked in priority order)
+    pub mod auth {
+        /// Username for NATS authentication (use with NATS_AUTH_PASSWORD)
+        pub const NATS_AUTH_USERNAME: &str = "NATS_AUTH_USERNAME";
+
+        /// Password for NATS authentication (use with NATS_AUTH_USERNAME)
+        pub const NATS_AUTH_PASSWORD: &str = "NATS_AUTH_PASSWORD";
+
+        /// Token for NATS authentication
+        pub const NATS_AUTH_TOKEN: &str = "NATS_AUTH_TOKEN";
+
+        /// NKey for NATS authentication
+        pub const NATS_AUTH_NKEY: &str = "NATS_AUTH_NKEY";
+
+        /// Path to NATS credentials file
+        pub const NATS_AUTH_CREDENTIALS_FILE: &str = "NATS_AUTH_CREDENTIALS_FILE";
+    }
+
+    /// NATS stream configuration
+    pub mod stream {
+        /// Maximum age for messages in NATS stream (in seconds)
+        pub const DYN_NATS_STREAM_MAX_AGE: &str = "DYN_NATS_STREAM_MAX_AGE";
+    }
+
+    /// NATS TLS configuration
+    pub mod tls {
+        /// Path to the PEM CA certificate used to verify the NATS server's certificate.
+        /// When set, a custom TLS config with this CA is applied to the NATS connection.
+        pub const NATS_TLS_CA_CERT_PATH: &str = "NATS_TLS_CA_CERT_PATH";
+
+        /// Path to the PEM client certificate presented to the NATS server for
+        /// mutual TLS (mTLS). Must be set together with `NATS_TLS_CLIENT_KEY_PATH`.
+        pub const NATS_TLS_CLIENT_CERT_PATH: &str = "NATS_TLS_CLIENT_CERT_PATH";
+
+        /// Path to the PEM client private key for NATS mutual TLS (mTLS).
+        /// Must be set together with `NATS_TLS_CLIENT_CERT_PATH`.
+        pub const NATS_TLS_CLIENT_KEY_PATH: &str = "NATS_TLS_CLIENT_KEY_PATH";
+
+        /// Disable TLS certificate verification. Set to a truthy value to skip.
+        /// WARNING: Only for local development. Never use in production.
+        pub const NATS_TLS_INSECURE: &str = "NATS_TLS_INSECURE";
+    }
+}
+
+/// ETCD transport environment variables
+pub mod etcd {
+    /// ETCD endpoints (comma-separated list of URLs)
+    pub const ETCD_ENDPOINTS: &str = "ETCD_ENDPOINTS";
+
+    /// ETCD lease TTL in seconds (default: 30)
+    pub const ETCD_LEASE_TTL: &str = "ETCD_LEASE_TTL";
+
+    /// Maximum time in seconds to retry the initial ETCD connection (default: 120)
+    pub const ETCD_STARTUP_CONNECT_TIMEOUT_SECONDS: &str = "ETCD_STARTUP_CONNECT_TIMEOUT_SECONDS";
+
+    /// HTTP/2 keepalive ping interval in seconds for the ETCD channel (default: 15, 0 disables)
+    pub const ETCD_KEEPALIVE_INTERVAL_SECONDS: &str = "ETCD_KEEPALIVE_INTERVAL_SECONDS";
+
+    /// Seconds to wait for a keepalive ping ack before the ETCD channel is closed (default: 10)
+    pub const ETCD_KEEPALIVE_TIMEOUT_SECONDS: &str = "ETCD_KEEPALIVE_TIMEOUT_SECONDS";
+
+    /// ETCD authentication environment variables
+    pub mod auth {
+        /// Username for ETCD authentication
+        pub const ETCD_AUTH_USERNAME: &str = "ETCD_AUTH_USERNAME";
+
+        /// Password for ETCD authentication
+        pub const ETCD_AUTH_PASSWORD: &str = "ETCD_AUTH_PASSWORD";
+
+        /// Path to CA certificate for ETCD TLS
+        pub const ETCD_AUTH_CA: &str = "ETCD_AUTH_CA";
+
+        /// Path to client certificate for ETCD TLS
+        pub const ETCD_AUTH_CLIENT_CERT: &str = "ETCD_AUTH_CLIENT_CERT";
+
+        /// Path to client key for ETCD TLS
+        pub const ETCD_AUTH_CLIENT_KEY: &str = "ETCD_AUTH_CLIENT_KEY";
+    }
+}
+
+/// LLM (Language Model) inference environment variables
+pub mod llm {
+    /// Delay between tokens emitted by the token echo engine, in milliseconds.
+    pub const DYN_TOKEN_ECHO_DELAY_MS: &str = "DYN_TOKEN_ECHO_DELAY_MS";
+
+    /// HTTP body size limit in MB
+    pub const DYN_HTTP_BODY_LIMIT_MB: &str = "DYN_HTTP_BODY_LIMIT_MB";
+
+    /// Batch file upload limit in MiB, including multipart framing (default 202).
+    pub const DYN_BATCH_UPLOAD_BODY_LIMIT_MB: &str = "DYN_BATCH_UPLOAD_BODY_LIMIT_MB";
+
+    /// Concurrent batch uploads/downloads per frontend replica (default 4).
+    pub const DYN_BATCH_MAX_FILE_TRANSFERS: &str = "DYN_BATCH_MAX_FILE_TRANSFERS";
+
+    /// Maximum batch file transfer lifetime, including response consumption (default 600 seconds).
+    pub const DYN_BATCH_FILE_TRANSFER_TIMEOUT_SECS: &str = "DYN_BATCH_FILE_TRANSFER_TIMEOUT_SECS";
+
+    /// Listen backlog of the frontend HTTP/HTTPS socket (default 4096).
+    pub const DYN_HTTP_LISTEN_BACKLOG: &str = "DYN_HTTP_LISTEN_BACKLOG";
+
+    pub const DYN_HTTP_GRACEFUL_SHUTDOWN_TIMEOUT_SECS: &str =
+        "DYN_HTTP_GRACEFUL_SHUTDOWN_TIMEOUT_SECS";
+
+    /// Maximum stalled downstream write time per connection (default 120 seconds).
+    pub const DYN_HTTP_WRITE_IDLE_TIMEOUT_SECS: &str = "DYN_HTTP_WRITE_IDLE_TIMEOUT_SECS";
+
+    /// HTTP status code returned when the frontend rejects a request because
+    /// all workers are overloaded. Defaults to 529 ("Site is overloaded"); set
+    /// to 503 for Service Unavailable retry semantics. Status codes from 200
+    /// through 999 are accepted; an informational value from 100 through 199,
+    /// an unparseable value, or an out-of-range value falls back to 529. The
+    /// value is read and cached on first use.
+    pub const DYN_HTTP_OVERLOAD_STATUS_CODE: &str = dynamo_error::DYN_HTTP_OVERLOAD_STATUS_CODE;
+
+    /// Emit an SSE comment at this interval while a streaming response has no
+    /// data. Unset, `0`, invalid, or unrepresentable values keep SSE comments
+    /// disabled.
+    pub const DYN_HTTP_SSE_KEEP_ALIVE_INTERVAL_MS: &str = "DYN_HTTP_SSE_KEEP_ALIVE_INTERVAL_MS";
+
+    /// Enable LoRA adapter support (set to "true" to enable)
+    pub const DYN_LORA_ENABLED: &str = "DYN_LORA_ENABLED";
+
+    /// Enable request-time LoRA resolution and worker-local loading.
+    pub const DYN_LORA_RUNTIME_LOAD_ENABLED: &str = "DYN_LORA_RUNTIME_LOAD_ENABLED";
+
+    /// Worker-side Python runtime LoRA resolver import reference.
+    pub const DYN_LORA_DOWNLOADER_PLUGIN: &str = "DYN_LORA_DOWNLOADER_PLUGIN";
+
+    /// Comma-separated runtime LoRA source URI scheme allowlist.
+    pub const DYN_LORA_ALLOWED_SCHEMES: &str = "DYN_LORA_ALLOWED_SCHEMES";
+
+    /// Worker-owned request-time resolution deadline.
+    pub const DYN_LORA_RESOLVE_TIMEOUT_SECONDS: &str = "DYN_LORA_RESOLVE_TIMEOUT_SECONDS";
+
+    /// Maximum concurrent worker resolver calls.
+    pub const DYN_LORA_MAX_CONCURRENT_RESOLUTIONS: &str = "DYN_LORA_MAX_CONCURRENT_RESOLUTIONS";
+
+    /// Maximum distinct unresolved request-time adapter identities.
+    pub const DYN_LORA_MAX_PENDING_RUNTIME_KEYS: &str = "DYN_LORA_MAX_PENDING_RUNTIME_KEYS";
+
+    /// Maximum pending request admissions for resident request-time adapters.
+    pub const DYN_LORA_MAX_PENDING_ADMISSIONS: &str = "DYN_LORA_MAX_PENDING_ADMISSIONS";
+
+    /// Pending request-time adapter lease lifetime before generation activation.
+    pub const DYN_LORA_PENDING_ADMISSION_TIMEOUT_SECONDS: &str =
+        "DYN_LORA_PENDING_ADMISSION_TIMEOUT_SECONDS";
+
+    /// Maximum resident request-time adapters per worker.
+    pub const DYN_LORA_MAX_RESIDENT_RUNTIME_LORAS: &str = "DYN_LORA_MAX_RESIDENT_RUNTIME_LORAS";
+
+    /// Maximum materialized bytes for one request-time adapter.
+    pub const DYN_LORA_MAX_DOWNLOAD_BYTES: &str = "DYN_LORA_MAX_DOWNLOAD_BYTES";
+
+    /// Request-time resolver cache admission bound; exceeding it does not trigger disk eviction.
+    pub const DYN_LORA_MAX_CACHE_BYTES: &str = "DYN_LORA_MAX_CACHE_BYTES";
+
+    /// LoRA cache directory path
+    pub const DYN_LORA_PATH: &str = "DYN_LORA_PATH";
+
+    /// Skip TLS certificate verification for S3 LoRA downloads (set to "true" to enable).
+    /// Intended for trusted internal networks with private-CA or self-signed S3 endpoints.
+    pub const DYN_LORA_S3_TLS_INSECURE: &str = "DYN_LORA_S3_TLS_INSECURE";
+
+    /// Enable the experimental Anthropic Messages API endpoint (/v1/messages)
+    pub const DYN_ENABLE_ANTHROPIC_API: &str = "DYN_ENABLE_ANTHROPIC_API";
+
+    /// Enable the experimental System One typed-decisions endpoint (/v1/systemone)
+    pub const DYN_ENABLE_SYSTEMONE_API: &str = "DYN_ENABLE_SYSTEMONE_API";
+
+    /// Maximum concurrent System One question branches (default 256, ceiling 4,096).
+    /// Increases above the default warn; values above the ceiling warn and clamp.
+    pub const DYN_SYSTEMONE_MAX_INFLIGHT_BRANCHES: &str = "DYN_SYSTEMONE_MAX_INFLIGHT_BRANCHES";
+
+    /// Maximum cumulative prompt tokens per System One request (default 65,536, ceiling 1,048,576).
+    /// Context and tokenization-work limits apply independently; increases warn, above-ceiling values clamp.
+    pub const DYN_SYSTEMONE_MAX_INPUT_TOKENS: &str = "DYN_SYSTEMONE_MAX_INPUT_TOKENS";
+    /// Total decision preflight and execution deadline (default 300 seconds, ceiling 3,600).
+    /// Increases above the default warn; values above the ceiling warn and clamp.
+    pub const DYN_SYSTEMONE_REQUEST_TIMEOUT_SECS: &str = "DYN_SYSTEMONE_REQUEST_TIMEOUT_SECS";
+
+    /// Master switch for the `nvext` extension protocol on the frontend.
+    /// The protocol is **enabled by default**; this variable disables it.
+    /// Truthy values (`1` / `true` / `yes` / `on`, case-insensitive) cause
+    /// the frontend to drop non-salt request NvExt fields, ignore supported
+    /// routing-override headers, and silently ignore the response-side
+    /// `extra_fields` opt-in. Cache isolation is exempt: supported
+    /// `cache_salt` and `x-tenant-id` inputs remain active.
+    pub const DYN_DISABLE_FRONTEND_NVEXT: &str = "DYN_DISABLE_FRONTEND_NVEXT";
+
+    /// Ignore unknown OpenAI frontend request fields. Unknown fields are dropped,
+    /// not handled; known pass-through fields remain type-validated.
+    pub const DYN_IGNORE_OPENAI_FE_UNSUPPORTED_FIELDS: &str =
+        "DYN_IGNORE_OPENAI_FE_UNSUPPORTED_FIELDS";
+
+    /// Skip OpenAI strict function-tool schema preflight for legacy clients.
+    /// Request schemas and strictness are preserved; basic tool validation and
+    /// downstream processor/backend constraints remain active.
+    pub const DYN_DISABLE_OPENAI_STRICT_SCHEMA_VALIDATION: &str =
+        "DYN_DISABLE_OPENAI_STRICT_SCHEMA_VALIDATION";
+
+    /// Master switch for the frontend's HTTP admin API surface.
+    /// The admin API is **disabled by default**. Truthy values (`1` / `true` / `yes` /
+    /// `on`, case-insensitive) start the admin listener (see `DYN_FRONTEND_ADMIN_HOST` /
+    /// `DYN_FRONTEND_ADMIN_PORT`), which serves `/router_policy`, its busy-threshold
+    /// subresource, and the legacy `/busy_threshold` routes.
+    pub const DYN_ENABLE_FRONTEND_ADMIN_API: &str = "DYN_ENABLE_FRONTEND_ADMIN_API";
+
+    /// Host the frontend admin listener binds to. Default `127.0.0.1`.
+    pub const DYN_FRONTEND_ADMIN_HOST: &str = "DYN_FRONTEND_ADMIN_HOST";
+
+    /// Port of the frontend admin listener. Default `8002`. When the admin API is
+    /// enabled and this port cannot be bound, startup aborts.
+    pub const DYN_FRONTEND_ADMIN_PORT: &str = "DYN_FRONTEND_ADMIN_PORT";
+
+    /// Strip the Claude Code billing preamble (`x-anthropic-billing-header: ...`)
+    /// from the system prompt before forwarding to the target model. The preamble
+    /// varies per session and per release, wasting tokens and breaking prompt caching.
+    pub const DYN_STRIP_ANTHROPIC_PREAMBLE: &str = "DYN_STRIP_ANTHROPIC_PREAMBLE";
+
+    /// When truthy, refuse chat requests that carry image, video, or audio
+    /// content in any message before they are routed. For frontends serving
+    /// text-only models.
+    pub const DYN_REJECT_MEDIA: &str = "DYN_REJECT_MEDIA";
+
+    /// HTTP status (4xx or 5xx) for a request refused by `DYN_REJECT_MEDIA`.
+    /// Defaults to 415.
+    pub const DYN_REJECT_MEDIA_STATUS_CODE: &str = "DYN_REJECT_MEDIA_STATUS_CODE";
+
+    /// When truthy, force usage in streaming chat and text-completion responses
+    /// regardless of the request's `stream_options.include_usage` value.
+    /// Unset or false preserves request-controlled defaults.
+    pub const DYN_ENABLE_FORCE_INCLUDE_USAGE: &str = "DYN_ENABLE_FORCE_INCLUDE_USAGE";
+
+    /// Enable streaming tool call dispatch (`event: tool_call_dispatch` SSE events)
+    pub const DYN_ENABLE_STREAMING_TOOL_DISPATCH: &str = "DYN_ENABLE_STREAMING_TOOL_DISPATCH";
+
+    /// Enable streaming reasoning dispatch (`event: reasoning_dispatch` SSE events)
+    pub const DYN_ENABLE_STREAMING_REASONING_DISPATCH: &str =
+        "DYN_ENABLE_STREAMING_REASONING_DISPATCH";
+
+    /// OpenAI-compatible response field used for emitted reasoning content.
+    /// Accepted values: "reasoning_content" (default) or "reasoning".
+    pub const DYN_REASONING_FIELD_NAME: &str = "DYN_REASONING_FIELD_NAME";
+
+    /// Select the parser generation. Unset or `auto` prefers a compatible unified V2
+    /// parser and falls back to V1 when no compatible family is configured.
+    ///
+    /// Explicit `1` keeps the V1 parsers; explicit `2` selects a compatible unified
+    /// parser for the configured family. When both parser slots are set, their names
+    /// must resolve to the same family. Unsupported explicit selections fail during
+    /// preprocessor construction.
+    ///
+    /// Accepted values are `auto`, `1`, and `2`. Explicit
+    /// generations fail during preprocessor construction when the configured family has
+    /// no compatible parser.
+    pub const DYN_PARSER_VERSION: &str = "DYN_PARSER_VERSION";
+
+    /// Compatibility alias for `DYN_PARSER_VERSION=2` when enabled. Uses the shared
+    /// boolean parser: `1`/`true`/`on`/`yes` select V2; `0`/`false`/`off`/`no`/empty
+    /// retain auto selection. True conflicts with `DYN_PARSER_VERSION=1`; false conflicts with `2`.
+    pub const DYN_ENABLE_EXPERIMENTAL_PARSERS_V2: &str = "DYN_ENABLE_EXPERIMENTAL_PARSERS_V2";
+
+    /// Rollback lever for incremental guided-tool-call streaming.
+    ///
+    /// A forced `tool_choice` (`required` or a named tool) installs a JSON grammar,
+    /// so by default the jail releases tool-call chunks as they arrive instead of
+    /// buffering the whole response. The grammar-constrained decoding itself lives
+    /// in the published `dynamo-parsers` dependency, not in this repo, so if a
+    /// backend in production doesn't correctly honor the grammar the only other
+    /// rollback is a dependency repin and a new release. On by default; set this
+    /// to a falsy value (`0`/`false`) to fall back to the old buffer-to-completion
+    /// behavior at runtime, no redeploy required.
+    pub const DYN_ENABLE_GUIDED_TOOL_STREAMING: &str = "DYN_ENABLE_GUIDED_TOOL_STREAMING";
+
+    /// Backend stream inactivity timeout in seconds.
+    ///
+    /// When set to a positive integer, the frontend will kill the engine context
+    /// and drop the inflight guard if no SSE event is received from the backend
+    /// within this many seconds. Acts as a circuit breaker for zombie workers
+    /// that hold a live TCP connection but never produce output.
+    ///
+    /// Set to `0` or leave unset to disable the timeout (default: disabled).
+    pub const DYN_HTTP_BACKEND_STREAM_TIMEOUT_SECS: &str = "DYN_HTTP_BACKEND_STREAM_TIMEOUT_SECS";
+
+    /// Pre-commit peek window in milliseconds for the streaming chat,
+    /// completions, responses, and Anthropic messages paths. Controls how long
+    /// the frontend polls the engine stream for a synchronous backend error
+    /// before committing HTTP 200.
+    /// Trades a small first-token latency budget
+    /// for the ability to surface `Backend(InvalidArgument)` and other
+    /// request-validation errors as HTTP 4xx instead of an SSE error frame.
+    ///
+    /// Default: unset → peek disabled (matches pre-fix behavior; all errors
+    /// surface as SSE frames post-HTTP-200). Set to a value ≥ observed
+    /// request-parse / admission p99 latency to opt in — request-validation
+    /// errors within the window surface as HTTP 4xx; anything past the window
+    /// stays as an SSE error frame. Setting to `0` also disables the peek.
+    ///
+    /// Read once when the HTTP service is built. A policy supplied through
+    /// `HttpServiceConfigBuilder::streaming_backend_error_check` replaces it.
+    pub const DYN_HTTP_PRE_COMMIT_ERROR_PEEK_MS: &str = "DYN_HTTP_PRE_COMMIT_ERROR_PEEK_MS";
+
+    /// Enable the LoRA allocation controller (set to "true" to enable)
+    pub const DYN_LORA_ALLOCATION_ENABLED: &str = "DYN_LORA_ALLOCATION_ENABLED";
+
+    /// LoRA allocation algorithm ("hrw", "random", or "mcf")
+    pub const DYN_LORA_ALLOCATION_ALGORITHM: &str = "DYN_LORA_ALLOCATION_ALGORITHM";
+
+    /// JSON configuration for the MCF (min-cost flow) placement solver.
+    /// Example: '{"candidate_m":16,"gamma_load":2000,"beta_keep":500}'
+    /// Omitted fields use defaults. Only relevant when algorithm is "mcf".
+    pub const DYN_LORA_MCF_CONFIG: &str = "DYN_LORA_MCF_CONFIG";
+
+    /// LoRA allocation controller recompute interval in seconds
+    pub const DYN_LORA_ALLOCATION_TIMESTEP_SECS: &str = "DYN_LORA_ALLOCATION_TIMESTEP_SECS";
+
+    /// Ticks to wait before scaling down a LoRA's replicas
+    pub const DYN_LORA_ALLOCATION_SCALE_DOWN_COOLDOWN_TICKS: &str =
+        "DYN_LORA_ALLOCATION_SCALE_DOWN_COOLDOWN_TICKS";
+
+    /// Multiplier for the load estimator's rate window relative to the controller timestep.
+    pub const DYN_LORA_ALLOCATION_RATE_WINDOW_MULTIPLIER: &str =
+        "DYN_LORA_ALLOCATION_RATE_WINDOW_MULTIPLIER";
+
+    /// Number of counter buckets per second in the BucketedRateCounter.
+    pub const DYN_LORA_ALLOCATION_BUCKETS_PER_SECOND: &str =
+        "DYN_LORA_ALLOCATION_BUCKETS_PER_SECOND";
+
+    /// Load predictor type: "none" (raw counts) or "ema" (exponential moving average).
+    pub const DYN_LORA_ALLOCATION_PREDICTOR_TYPE: &str = "DYN_LORA_ALLOCATION_PREDICTOR_TYPE";
+
+    /// EMA smoothing factor (alpha) for the EMA predictor. Range [0.0, 1.0].
+    pub const DYN_LORA_ALLOCATION_EMA_ALPHA: &str = "DYN_LORA_ALLOCATION_EMA_ALPHA";
+
+    /// Bounded startup wait, in seconds, for the KV state-agent host
+    /// advertisement before an opted-in worker gives up on KV routing.
+    /// `0` fails after a single discovery snapshot; invalid values use the
+    /// 30-second default.
+    pub const DYN_KV_STATE_AGENT_HOST_DISCOVERY_TIMEOUT_SECS: &str =
+        "DYN_KV_STATE_AGENT_HOST_DISCOVERY_TIMEOUT_SECS";
+
+    /// Progress-thread delay, in microseconds, of the frontend media loader's NIXL
+    /// agent (default 1000, range 0 to 1000000). NIXL rounds it up to whole
+    /// milliseconds; `0` makes the thread busy-poll one core. Over TCP, a read can
+    /// wait up to the full delay, so larger values add longer stalls. Values that do
+    /// not parse or are above 1000000 use the default.
+    pub const DYN_MM_NIXL_PROGRESS_DELAY_US: &str = "DYN_MM_NIXL_PROGRESS_DELAY_US";
+
+    /// Publish the serving-load streams the Pool Relay aggregates: frontend
+    /// request load and router scheduler load. Off unless truthy.
+    pub const DYN_SERVING_LOAD_PUBLISH: &str = "DYN_SERVING_LOAD_PUBLISH";
+
+    /// Metrics configuration
+    pub mod metrics {
+        /// Custom metrics prefix (overrides default "dynamo_frontend")
+        pub const DYN_METRICS_PREFIX: &str = "DYN_METRICS_PREFIX";
+
+        /// Histogram bucket configuration prefixes. Each is suffixed with `_MIN`,
+        /// `_MAX`, or `_COUNT` to form the variable that tunes one frontend
+        /// histogram's log-spaced buckets, for example `DYN_METRICS_ITL_MAX`.
+        /// Values are read once, when the frontend builds its metrics.
+        pub const DYN_METRICS_REQUEST_DURATION: &str = "DYN_METRICS_REQUEST_DURATION";
+        /// See [`DYN_METRICS_REQUEST_DURATION`].
+        pub const DYN_METRICS_INPUT_SEQUENCE: &str = "DYN_METRICS_INPUT_SEQUENCE";
+        /// See [`DYN_METRICS_REQUEST_DURATION`].
+        pub const DYN_METRICS_OUTPUT_SEQUENCE: &str = "DYN_METRICS_OUTPUT_SEQUENCE";
+        /// See [`DYN_METRICS_REQUEST_DURATION`].
+        pub const DYN_METRICS_TTFT: &str = "DYN_METRICS_TTFT";
+        /// See [`DYN_METRICS_REQUEST_DURATION`].
+        pub const DYN_METRICS_ITL: &str = "DYN_METRICS_ITL";
+        /// Comma-separated inter-token latency histogram bucket boundaries.
+        pub const DYN_METRICS_ITL_BUCKETS: &str = "DYN_METRICS_ITL_BUCKETS";
+        /// See [`DYN_METRICS_REQUEST_DURATION`].
+        pub const DYN_METRICS_EMBEDDING_LATENCY: &str = "DYN_METRICS_EMBEDDING_LATENCY";
+
+        /// Deprecated prefix for the histogram bucket variables above.
+        ///
+        /// This was once prepended to prefixes that already started with
+        /// `DYN_METRICS_`, so the variables were read under doubled names such as
+        /// `DYN_HISTOGRAM_DYN_METRICS_ITL_MAX`. The doubled form is still accepted
+        /// as a fallback, with a warning, and will be removed in a future release.
+        pub const DEPRECATED_HISTOGRAM_PREFIX: &str = "DYN_HISTOGRAM_";
+
+        /// Former name of [`DEPRECATED_HISTOGRAM_PREFIX`], kept so that code outside
+        /// this workspace importing it keeps compiling. Remove together with the
+        /// doubled-name fallback.
+        #[deprecated(note = "use DEPRECATED_HISTOGRAM_PREFIX")]
+        pub const HISTOGRAM_PREFIX: &str = DEPRECATED_HISTOGRAM_PREFIX;
+    }
+
+    /// Forward-pass-metrics trace configuration.
+    pub mod fpm_trace {
+        /// Master switch. Truthy values persist locally produced FPM events.
+        pub const DYN_FPM_TRACE: &str = "DYN_FPM_TRACE";
+
+        /// Local gzip JSONL segment prefix. A sanitized producer id is appended
+        /// before the segment index so multiple producers do not share files.
+        pub const DYN_FPM_OUTPUT_PATH: &str = "DYN_FPM_OUTPUT_PATH";
+
+        /// Capture mode: `sampled` (latest event per DP rank each interval) or
+        /// `full` (every event reaching the producer-side trace tap).
+        pub const DYN_FPM_MODE: &str = "DYN_FPM_MODE";
+
+        /// Sampling interval in milliseconds when `DYN_FPM_MODE=sampled`.
+        pub const DYN_FPM_SAMPLE_INTERVAL_MS: &str = "DYN_FPM_SAMPLE_INTERVAL_MS";
+
+        /// Rotating gzip JSONL threshold in uncompressed bytes.
+        pub const DYN_FPM_JSONL_GZ_ROLL_BYTES: &str = "DYN_FPM_JSONL_GZ_ROLL_BYTES";
+
+        /// Maximum number of gzip JSONL segments retained per producer,
+        /// including the active segment.
+        pub const DYN_FPM_MAX_SEGMENTS: &str = "DYN_FPM_MAX_SEGMENTS";
+    }
+
+    /// Deprecated audit payload logging aliases. Prefer `llm::request_trace`.
+    pub mod audit {
+        /// Deprecated alias for `DYN_REQUEST_TRACE_SINKS`. Legacy values
+        /// `jsonl` and `jsonl_gz` map to the request trace `file` sink.
+        pub const DYN_AUDIT_SINKS: &str = "DYN_AUDIT_SINKS";
+
+        /// Deprecated migration shim for `DYN_REQUEST_TRACE_RECORDS=request_payload`.
+        pub const DYN_AUDIT_FORCE_LOGGING: &str = "DYN_AUDIT_FORCE_LOGGING";
+
+        /// Deprecated alias for `DYN_REQUEST_TRACE_CAPACITY`.
+        pub const DYN_AUDIT_CAPACITY: &str = "DYN_AUDIT_CAPACITY";
+
+        /// Deprecated alias for `DYN_REQUEST_TRACE_NATS_SUBJECT`.
+        pub const DYN_AUDIT_NATS_SUBJECT: &str = "DYN_AUDIT_NATS_SUBJECT";
+
+        /// Deprecated alias for `DYN_REQUEST_TRACE_FILE_PATH`.
+        pub const DYN_AUDIT_OUTPUT_PATH: &str = "DYN_AUDIT_OUTPUT_PATH";
+
+        /// Deprecated alias for `DYN_REQUEST_TRACE_FILE_BUFFER_BYTES`.
+        pub const DYN_AUDIT_JSONL_BUFFER_BYTES: &str = "DYN_AUDIT_JSONL_BUFFER_BYTES";
+
+        /// Deprecated alias for `DYN_REQUEST_TRACE_FILE_FLUSH_INTERVAL_MS`.
+        pub const DYN_AUDIT_JSONL_FLUSH_INTERVAL_MS: &str = "DYN_AUDIT_JSONL_FLUSH_INTERVAL_MS";
+
+        /// Deprecated alias for `DYN_REQUEST_TRACE_FILE_ROLL_BYTES`.
+        pub const DYN_AUDIT_JSONL_GZ_ROLL_BYTES: &str = "DYN_AUDIT_JSONL_GZ_ROLL_BYTES";
+
+        /// Deprecated alias for `DYN_REQUEST_TRACE_FILE_ROLL_LINES`.
+        pub const DYN_AUDIT_JSONL_GZ_ROLL_LINES: &str = "DYN_AUDIT_JSONL_GZ_ROLL_LINES";
+
+        /// Deprecated alias for `DYN_REQUEST_TRACE_OTEL_MAX_PAYLOAD_BYTES`.
+        pub const DYN_AUDIT_OTEL_MAX_PAYLOAD_BYTES: &str = "DYN_AUDIT_OTEL_MAX_PAYLOAD_BYTES";
+    }
+
+    /// Request trace and request payload logging configuration.
+    pub mod request_trace {
+        /// Master switch. Truthy enables request trace emission.
+        pub const DYN_REQUEST_TRACE: &str = "DYN_REQUEST_TRACE";
+
+        /// Request trace sink selection. Comma-separated values: `file`,
+        /// `stderr`, `nats`, `otel`, `s3`.
+        ///
+        /// Legacy values map as follows: `jsonl` => `file` with `jsonl` format,
+        /// `jsonl_gz` => `file` with `jsonl_gz` format, `stderr` => `stderr`,
+        /// `nats` => `nats`, and `otel` => `otel`.
+        pub const DYN_REQUEST_TRACE_SINKS: &str = "DYN_REQUEST_TRACE_SINKS";
+
+        /// Local output path for request trace file records.
+        ///
+        /// With `DYN_REQUEST_TRACE_FILE_FORMAT=jsonl`, this is the literal JSONL
+        /// path. With `jsonl_gz`, this is the segment prefix used to derive
+        /// `<prefix>.<index>.jsonl.gz` files.
+        pub const DYN_REQUEST_TRACE_FILE_PATH: &str = "DYN_REQUEST_TRACE_FILE_PATH";
+
+        /// Deprecated alias for `DYN_REQUEST_TRACE_FILE_PATH`.
+        pub const DYN_REQUEST_TRACE_OUTPUT_PATH: &str = "DYN_REQUEST_TRACE_OUTPUT_PATH";
+
+        /// Request trace file record format. Supported values: `jsonl`, `jsonl_gz`.
+        pub const DYN_REQUEST_TRACE_FILE_FORMAT: &str = "DYN_REQUEST_TRACE_FILE_FORMAT";
+
+        /// In-process trace bus capacity.
+        pub const DYN_REQUEST_TRACE_CAPACITY: &str = "DYN_REQUEST_TRACE_CAPACITY";
+
+        /// Request trace record selection. Comma-separated values: `request_end`,
+        /// `request_payload`, `tool`.
+        pub const DYN_REQUEST_TRACE_RECORDS: &str = "DYN_REQUEST_TRACE_RECORDS";
+
+        /// NATS subject the request trace sink publishes to.
+        pub const DYN_REQUEST_TRACE_NATS_SUBJECT: &str = "DYN_REQUEST_TRACE_NATS_SUBJECT";
+
+        /// Maximum serialized OTEL payload bytes. Oversized request payload
+        /// records emit an incomplete marker payload instead of the full request/response.
+        pub const DYN_REQUEST_TRACE_OTEL_MAX_PAYLOAD_BYTES: &str =
+            "DYN_REQUEST_TRACE_OTEL_MAX_PAYLOAD_BYTES";
+
+        /// Request trace file sink buffer size in bytes.
+        pub const DYN_REQUEST_TRACE_FILE_BUFFER_BYTES: &str = "DYN_REQUEST_TRACE_FILE_BUFFER_BYTES";
+
+        /// Deprecated alias for `DYN_REQUEST_TRACE_FILE_BUFFER_BYTES`.
+        pub const DYN_REQUEST_TRACE_JSONL_BUFFER_BYTES: &str =
+            "DYN_REQUEST_TRACE_JSONL_BUFFER_BYTES";
+
+        /// Request trace file sink periodic flush interval in milliseconds.
+        pub const DYN_REQUEST_TRACE_FILE_FLUSH_INTERVAL_MS: &str =
+            "DYN_REQUEST_TRACE_FILE_FLUSH_INTERVAL_MS";
+
+        /// Deprecated alias for `DYN_REQUEST_TRACE_FILE_FLUSH_INTERVAL_MS`.
+        pub const DYN_REQUEST_TRACE_JSONL_FLUSH_INTERVAL_MS: &str =
+            "DYN_REQUEST_TRACE_JSONL_FLUSH_INTERVAL_MS";
+
+        /// Gzip file sink roll threshold in uncompressed bytes.
+        pub const DYN_REQUEST_TRACE_FILE_ROLL_BYTES: &str = "DYN_REQUEST_TRACE_FILE_ROLL_BYTES";
+
+        /// Deprecated alias for `DYN_REQUEST_TRACE_FILE_ROLL_BYTES`.
+        pub const DYN_REQUEST_TRACE_JSONL_GZ_ROLL_BYTES: &str =
+            "DYN_REQUEST_TRACE_JSONL_GZ_ROLL_BYTES";
+
+        /// Gzip file sink roll threshold in record lines.
+        pub const DYN_REQUEST_TRACE_FILE_ROLL_LINES: &str = "DYN_REQUEST_TRACE_FILE_ROLL_LINES";
+
+        /// Deprecated alias for `DYN_REQUEST_TRACE_FILE_ROLL_LINES`.
+        pub const DYN_REQUEST_TRACE_JSONL_GZ_ROLL_LINES: &str =
+            "DYN_REQUEST_TRACE_JSONL_GZ_ROLL_LINES";
+
+        /// Local ZMQ PULL endpoint Dynamo binds for harness tool events.
+        pub const DYN_REQUEST_TRACE_TOOL_EVENTS_ZMQ_ENDPOINT: &str =
+            "DYN_REQUEST_TRACE_TOOL_EVENTS_ZMQ_ENDPOINT";
+
+        /// First-frame ZMQ topic filter override for harness tool events.
+        pub const DYN_REQUEST_TRACE_TOOL_EVENTS_ZMQ_TOPIC: &str =
+            "DYN_REQUEST_TRACE_TOOL_EVENTS_ZMQ_TOPIC";
+
+        /// Comma/whitespace-separated allowlist of HTTP request header names to
+        /// record in request payload records. Unset/empty captures none. Values
+        /// are recorded unredacted; avoid credential-bearing headers.
+        pub const DYN_REQUEST_TRACE_HTTP_HEADER_CAPTURE_LIST: &str =
+            "DYN_REQUEST_TRACE_HTTP_HEADER_CAPTURE_LIST";
+
+        /// Lowest-cost candidates retained per `router_selection` record. `0`
+        /// retains every scored candidate. The selected worker is always
+        /// retained. Default `16`.
+        pub const DYN_REQUEST_TRACE_ROUTER_SELECTION_TOP_K: &str =
+            "DYN_REQUEST_TRACE_ROUTER_SELECTION_TOP_K";
+
+        /// S3 bucket for the S3 request-trace sink. Required when
+        /// `DYN_REQUEST_TRACE_SINKS` includes `s3`.
+        pub const DYN_REQUEST_TRACE_S3_BUCKET: &str = "DYN_REQUEST_TRACE_S3_BUCKET";
+
+        /// AWS region for the S3 request-trace sink. When unset the AWS SDK
+        /// default region resolution is used (env, profile, IMDS).
+        pub const DYN_REQUEST_TRACE_S3_REGION: &str = "DYN_REQUEST_TRACE_S3_REGION";
+
+        /// Optional object key prefix for the S3 request-trace sink. When unset
+        /// records land at the bucket root.
+        pub const DYN_REQUEST_TRACE_S3_PREFIX: &str = "DYN_REQUEST_TRACE_S3_PREFIX";
+
+        /// S3 batch roll threshold in uncompressed bytes. When the pending
+        /// batch reaches this size, it is finalized and uploaded. Default
+        /// `67108864` (64 MiB).
+        pub const DYN_REQUEST_TRACE_S3_ROLL_UNCOMPRESSED_BYTES: &str =
+            "DYN_REQUEST_TRACE_S3_ROLL_UNCOMPRESSED_BYTES";
+
+        /// S3 periodic flush interval in milliseconds. Any partial batch is
+        /// finalized and uploaded when this elapses, so low-volume traces
+        /// still land in S3. Default `10000` (10 s).
+        pub const DYN_REQUEST_TRACE_S3_FLUSH_INTERVAL_MS: &str =
+            "DYN_REQUEST_TRACE_S3_FLUSH_INTERVAL_MS";
+    }
+}
+
+/// Model loading and caching environment variables
+pub mod model {
+    /// Model Express configuration
+    pub mod model_express {
+        /// Model Express server endpoint URL
+        pub const MODEL_EXPRESS_URL: &str = "MODEL_EXPRESS_URL";
+
+        /// Model Express cache path
+        pub const MODEL_EXPRESS_CACHE_PATH: &str = "MODEL_EXPRESS_CACHE_PATH";
+
+        /// Disable shared-storage mode for the Model Express client. When set,
+        /// the client streams model files from the server over gRPC instead of
+        /// relying on a shared filesystem path. Required when the Model Express
+        /// server and worker pods do not share a filesystem (e.g. RWO PVCs,
+        /// cross-namespace deployments). Set to "1" or "true" to enable.
+        pub const MODEL_EXPRESS_NO_SHARED_STORAGE: &str = "MODEL_EXPRESS_NO_SHARED_STORAGE";
+    }
+
+    /// Hugging Face configuration
+    pub mod huggingface {
+        /// Hugging Face authentication token
+        pub const HF_TOKEN: &str = "HF_TOKEN";
+
+        /// Deprecated alias for the Hugging Face authentication token
+        pub const HUGGING_FACE_HUB_TOKEN: &str = "HUGGING_FACE_HUB_TOKEN";
+
+        /// Path to the stored Hugging Face authentication token
+        pub const HF_TOKEN_PATH: &str = "HF_TOKEN_PATH";
+
+        /// Hugging Face Hub cache directory
+        pub const HF_HUB_CACHE: &str = "HF_HUB_CACHE";
+
+        /// Hugging Face home directory
+        pub const HF_HOME: &str = "HF_HOME";
+
+        /// Override the Hugging Face Hub API endpoint
+        pub const HF_ENDPOINT: &str = "HF_ENDPOINT";
+
+        /// Offline mode - skip API calls when model is cached
+        /// Set to "1", "true", "on", or "yes" to enable
+        pub const HF_HUB_OFFLINE: &str = "HF_HUB_OFFLINE";
+    }
+}
+
+/// KV Router configuration environment variables
+pub mod router {
+    /// Most sessions each session-affinity table holds; defaults to 65,536.
+    /// The Python frontend exports `--router-session-affinity-max-entries` here.
+    pub const DYN_ROUTER_SESSION_AFFINITY_MAX_ENTRIES: &str =
+        "DYN_ROUTER_SESSION_AFFINITY_MAX_ENTRIES";
+
+    /// Scale applied to adjusted prompt-side prefill load after overlap/cache-hit credits.
+    pub const DYN_ROUTER_PREFILL_LOAD_SCALE: &str = "DYN_ROUTER_PREFILL_LOAD_SCALE";
+
+    /// Queue threshold fraction for prefill token capacity.
+    /// When set, requests are queued if all workers exceed this fraction of max_num_batched_tokens.
+    pub const DYN_ROUTER_QUEUE_THRESHOLD: &str = "DYN_ROUTER_QUEUE_THRESHOLD";
+
+    /// Scheduling policy for the router queue ("fcfs" or "wspt").
+    pub const DYN_ROUTER_QUEUE_POLICY: &str = "DYN_ROUTER_QUEUE_POLICY";
+    pub const DYN_ROUTER_POLICY_CONFIG: &str = "DYN_ROUTER_POLICY_CONFIG";
+
+    /// Stale active-request cleanup guard in seconds; this is not a request timeout.
+    pub const DYN_ROUTER_ACTIVE_REQUEST_EXPIRY_SECS: &str = "DYN_ROUTER_ACTIVE_REQUEST_EXPIRY_SECS";
+}
+
+/// Request plane transport environment variables
+pub mod request_plane {
+    /// Request-plane transport selection: `"tcp"` (default) or `"nats"`. Read by the
+    /// runtime in `distributed.rs` and by the Python launch layer.
+    pub const DYN_REQUEST_PLANE: &str = "DYN_REQUEST_PLANE";
+
+    /// Preferred payload codec advertised by every request-plane endpoint in this process.
+    /// The process-wide value is cached on first use and defaults to "msgpack". Outbound requests
+    /// use the destination endpoint's advertised codec, or "json" for a legacy destination.
+    pub const DYN_REQUEST_PLANE_CODEC: &str = "DYN_REQUEST_PLANE_CODEC";
+
+    /// Serialize `PreprocessedRequest.token_ids` as one packed little-endian int32 blob on
+    /// binary codecs instead of a sequence. Opt-in; every msgpack worker must run a release
+    /// whose readers accept the packed form.
+    pub const DYN_TOKEN_IDS_AS_BYTES: &str = "DYN_TOKEN_IDS_AS_BYTES";
+
+    /// Maximum TCP request-plane message size, in bytes.
+    pub const DYN_TCP_MAX_MESSAGE_SIZE: &str = "DYN_TCP_MAX_MESSAGE_SIZE";
+
+    /// Buffer size above which the TCP decoder shrinks an empty buffer, in bytes.
+    pub const DYN_TCP_SHRINK_MESSAGE_SIZE: &str = "DYN_TCP_SHRINK_MESSAGE_SIZE";
+
+    /// Host or interface for the TCP request-plane server.
+    /// The server resolves the value once at startup. A loopback fallback
+    /// persists until restart, and an enumeration error fails server startup.
+    pub const DYN_TCP_RPC_HOST: &str = "DYN_TCP_RPC_HOST";
+
+    /// Port for the TCP request-plane server.
+    /// If unset, the OS assigns a free ephemeral port.
+    pub const DYN_TCP_RPC_PORT: &str = "DYN_TCP_RPC_PORT";
+}
+
+/// Response plane transport configuration.
+pub mod response_plane {
+    /// Response transport used by every runtime in this process: "tcp", "quic"
+    /// or "velo". Defaults to "tcp".
+    ///
+    /// Velo has no TLS, so a process that selects velo uses tcp instead
+    /// while any `DYN_TCP_TLS_*` path is set or `DYN_TCP_TLS_INSECURE` is
+    /// truthy.
+    ///
+    /// On a graceful Stop, velo still delivers what the worker's engine
+    /// yields, final chunk included; tcp and quic end the stream at the worker.
+    pub const DYN_RESPONSE_PLANE: &str = "DYN_RESPONSE_PLANE";
+
+    /// Seconds a frontend waits, after a worker ACKs a unary request, for that
+    /// worker to establish its response stream.
+    ///
+    /// The deadline starts at the request-plane ACK, so time spent waiting for
+    /// local admission, connecting, and sending does not count. It covers the
+    /// worker's queueing and setup before it sends the response prologue, and a
+    /// worker that accepts requests but cannot connect back. Set it above the
+    /// worst-case time a healthy worker takes to start a response.
+    ///
+    /// On expiry the request fails with a response timeout (or migrates when
+    /// migration is enabled) and the worker is inhibited for
+    /// `DYN_RUNTIME_INHIBITED_DURATION_SECS`. Routers without fault detection
+    /// and bidirectional (streaming-input) requests do not apply this bound.
+    ///
+    /// Set to `0` or leave unset to disable the timeout (default: disabled).
+    pub const DYN_RESPONSE_STREAM_ESTABLISH_TIMEOUT_SECS: &str =
+        "DYN_RESPONSE_STREAM_ESTABLISH_TIMEOUT_SECS";
+    /// Messenger transport for Velo responses: tcp (default) or ucx. A ucx
+    /// service also listens on TCP, so a frontend and worker set differently
+    /// still reach each other, and the worker reports the mismatch.
+    pub const DYN_VELO_RESPONSE_TRANSPORT: &str = "DYN_VELO_RESPONSE_TRANSPORT";
+    /// Maximum Velo response batching delay in milliseconds (default: 2).
+    /// Set to 0 for greedy flushing after transport admission. Full batches and
+    /// lifecycle records can flush sooner. Read once when the service starts.
+    pub const DYN_VELO_RESPONSE_BATCH_MS: &str = "DYN_VELO_RESPONSE_BATCH_MS";
+    /// Heartbeat interval of each Velo response stream in milliseconds
+    /// (default: 1000). A frontend ends a stream, as Disconnected, once its
+    /// worker misses three to four heartbeats. Must be positive. Set on the
+    /// frontend; workers follow it. Read once when the service starts.
+    pub const DYN_VELO_RESPONSE_HEARTBEAT_MS: &str = "DYN_VELO_RESPONSE_HEARTBEAT_MS";
+    /// TCP port of the Velo response listener. Every Velo process, workers
+    /// included, opens one, and frontends connect to the workers' listeners as
+    /// well as workers to the frontends'. Only one process per IP address can
+    /// use a given port. If unset or 0, the OS assigns a free ephemeral port.
+    pub const DYN_VELO_RESPONSE_PORT: &str = "DYN_VELO_RESPONSE_PORT";
+}
+
+/// TCP request callback listener environment variables. Names are retained for compatibility.
+pub mod tcp_response_stream {
+    /// Port shared by the TCP request callback and QUIC response listeners.
+    /// If unset or 0, the OS assigns a free ephemeral port. Velo responses
+    /// use `DYN_VELO_RESPONSE_PORT` instead.
+    pub const DYN_TCP_RESPONSE_STREAM_PORT: &str = "DYN_TCP_RESPONSE_STREAM_PORT";
+
+    /// Listen backlog of the TCP response stream (CallHome) listener. Defaults to
+    /// 4096, capped by the kernel at `net.core.somaxconn`. Unset, zero, negative, or
+    /// unparseable values fall back to the default.
+    pub const DYN_TCP_LISTEN_BACKLOG: &str = "DYN_TCP_LISTEN_BACKLOG";
+
+    /// Host or interface for the TCP response stream server and QUIC response listener.
+    ///
+    /// Accepts IPv4 and IPv6 literals, bracketed IPv6 literals, IPv4 or IPv6
+    /// wildcards, and interface names. Interface aliases such as `eth0:1` are
+    /// also accepted. If unset, the server selects the first usable
+    /// non-loopback IPv4 address, then IPv6, then IPv4 loopback, then IPv6
+    /// loopback. A wildcard uses a reachable address in its requested family.
+    /// If only the other family has a usable non-loopback address, the server
+    /// switches the bind wildcard to that family. The server resolves the value
+    /// once at startup. A loopback fallback persists until restart, and an
+    /// enumeration error fails server startup.
+    pub const DYN_TCP_RESPONSE_STREAM_HOST: &str = "DYN_TCP_RESPONSE_STREAM_HOST";
+
+    /// TCP request-plane TLS configuration
+    pub mod tls {
+        /// Path to the PEM certificate used by the TCP server.
+        /// When set together with DYN_TCP_TLS_KEY_PATH, TLS is enabled on the
+        /// TCP server. To enable TLS on the client side, also set
+        /// DYN_TCP_TLS_CA_CERT_PATH (or DYN_TCP_TLS_INSECURE for dev).
+        pub const DYN_TCP_TLS_CERT_PATH: &str = "DYN_TCP_TLS_CERT_PATH";
+
+        /// Path to the PEM private key for the TCP server certificate.
+        pub const DYN_TCP_TLS_KEY_PATH: &str = "DYN_TCP_TLS_KEY_PATH";
+
+        /// Path to the PEM CA certificate used by TCP clients to verify the server.
+        /// Required on the client side when the server uses a self-signed or internal CA.
+        pub const DYN_TCP_TLS_CA_CERT_PATH: &str = "DYN_TCP_TLS_CA_CERT_PATH";
+
+        /// Disable TLS certificate verification on the TCP client. Set to "true" to skip.
+        /// WARNING: Only for local development. Never use in production.
+        pub const DYN_TCP_TLS_INSECURE: &str = "DYN_TCP_TLS_INSECURE";
+
+        /// Override the TLS server name (SNI) used by TCP clients when verifying the
+        /// server certificate. When unset, the hostname extracted from the connection
+        /// address is used. Useful when connecting by IP to a server whose certificate
+        /// uses a DNS SAN.
+        pub const DYN_TCP_TLS_SERVER_NAME: &str = "DYN_TCP_TLS_SERVER_NAME";
+
+        /// Path to the PEM client certificate presented by TCP clients to the
+        /// server for mutual TLS (mTLS). Must be set together with
+        /// `DYN_TCP_TLS_CLIENT_KEY_PATH`.
+        pub const DYN_TCP_TLS_CLIENT_CERT_PATH: &str = "DYN_TCP_TLS_CLIENT_CERT_PATH";
+
+        /// Path to the PEM private key for the TCP client certificate (mTLS).
+        pub const DYN_TCP_TLS_CLIENT_KEY_PATH: &str = "DYN_TCP_TLS_CLIENT_KEY_PATH";
+
+        /// Path to the PEM CA certificate the TCP server uses to verify client
+        /// certificates. When set, the server requires clients to present a
+        /// certificate signed by this CA (mTLS is enforced).
+        pub const DYN_TCP_TLS_CLIENT_CA_CERT_PATH: &str = "DYN_TCP_TLS_CLIENT_CA_CERT_PATH";
+
+        /// TLS handshake timeout in seconds (default: 3).
+        pub const DYN_TCP_TLS_HANDSHAKE_TIMEOUT_SECS: &str = "DYN_TCP_TLS_HANDSHAKE_TIMEOUT_SECS";
+    }
+}
+
+/// Fixed-lane QUIC response transport.
+pub mod quic_response {
+    /// Bulk-lane batch interval in microseconds. Defaults to 5,000. Registration,
+    /// prologue, first-data, and priority-end frames always flush immediately.
+    pub const DYN_QUIC_RESPONSE_BATCH_INTERVAL_US: &str = "DYN_QUIC_RESPONSE_BATCH_INTERVAL_US";
+    /// Per-response frontend mailbox capacity. Defaults to 16,384 frames.
+    pub const DYN_QUIC_RESPONSE_BUFFER_CAPACITY: &str = "DYN_QUIC_RESPONSE_BUFFER_CAPACITY";
+}
+
+/// Event Plane transport environment variables
+pub mod event_plane {
+    /// Event transport selection: "zmq" or "nats".
+    ///
+    /// When unset the default depends on the discovery backend:
+    /// - `file` / `mem` backends: defaults to `zmq` (no external services required).
+    /// - `etcd` / `kubernetes` backends: defaults to `nats`.
+    ///
+    /// Set this explicitly to override the context-aware default.
+    pub const DYN_EVENT_PLANE: &str = "DYN_EVENT_PLANE";
+
+    /// Event plane codec selection: "json" or "msgpack".
+    pub const DYN_EVENT_PLANE_CODEC: &str = "DYN_EVENT_PLANE_CODEC";
+
+    /// IP address or exact interface advertised by direct ZMQ event publishers.
+    /// Unspecified addresses are rejected.
+    /// If unset, the runtime auto-detects a local IP address.
+    pub const DYN_EVENT_PLANE_HOST: &str = "DYN_EVENT_PLANE_HOST";
+
+    /// Bounded capacity of the direct ZMQ event-subscriber's merged event channel.
+    ///
+    /// Many peer publishers (e.g. every other frontend under replica-sync) feed
+    /// this single-consumer channel; an unbounded channel grows RSS without limit
+    /// when the consumer can't keep up. When the channel is full, new events are
+    /// dropped — the event plane is already best-effort/lossy (ZMQ RCVHWM), so a
+    /// dropped event costs routing-estimate freshness, not correctness.
+    /// Default: 100_000 (matches ZMQ_RCVHWM). Applies only to the direct ZMQ
+    /// subscriber path.
+    pub const DYN_ZMQ_EVENT_SUBSCRIBER_CHANNEL_CAPACITY: &str =
+        "DYN_ZMQ_EVENT_SUBSCRIBER_CHANNEL_CAPACITY";
+}
+
+/// ZMQ Broker environment variables
+pub mod zmq_broker {
+    /// Explicit ZMQ broker URL (takes precedence over discovery)
+    /// Format: `"xsub=<url1>[;<url2>...] , xpub=<url1>[;<url2>...]"`
+    /// Example: "xsub=tcp://broker:5555 , xpub=tcp://broker:5556"
+    pub const DYN_ZMQ_BROKER_URL: &str = "DYN_ZMQ_BROKER_URL";
+
+    /// Enable ZMQ broker discovery mode
+    pub const DYN_ZMQ_BROKER_ENABLED: &str = "DYN_ZMQ_BROKER_ENABLED";
+
+    /// XSUB bind address (broker binary only)
+    pub const ZMQ_BROKER_XSUB_BIND: &str = "ZMQ_BROKER_XSUB_BIND";
+
+    /// XPUB bind address (broker binary only)
+    pub const ZMQ_BROKER_XPUB_BIND: &str = "ZMQ_BROKER_XPUB_BIND";
+
+    /// Namespace for broker discovery registration
+    pub const ZMQ_BROKER_NAMESPACE: &str = "ZMQ_BROKER_NAMESPACE";
+}
+
+/// Discovery environment variables
+pub mod discovery {
+    /// Discovery backend: "kubernetes" or "etcd" (default)
+    pub const DYN_DISCOVERY_BACKEND: &str = "DYN_DISCOVERY_BACKEND";
+
+    /// Kube discovery mode: "pod" (default) or "container" (each container registers independently)
+    pub const DYN_KUBE_DISCOVERY_MODE: &str = "DYN_KUBE_DISCOVERY_MODE";
+}
+
+/// CUDA and GPU environment variables
+pub mod cuda {
+    /// Path to custom CUDA fatbin file.
+    ///
+    /// Note: build.rs files cannot import this constant at build time,
+    /// so they must define local constants with the same value.
+    pub const DYN_FATBIN_PATH: &str = "DYN_FATBIN_PATH";
+}
+
+/// Build-time environment variables
+pub mod build {
+    /// Cargo output directory for build artifacts
+    ///
+    /// Note: This constant cannot be used with the `env!()` macro,
+    /// which requires a string literal at compile time.
+    /// Build scripts (build.rs) also cannot import this constant.
+    pub const OUT_DIR: &str = "OUT_DIR";
+}
+
+/// Mocker (mock scheduler/KV manager) environment variables
+pub mod mocker {
+    /// Enable structured KV cache allocation/eviction trace logs (set to "1" or "true" to enable)
+    pub const DYN_MOCKER_KV_CACHE_TRACE: &str = "DYN_MOCKER_KV_CACHE_TRACE";
+
+    /// Use the original direct() code path in the mocker request dispatch.
+    ///
+    /// This path is race-prone during startup; prefer leaving it unset unless you are
+    /// explicitly trying to reproduce the original behavior.
+    pub const DYN_MOCKER_SYNC_DIRECT: &str = "DYN_MOCKER_SYNC_DIRECT";
+}
+
+/// Testing environment variables
+pub mod testing {
+    /// Enable queued-up request processing in tests
+    pub const DYN_QUEUED_UP_PROCESSING: &str = "DYN_QUEUED_UP_PROCESSING";
+
+    /// Soak test run duration (e.g., "3s", "5m")
+    pub const DYN_SOAK_RUN_DURATION: &str = "DYN_SOAK_RUN_DURATION";
+
+    /// Soak test batch load size
+    pub const DYN_SOAK_BATCH_LOAD: &str = "DYN_SOAK_BATCH_LOAD";
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_no_duplicate_env_var_names() {
+        use std::collections::HashSet;
+
+        let mut seen = HashSet::new();
+        let vars = [
+            // Logging
+            logging::DYN_LOG,
+            logging::DYN_LOGGING_CONFIG_PATH,
+            logging::DYN_LOGGING_JSONL,
+            logging::DYN_LOGGING_CONSOLE_FORMAT,
+            logging::DYN_SDK_DISABLE_ANSI_LOGGING,
+            logging::DYN_LOG_USE_LOCAL_TZ,
+            logging::DYN_LOGGING_SPAN_EVENTS,
+            logging::otlp::OTEL_EXPORT_ENABLED,
+            logging::otlp::OTEL_EXPORTER_OTLP_PROTOCOL,
+            logging::otlp::OTEL_EXPORTER_OTLP_TRACES_PROTOCOL,
+            logging::otlp::OTEL_EXPORTER_OTLP_LOGS_PROTOCOL,
+            logging::otlp::OTEL_EXPORTER_OTLP_ENDPOINT,
+            logging::otlp::OTEL_EXPORTER_OTLP_TRACES_ENDPOINT,
+            logging::otlp::OTEL_SERVICE_NAME,
+            logging::otlp::OTEL_EXPORTER_OTLP_LOGS_ENDPOINT,
+            logging::otlp::OTEL_TRACES_SAMPLE_RATIO,
+            // Runtime
+            runtime::DYN_RUNTIME_NUM_WORKER_THREADS,
+            runtime::DYN_RUNTIME_MAX_BLOCKING_THREADS,
+            runtime::DYN_RUNTIME_GRACEFUL_SHUTDOWN_TIMEOUT_SECS,
+            runtime::DYN_RUNTIME_INHIBITED_DURATION_SECS,
+            runtime::system::DYN_SYSTEM_ENABLED,
+            runtime::system::DYN_SYSTEM_HOST,
+            runtime::system::DYN_SYSTEM_PORT,
+            runtime::system::DYN_SYSTEM_USE_ENDPOINT_HEALTH_STATUS,
+            runtime::system::DYN_SYSTEM_STARTING_HEALTH_STATUS,
+            runtime::system::DYN_SYSTEM_HEALTH_PATH,
+            runtime::system::DYN_SYSTEM_LIVE_PATH,
+            runtime::canary::DYN_CANARY_WAIT_TIME,
+            // Worker
+            worker::DYN_WORKER_GRACEFUL_SHUTDOWN_TIMEOUT,
+            // NATS
+            nats::NATS_SERVER,
+            nats::DYN_NATS_REQUEST_TIMEOUT_SECS,
+            nats::NATS_STARTUP_CONNECT_TIMEOUT_SECONDS,
+            nats::auth::NATS_AUTH_USERNAME,
+            nats::auth::NATS_AUTH_PASSWORD,
+            nats::auth::NATS_AUTH_TOKEN,
+            nats::auth::NATS_AUTH_NKEY,
+            nats::auth::NATS_AUTH_CREDENTIALS_FILE,
+            nats::stream::DYN_NATS_STREAM_MAX_AGE,
+            nats::tls::NATS_TLS_CA_CERT_PATH,
+            nats::tls::NATS_TLS_CLIENT_CERT_PATH,
+            nats::tls::NATS_TLS_CLIENT_KEY_PATH,
+            nats::tls::NATS_TLS_INSECURE,
+            // ETCD
+            etcd::ETCD_ENDPOINTS,
+            etcd::ETCD_LEASE_TTL,
+            etcd::ETCD_STARTUP_CONNECT_TIMEOUT_SECONDS,
+            etcd::ETCD_KEEPALIVE_INTERVAL_SECONDS,
+            etcd::ETCD_KEEPALIVE_TIMEOUT_SECONDS,
+            etcd::auth::ETCD_AUTH_USERNAME,
+            etcd::auth::ETCD_AUTH_PASSWORD,
+            etcd::auth::ETCD_AUTH_CA,
+            etcd::auth::ETCD_AUTH_CLIENT_CERT,
+            etcd::auth::ETCD_AUTH_CLIENT_KEY,
+            // LLM
+            llm::DYN_HTTP_BODY_LIMIT_MB,
+            llm::DYN_BATCH_UPLOAD_BODY_LIMIT_MB,
+            llm::DYN_BATCH_MAX_FILE_TRANSFERS,
+            llm::DYN_BATCH_FILE_TRANSFER_TIMEOUT_SECS,
+            llm::DYN_HTTP_LISTEN_BACKLOG,
+            llm::DYN_HTTP_GRACEFUL_SHUTDOWN_TIMEOUT_SECS,
+            llm::DYN_HTTP_WRITE_IDLE_TIMEOUT_SECS,
+            llm::DYN_HTTP_OVERLOAD_STATUS_CODE,
+            llm::DYN_HTTP_BACKEND_STREAM_TIMEOUT_SECS,
+            llm::DYN_HTTP_PRE_COMMIT_ERROR_PEEK_MS,
+            llm::DYN_LORA_ENABLED,
+            llm::DYN_LORA_RUNTIME_LOAD_ENABLED,
+            llm::DYN_LORA_DOWNLOADER_PLUGIN,
+            llm::DYN_LORA_ALLOWED_SCHEMES,
+            llm::DYN_LORA_RESOLVE_TIMEOUT_SECONDS,
+            llm::DYN_LORA_MAX_CONCURRENT_RESOLUTIONS,
+            llm::DYN_LORA_MAX_PENDING_RUNTIME_KEYS,
+            llm::DYN_LORA_MAX_PENDING_ADMISSIONS,
+            llm::DYN_LORA_PENDING_ADMISSION_TIMEOUT_SECONDS,
+            llm::DYN_LORA_MAX_RESIDENT_RUNTIME_LORAS,
+            llm::DYN_LORA_MAX_DOWNLOAD_BYTES,
+            llm::DYN_LORA_MAX_CACHE_BYTES,
+            llm::DYN_LORA_PATH,
+            llm::DYN_LORA_S3_TLS_INSECURE,
+            llm::DYN_ENABLE_ANTHROPIC_API,
+            llm::DYN_SERVING_LOAD_PUBLISH,
+            llm::DYN_ENABLE_SYSTEMONE_API,
+            llm::DYN_SYSTEMONE_MAX_INFLIGHT_BRANCHES,
+            llm::DYN_SYSTEMONE_MAX_INPUT_TOKENS,
+            llm::DYN_SYSTEMONE_REQUEST_TIMEOUT_SECS,
+            llm::DYN_DISABLE_FRONTEND_NVEXT,
+            llm::DYN_IGNORE_OPENAI_FE_UNSUPPORTED_FIELDS,
+            llm::DYN_DISABLE_OPENAI_STRICT_SCHEMA_VALIDATION,
+            llm::DYN_ENABLE_FRONTEND_ADMIN_API,
+            llm::DYN_FRONTEND_ADMIN_HOST,
+            llm::DYN_FRONTEND_ADMIN_PORT,
+            llm::DYN_STRIP_ANTHROPIC_PREAMBLE,
+            llm::DYN_REJECT_MEDIA,
+            llm::DYN_REJECT_MEDIA_STATUS_CODE,
+            llm::DYN_ENABLE_FORCE_INCLUDE_USAGE,
+            llm::DYN_ENABLE_STREAMING_TOOL_DISPATCH,
+            llm::DYN_ENABLE_STREAMING_REASONING_DISPATCH,
+            llm::DYN_REASONING_FIELD_NAME,
+            llm::DYN_PARSER_VERSION,
+            llm::DYN_ENABLE_EXPERIMENTAL_PARSERS_V2,
+            llm::DYN_ENABLE_GUIDED_TOOL_STREAMING,
+            llm::DYN_KV_STATE_AGENT_HOST_DISCOVERY_TIMEOUT_SECS,
+            llm::DYN_MM_NIXL_PROGRESS_DELAY_US,
+            llm::DYN_LORA_ALLOCATION_ENABLED,
+            llm::DYN_LORA_ALLOCATION_ALGORITHM,
+            llm::DYN_LORA_ALLOCATION_TIMESTEP_SECS,
+            llm::DYN_LORA_ALLOCATION_SCALE_DOWN_COOLDOWN_TICKS,
+            llm::DYN_LORA_ALLOCATION_RATE_WINDOW_MULTIPLIER,
+            llm::DYN_LORA_ALLOCATION_BUCKETS_PER_SECOND,
+            llm::DYN_LORA_ALLOCATION_PREDICTOR_TYPE,
+            llm::DYN_LORA_ALLOCATION_EMA_ALPHA,
+            llm::DYN_LORA_MCF_CONFIG,
+            llm::DYN_TOKEN_ECHO_DELAY_MS,
+            llm::DYN_HTTP_SSE_KEEP_ALIVE_INTERVAL_MS,
+            llm::metrics::DYN_METRICS_PREFIX,
+            llm::metrics::DYN_METRICS_REQUEST_DURATION,
+            llm::metrics::DYN_METRICS_INPUT_SEQUENCE,
+            llm::metrics::DYN_METRICS_OUTPUT_SEQUENCE,
+            llm::metrics::DYN_METRICS_TTFT,
+            llm::metrics::DYN_METRICS_ITL,
+            llm::metrics::DYN_METRICS_ITL_BUCKETS,
+            llm::metrics::DYN_METRICS_EMBEDDING_LATENCY,
+            llm::audit::DYN_AUDIT_SINKS,
+            llm::audit::DYN_AUDIT_FORCE_LOGGING,
+            llm::audit::DYN_AUDIT_CAPACITY,
+            llm::audit::DYN_AUDIT_NATS_SUBJECT,
+            llm::audit::DYN_AUDIT_OUTPUT_PATH,
+            llm::audit::DYN_AUDIT_JSONL_BUFFER_BYTES,
+            llm::audit::DYN_AUDIT_JSONL_FLUSH_INTERVAL_MS,
+            llm::audit::DYN_AUDIT_JSONL_GZ_ROLL_BYTES,
+            llm::audit::DYN_AUDIT_JSONL_GZ_ROLL_LINES,
+            llm::request_trace::DYN_REQUEST_TRACE,
+            llm::request_trace::DYN_REQUEST_TRACE_SINKS,
+            llm::request_trace::DYN_REQUEST_TRACE_FILE_PATH,
+            llm::request_trace::DYN_REQUEST_TRACE_OUTPUT_PATH,
+            llm::request_trace::DYN_REQUEST_TRACE_FILE_FORMAT,
+            llm::request_trace::DYN_REQUEST_TRACE_CAPACITY,
+            llm::request_trace::DYN_REQUEST_TRACE_RECORDS,
+            llm::request_trace::DYN_REQUEST_TRACE_NATS_SUBJECT,
+            llm::request_trace::DYN_REQUEST_TRACE_OTEL_MAX_PAYLOAD_BYTES,
+            llm::request_trace::DYN_REQUEST_TRACE_FILE_BUFFER_BYTES,
+            llm::request_trace::DYN_REQUEST_TRACE_JSONL_BUFFER_BYTES,
+            llm::request_trace::DYN_REQUEST_TRACE_FILE_FLUSH_INTERVAL_MS,
+            llm::request_trace::DYN_REQUEST_TRACE_JSONL_FLUSH_INTERVAL_MS,
+            llm::request_trace::DYN_REQUEST_TRACE_FILE_ROLL_BYTES,
+            llm::request_trace::DYN_REQUEST_TRACE_JSONL_GZ_ROLL_BYTES,
+            llm::request_trace::DYN_REQUEST_TRACE_FILE_ROLL_LINES,
+            llm::request_trace::DYN_REQUEST_TRACE_JSONL_GZ_ROLL_LINES,
+            llm::request_trace::DYN_REQUEST_TRACE_TOOL_EVENTS_ZMQ_ENDPOINT,
+            llm::request_trace::DYN_REQUEST_TRACE_TOOL_EVENTS_ZMQ_TOPIC,
+            llm::request_trace::DYN_REQUEST_TRACE_HTTP_HEADER_CAPTURE_LIST,
+            llm::audit::DYN_AUDIT_OTEL_MAX_PAYLOAD_BYTES,
+            // Model
+            model::model_express::MODEL_EXPRESS_URL,
+            model::model_express::MODEL_EXPRESS_CACHE_PATH,
+            model::model_express::MODEL_EXPRESS_NO_SHARED_STORAGE,
+            model::huggingface::HF_TOKEN,
+            model::huggingface::HUGGING_FACE_HUB_TOKEN,
+            model::huggingface::HF_TOKEN_PATH,
+            model::huggingface::HF_HUB_CACHE,
+            model::huggingface::HF_HOME,
+            model::huggingface::HF_ENDPOINT,
+            model::huggingface::HF_HUB_OFFLINE,
+            // Router
+            router::DYN_ROUTER_PREFILL_LOAD_SCALE,
+            router::DYN_ROUTER_QUEUE_THRESHOLD,
+            router::DYN_ROUTER_QUEUE_POLICY,
+            router::DYN_ROUTER_POLICY_CONFIG,
+            router::DYN_ROUTER_ACTIVE_REQUEST_EXPIRY_SECS,
+            request_plane::DYN_REQUEST_PLANE,
+            request_plane::DYN_REQUEST_PLANE_CODEC,
+            response_plane::DYN_RESPONSE_PLANE,
+            response_plane::DYN_RESPONSE_STREAM_ESTABLISH_TIMEOUT_SECS,
+            response_plane::DYN_VELO_RESPONSE_TRANSPORT,
+            response_plane::DYN_VELO_RESPONSE_BATCH_MS,
+            response_plane::DYN_VELO_RESPONSE_HEARTBEAT_MS,
+            response_plane::DYN_VELO_RESPONSE_PORT,
+            request_plane::DYN_TCP_MAX_MESSAGE_SIZE,
+            request_plane::DYN_TCP_SHRINK_MESSAGE_SIZE,
+            request_plane::DYN_TCP_RPC_HOST,
+            request_plane::DYN_TCP_RPC_PORT,
+            // TCP Response Stream
+            tcp_response_stream::DYN_TCP_RESPONSE_STREAM_PORT,
+            tcp_response_stream::DYN_TCP_LISTEN_BACKLOG,
+            tcp_response_stream::DYN_TCP_RESPONSE_STREAM_HOST,
+            tcp_response_stream::tls::DYN_TCP_TLS_CERT_PATH,
+            tcp_response_stream::tls::DYN_TCP_TLS_KEY_PATH,
+            tcp_response_stream::tls::DYN_TCP_TLS_CA_CERT_PATH,
+            tcp_response_stream::tls::DYN_TCP_TLS_INSECURE,
+            tcp_response_stream::tls::DYN_TCP_TLS_SERVER_NAME,
+            tcp_response_stream::tls::DYN_TCP_TLS_CLIENT_CERT_PATH,
+            tcp_response_stream::tls::DYN_TCP_TLS_CLIENT_KEY_PATH,
+            tcp_response_stream::tls::DYN_TCP_TLS_CLIENT_CA_CERT_PATH,
+            tcp_response_stream::tls::DYN_TCP_TLS_HANDSHAKE_TIMEOUT_SECS,
+            quic_response::DYN_QUIC_RESPONSE_BATCH_INTERVAL_US,
+            quic_response::DYN_QUIC_RESPONSE_BUFFER_CAPACITY,
+            // Event Plane
+            event_plane::DYN_EVENT_PLANE,
+            event_plane::DYN_EVENT_PLANE_CODEC,
+            event_plane::DYN_EVENT_PLANE_HOST,
+            event_plane::DYN_ZMQ_EVENT_SUBSCRIBER_CHANNEL_CAPACITY,
+            // ZMQ Broker
+            zmq_broker::DYN_ZMQ_BROKER_URL,
+            zmq_broker::DYN_ZMQ_BROKER_ENABLED,
+            zmq_broker::ZMQ_BROKER_XSUB_BIND,
+            zmq_broker::ZMQ_BROKER_XPUB_BIND,
+            zmq_broker::ZMQ_BROKER_NAMESPACE,
+            // Discovery
+            discovery::DYN_DISCOVERY_BACKEND,
+            discovery::DYN_KUBE_DISCOVERY_MODE,
+            // CUDA
+            cuda::DYN_FATBIN_PATH,
+            // Build
+            build::OUT_DIR,
+            // Mocker
+            mocker::DYN_MOCKER_KV_CACHE_TRACE,
+            mocker::DYN_MOCKER_SYNC_DIRECT,
+            // Testing
+            testing::DYN_QUEUED_UP_PROCESSING,
+            testing::DYN_SOAK_RUN_DURATION,
+            testing::DYN_SOAK_BATCH_LOAD,
+        ];
+
+        for var in &vars {
+            if !seen.insert(var) {
+                panic!("Duplicate environment variable name: {}", var);
+            }
+        }
+    }
+
+    #[test]
+    fn test_naming_conventions() {
+        // Dynamo-specific vars should start with DYN_
+        assert!(runtime::DYN_RUNTIME_NUM_WORKER_THREADS.starts_with("DYN_"));
+        assert!(runtime::DYN_RUNTIME_GRACEFUL_SHUTDOWN_TIMEOUT_SECS.starts_with("DYN_"));
+        assert!(runtime::system::DYN_SYSTEM_ENABLED.starts_with("DYN_"));
+        assert!(worker::DYN_WORKER_GRACEFUL_SHUTDOWN_TIMEOUT.starts_with("DYN_"));
+
+        // NATS vars should start with NATS_
+        assert!(nats::NATS_SERVER.starts_with("NATS_"));
+        assert!(nats::auth::NATS_AUTH_USERNAME.starts_with("NATS_AUTH_"));
+
+        // ETCD vars should start with ETCD_
+        assert!(etcd::ETCD_ENDPOINTS.starts_with("ETCD_"));
+        assert!(etcd::ETCD_LEASE_TTL.starts_with("ETCD_"));
+        assert!(etcd::auth::ETCD_AUTH_USERNAME.starts_with("ETCD_AUTH_"));
+
+        // OpenTelemetry vars should start with OTEL_
+        assert!(logging::otlp::OTEL_EXPORT_ENABLED.starts_with("OTEL_"));
+        assert!(logging::otlp::OTEL_EXPORTER_OTLP_ENDPOINT.starts_with("OTEL_"));
+        assert!(logging::otlp::OTEL_SERVICE_NAME.starts_with("OTEL_"));
+    }
+}

@@ -1,0 +1,540 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package v1beta1
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"strings"
+
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/validation"
+	"k8s.io/utils/ptr"
+
+	commonconsts "github.com/ai-dynamo/dynamo/deploy/operator/internal/consts"
+)
+
+const (
+	// DynamoComponentDeploymentConditionTypeAvailable indicates the component is
+	// available and serving traffic.
+	DynamoComponentDeploymentConditionTypeAvailable = "Available"
+	// DynamoComponentDeploymentConditionTypeDynamoComponentReady indicates the
+	// underlying Dynamo component is ready.
+	DynamoComponentDeploymentConditionTypeDynamoComponentReady = "DynamoComponentReady"
+
+	// MainContainerName is the well-known name of the primary Dynamo workload
+	// container inside a component's podTemplate.spec.containers. The
+	// podTemplate must include this container with a non-empty image. The
+	// operator injects its defaults (command, env, ports, probes, resources,
+	// volume mounts) into this container. Any other container in the
+	// podTemplate is treated as a user-managed sidecar.
+	MainContainerName = "main"
+)
+
+// DynamoComponentDeploymentSpec defines the desired state of a DynamoComponentDeployment.
+// +kubebuilder:validation:XValidation:rule="!(has(self.type) && self.type == 'lpx')",message="standalone LPX DynamoComponentDeployments are not supported; use DynamoGraphDeployment"
+// +kubebuilder:validation:XValidation:rule="!has(oldSelf.minAvailable) || (has(self.minAvailable) && self.minAvailable == oldSelf.minAvailable)",message="minAvailable is immutable after creation"
+type DynamoComponentDeploymentSpec struct {
+	// backendFramework specifies the backend framework.
+	// +kubebuilder:validation:Enum=sglang;vllm;trtllm
+	// +optional
+	BackendFramework string `json:"backendFramework,omitempty"`
+
+	// DynamoComponentDeploymentSharedSpec embeds common deployment and runtime
+	// settings that apply to the component.
+	DynamoComponentDeploymentSharedSpec `json:",inline"`
+}
+
+// DynamoComponentDeploymentSharedSpec is the shared configuration used by both
+// standalone DCDs and by the components embedded in a DynamoGraphDeployment.
+//
+// In v1beta1 the ten per-component pod-configuration fields that existed in
+// v1alpha1 (resources, envs, envFromSecret, livenessProbe, readinessProbe,
+// volumeMounts, annotations, labels, extraPodMetadata, extraPodSpec) are
+// replaced with a single `podTemplate` field holding a native
+// `corev1.PodTemplateSpec`. By default, the operator injects its defaults into
+// `podTemplate.spec.containers[name=main]` and merges user overrides using
+// strategic-merge-by-name semantics. In Dynamo sidecar mode, Dynamo defaults target
+// `podTemplate.spec.initContainers[name=runtime]` instead. Users can add sidecars,
+// init containers, and pod-level configuration directly in `podTemplate` without
+// any `extraPodSpec`-style escape hatch. Container paths are relative to the component spec.
+// +kubebuilder:validation:XValidation:rule="!has(self.eppConfig) || (has(self.type) && self.type == 'epp')",message="eppConfig may only be set when type is epp"
+// +kubebuilder:validation:XValidation:rule="!has(self.minAvailable) || (!has(self.replicas) && has(self.type) && self.type == 'lpx') || (has(self.replicas) && self.replicas == 0) || self.minAvailable <= (has(self.replicas) ? self.replicas : 1)",message="minAvailable must be less than or equal to replicas unless replicas is 0"
+// +kubebuilder:validation:XValidation:rule="!has(oldSelf.type) || (has(self.type) && self.type == oldSelf.type)",message="type is immutable after it is set"
+// +kubebuilder:validation:XValidation:rule="!has(self.lpx) || (has(self.type) && self.type == 'lpx')",message="lpx may only be set when type is lpx"
+// +kubebuilder:validation:XValidation:rule="!(has(self.type) && self.type == 'lpx') || has(self.lpx)",message="lpx is required when type is lpx"
+// +kubebuilder:validation:XValidation:rule="!(has(self.type) && self.type == 'lpx') || !has(self.podTemplate)",message="LPX Pod templates belong to roles"
+// +kubebuilder:validation:XValidation:rule="!(has(self.type) && self.type == 'lpx' && has(self.replicas) && self.replicas < 1)",message="replicas must be positive when type is lpx"
+// +kubebuilder:validation:XValidation:rule="!(has(self.type) && self.type == 'lpx' && has(self.scalingAdapter))",message="scalingAdapter is not supported when type is lpx"
+// +kubebuilder:validation:XValidation:rule="(has(self.type) && self.type == 'lpx') || !has(self.roles) || !self.roles.exists(r, has(r.podTemplate)) || (!has(self.podTemplate) && self.roles.all(r, has(r.podTemplate)))",message="use either component podTemplate or complete role podTemplates"
+type DynamoComponentDeploymentSharedSpec struct {
+	// providerOverride configures the primary Grove unit representing this DGD
+	// component. With apiVersion `grove.io/v1alpha1`, target is
+	// `PodCliqueTemplateSpec` for a single-node component or
+	// `PodCliqueScalingGroupConfig` for a PCSG-backed component; value may set
+	// `topologyConstraint` and `rollingUpdate.maxUnavailable`. Standalone DCD
+	// OpenAPI omits this field.
+	// +optional
+	ProviderOverride *ProviderOverride `json:"providerOverride,omitempty"`
+
+	// name is the stable logical identifier for this component within its
+	// DynamoGraphDeployment. It must be unique within the parent's
+	// `spec.components` list.
+	//
+	// For standalone DynamoComponentDeployment objects, the defaulting webhook
+	// populates `name` from `metadata.name` on admission, so users
+	// typically do not need to set it explicitly.
+	//
+	// `name` is decoupled from the underlying Kubernetes resource name so that
+	// the operator can rename child workloads (e.g. suffixing worker DCDs with
+	// a hash during rolling updates) without losing the stable identity that
+	// downstream consumers (labels, status maps, DGDSA references, planner
+	// RBAC, EPP filters) depend on.
+	// +required
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:Pattern=`^[A-Za-z0-9]([-A-Za-z0-9]*[A-Za-z0-9])?$`
+	ComponentName string `json:"name"`
+
+	// type indicates the role of this component within a Dynamo graph. Drives
+	// port mapping, frontend detection, planner RBAC, and the pod label
+	// `nvidia.com/dynamo-component-type`. Because `prefill` and `decode` are
+	// first-class values, users can set them directly.
+	//
+	// The DGD-only "lpx" type is experimental, requires the operator's
+	// lpx.enabled setting, and may change incompatibly.
+	// +optional
+	ComponentType ComponentType `json:"type,omitempty"`
+
+	// RuntimeVersionOverride overrides the Dynamo runtime compatibility version
+	// inferred from podTemplate.spec.containers[name=main].image.
+	// In sidecar mode, it instead overrides the version inferred from
+	// podTemplate.spec.initContainers[name=runtime].image.
+	// The same rules apply to roles[].podTemplate. For non-LPX components in
+	// sidecar mode, main container images are not used to infer Dynamo versions,
+	// including for roles without a runtime init container.
+	// This field does not change container images.
+	//
+	// For frontend, worker, prefill, decode, planner, and epp components, DGD
+	// admission requires this field when any runtime image tag lacks a parseable
+	// semantic version. Components without a type and controller-generated DCDs
+	// may omit it. An override is also needed when the parsed tag differs from
+	// the Dynamo runtime version.
+	//
+	// The value must use canonical MAJOR.MINOR.PATCH format, for example "1.4.0",
+	// and match the Dynamo version in every affected runtime container.
+	// Setting or changing an override of 1.5.0 or later may trigger a rollout.
+	// +kubebuilder:validation:Pattern=`^(0|[1-9][0-9]{0,3})\.(0|[1-9][0-9]{0,3})\.(0|[1-9][0-9]{0,3})$`
+	// +optional
+	RuntimeVersionOverride string `json:"runtimeVersionOverride,omitempty"`
+
+	// globalDynamoNamespace places the component in the global Dynamo
+	// namespace rather than the per-deployment namespace derived from the
+	// DGD name.
+	// +optional
+	GlobalDynamoNamespace bool `json:"globalDynamoNamespace,omitempty"`
+
+	// PodTemplate supplies the Pod configuration shared by this component's roles.
+	// It is mutually exclusive with roles[].podTemplate. New components using this
+	// template must include podTemplate.spec.containers[name=main] with a non-empty
+	// image. Existing components without a podTemplate may retain that omission
+	// on update.
+	//
+	// By default, the operator merges Dynamo defaults into
+	// podTemplate.spec.containers[name=main]. Declaring
+	// podTemplate.spec.initContainers[name=runtime] enables Dynamo sidecar mode.
+	// The main container runs the inference engine, and the runtime init container
+	// receives Dynamo environment, identity, system port, and probe defaults.
+	// The operator does not create the runtime init container. Its declaration must
+	// include a non-empty image and restartPolicy: Always.
+	//
+	// Sidecar mode supports worker, prefill, and decode components.
+	// Multinode sidecars support backendFramework: sglang, vllm, and trtllm.
+	// Multinode sidecars require complete leader and worker roles[].podTemplate
+	// definitions instead of this shared template.
+	// The leader must declare a runtime init container. The worker may omit it.
+	// Each role's template supplies the engine command and topology arguments.
+	// Declared runtime init containers still receive Dynamo defaults.
+	// Checkpoint, GPU memory service, and failover cannot be enabled in sidecar mode.
+	//
+	// Graph-level env applies to podTemplate.spec.containers[name=main] and any
+	// declared podTemplate.spec.initContainers[name=runtime]. Compilation cache
+	// and shared memory apply to the main container. Other containers require
+	// their own configuration, including an image.
+	// See runtimeVersionOverride for runtime image version requirements.
+	// +optional
+	PodTemplate *corev1.PodTemplateSpec `json:"podTemplate,omitempty"`
+
+	// replicas is the desired number of Pods for this component. When
+	// `scalingAdapter` is set on this component, this field is managed by
+	// the DynamoGraphDeploymentScalingAdapter and should not be modified
+	// directly.
+	// +kubebuilder:validation:Minimum=0
+	// +optional
+	Replicas *int32 `json:"replicas,omitempty"`
+
+	// minAvailable maps to Grove PodCliqueScalingGroup minAvailable for
+	// components rendered as a scaling group (multi-node, inter-pod GMS, or
+	// `experimental.grove.forceScalingGroup`; see `UsesPCSG`) and to Grove
+	// PodClique minAvailable for all other single-node components.
+	// This field determines 1) the minimum number of replicas guaranteed to be
+	// gang-scheduled, and 2) when violating minAvailable replicas triggers gang
+	// termination.
+	//
+	// Deprecated: use providerOverride.value.spec.minAvailable for a standalone
+	// Grove PodClique, or providerOverride.value.minAvailable for a scaling group.
+	// The effective minimum is immutable after creation; moving the same value
+	// to the new form is supported without changing the update strategy.
+	// Grove uses RollingRecreate unless a strategy annotation explicitly overrides it.
+	// New Grove deployments default the provider-native form to 1. Scale-to-zero
+	// preserves the minimum until replicas becomes positive again.
+	//
+	// For non-Grove deployments, setting this field will result in a validation error.
+	// +kubebuilder:validation:Minimum=1
+	// +optional
+	MinAvailable *int32 `json:"minAvailable,omitempty"`
+
+	// multinode configures worker, prefill, or decode components that span
+	// multiple Pods.
+	// +optional
+	Multinode *MultinodeSpec `json:"multinode,omitempty"`
+
+	// roles expose the named Pod-producing parts inside a compound component.
+	// When set for a multinode component, this list must contain exactly one
+	// leader and one worker role. Admission defaults omitted replicas to 1 for
+	// leader and multinode.nodeCount minus 1 for worker. Omitting the roles list
+	// preserves the implicit multinode role layout.
+	//
+	// LPX components each require an agent role. A DGD may contain independent
+	// LPX components, each serving through its own conductor role or agent
+	// runtime init container, or a draft and target pair in which only the
+	// target serves. Every LPX role requires its own podTemplate.
+	// +optional
+	// +kubebuilder:validation:MaxItems=2
+	// +listType=map
+	// +listMapKey=name
+	Roles []ComponentRoleSpec `json:"roles,omitempty"`
+
+	// sharedMemorySize controls the size of the tmpfs mounted at `/dev/shm`.
+	// `nil` selects the operator default (8Gi), a positive quantity sets a
+	// custom size, and `"0"` disables the shared-memory volume entirely.
+	// Simpler replacement for v1alpha1's `SharedMemorySpec` struct with its
+	// `disabled bool` + `size Quantity` pattern.
+	// +optional
+	SharedMemorySize *resource.Quantity `json:"sharedMemorySize,omitempty"`
+
+	// modelRef references a model served by this component. When specified,
+	// a headless service is created for endpoint discovery.
+	// +optional
+	ModelRef *ModelReference `json:"modelRef,omitempty"`
+
+	// scalingAdapter opts this component into the DynamoGraphDeploymentScalingAdapter.
+	// Setting it (even as an empty object, `scalingAdapter: {}`) creates a DGDSA that owns the
+	// `replicas` field so that external autoscalers (HPA/KEDA/Planner) can drive scaling via the
+	// Scale subresource; omit the field to opt out.
+	// +optional
+	ScalingAdapter *ScalingAdapter `json:"scalingAdapter,omitempty"`
+
+	// eppConfig holds legacy Go-EPP configuration for Endpoint Picker Plugin
+	// components. Only meaningful when `type` is `epp`.
+	//
+	// Deprecated: omit this field for the native Rust EPP. Presence of
+	// `eppConfig` selects the legacy Go EPP Pod contract (CLI flags + config
+	// mount) so existing DGDs keep running across operator upgrades until
+	// migration is started by clearing this field.
+	// +optional
+	EPPConfig *EPPConfig `json:"eppConfig,omitempty"`
+
+	// lpx holds LPX integration configuration. Only meaningful when
+	// `type` is `lpx`.
+	//
+	// Experimental: requires the operator's lpx.enabled setting and may change incompatibly.
+	// +optional
+	LPX *LPXConfig `json:"lpx,omitempty"`
+
+	// frontendSidecar optionally designates a container in each selected PodTemplate
+	// as the frontend sidecar. The value must match the `name` of a container in the
+	// component-level podTemplate, or in every role podTemplate when those are used.
+	// The operator merges its
+	// frontend-sidecar defaults (auto-generated Dynamo env vars, ports,
+	// health probes) into that container the same way it merges into
+	// `podTemplate.spec.containers[name=main]`.
+	// The full container definition (image, args, envFrom, env) lives in
+	// `podTemplate` -- this eliminates the redundant `image`, `args`,
+	// `envFromSecret`, and `envs` fields from v1alpha1's `FrontendSidecarSpec`.
+	// The validation webhook rejects values that do not match the selected templates.
+	// +optional
+	FrontendSidecar *string `json:"frontendSidecar,omitempty"`
+
+	// compilationCache configures a PVC-backed compilation cache. The operator
+	// handles backend-specific mount paths and environment variables, so
+	// users do not need to hand-wire them into `podTemplate`. Extracted from
+	// v1alpha1's `volumeMount.useAsCompilationCache` flag.
+	// +optional
+	CompilationCache *CompilationCacheConfig `json:"compilationCache,omitempty"`
+
+	// topologyConstraint applies to this component.
+	// `topologyConstraint.packDomain` is required. When both this and
+	// `spec.topologyConstraint.packDomain` are set, this field's `packDomain`
+	// must be narrower than or equal to the spec-level value.
+	// +optional
+	TopologyConstraint *TopologyConstraint `json:"topologyConstraint,omitempty"`
+
+	// experimental groups opt-in preview features whose API shape and
+	// behavior may change in breaking ways between v1beta1 releases,
+	// including disappearing without a name-preserving graduation path.
+	// In v1beta1 this block holds `gpuMemoryService` and `failover` (which remain
+	// tightly coupled -- failover requires GMS -- and
+	// are expected to evolve together as the DRA-based GPU sharing story
+	// matures); and `checkpoint` (whose API shape is still settling). Fields here are
+	// explicitly NOT covered by the normal v1beta1 deprecation policy; do not
+	// depend on them for production workloads.
+	// +optional
+	Experimental *ExperimentalSpec `json:"experimental,omitempty"`
+}
+
+// DynamoComponentDeploymentStatus defines the observed state of a DynamoComponentDeployment.
+//
+// Unchanged from v1alpha1 except that v1alpha1's unused `podSelector` field is
+// removed. `podSelector` was never written or read by the operator controller.
+type DynamoComponentDeploymentStatus struct {
+	// observedGeneration is the most recent generation observed by the controller.
+	// +optional
+	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+
+	// conditions captures the latest observed state of the component using
+	// standard Kubernetes condition types (including `Available` and
+	// `DynamoComponentReady`).
+	// +optional
+	// +listType=map
+	// +listMapKey=type
+	Conditions []metav1.Condition `json:"conditions,omitempty"`
+
+	// component contains replica status information for this component.
+	// +optional
+	Component *ComponentReplicaStatus `json:"component,omitempty"`
+}
+
+// +genclient
+// +kubebuilder:object:root=true
+// +kubebuilder:subresource:status
+// +kubebuilder:storageversion
+// +kubebuilder:resource:shortName=dcd
+// +kubebuilder:printcolumn:name="Available",type="string",JSONPath=".status.conditions[?(@.type=='Available')].status",description="Available"
+// +kubebuilder:printcolumn:name="Backend",type="string",JSONPath=`.spec.backendFramework`,description="Backend framework (sglang, vllm, trtllm)"
+// +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
+
+// DynamoComponentDeployment is the Schema for the dynamocomponentdeployments API.
+//
+// v1beta1 is the storage version. The API server transparently converts
+// to and from the served v1alpha1 version through
+// operator's conversion webhook; see api/v1alpha1/*_conversion.go.
+type DynamoComponentDeployment struct {
+	metav1.TypeMeta `json:",inline"`
+	// +optional
+	metav1.ObjectMeta `json:"metadata,omitempty"`
+
+	// spec defines the desired state for this Dynamo component deployment.
+	// +optional
+	Spec DynamoComponentDeploymentSpec `json:"spec,omitempty"`
+	// status reflects the current observed state of the component deployment.
+	// +optional
+	Status DynamoComponentDeploymentStatus `json:"status,omitempty"`
+}
+
+// +kubebuilder:object:root=true
+
+// DynamoComponentDeploymentList contains a list of DynamoComponentDeployment.
+type DynamoComponentDeploymentList struct {
+	metav1.TypeMeta `json:",inline"`
+	metav1.ListMeta `json:"metadata,omitempty"`
+	Items           []DynamoComponentDeployment `json:"items"`
+}
+
+// IsReady returns true if the component has processed its latest spec and is `Available`.
+func (s *DynamoComponentDeployment) IsReady() (bool, string) {
+	if s.Status.ObservedGeneration < s.Generation {
+		return false, fmt.Sprintf("spec not yet processed: generation=%d, observedGeneration=%d", s.Generation, s.Status.ObservedGeneration)
+	}
+	return s.Status.IsReady()
+}
+
+// IsReady reports whether the component status signals `Available=True`.
+func (s *DynamoComponentDeploymentStatus) IsReady() (bool, string) {
+	for _, condition := range s.Conditions {
+		if condition.Type == DynamoComponentDeploymentConditionTypeAvailable && condition.Status == metav1.ConditionTrue {
+			return true, ""
+		}
+	}
+	return false, "Component deployment not ready - Available condition not true"
+}
+
+// IsMultinode reports whether the component is configured with more than one node.
+func (s *DynamoComponentDeployment) IsMultinode() bool {
+	return s.GetNumberOfNodes() > 1
+}
+
+// GetNumberOfNodes returns the configured node count, defaulting to 1.
+func (s *DynamoComponentDeployment) GetNumberOfNodes() int32 {
+	return s.Spec.GetNumberOfNodes()
+}
+
+// IsMultinode reports whether this shared spec is configured with more than one node.
+func (s *DynamoComponentDeploymentSharedSpec) IsMultinode() bool {
+	return s.GetNumberOfNodes() > 1
+}
+
+// GetNumberOfNodes returns the configured node count, defaulting to 1.
+func (s *DynamoComponentDeploymentSharedSpec) GetNumberOfNodes() int32 {
+	if s.Multinode != nil {
+		return s.Multinode.NodeCount
+	}
+	return 1
+}
+
+// IsInterPodGMSEnabled reports whether the inter-pod GMS layout is requested.
+func (s *DynamoComponentDeploymentSharedSpec) IsInterPodGMSEnabled() bool {
+	return s.Experimental != nil &&
+		s.Experimental.GPUMemoryService != nil &&
+		s.Experimental.GPUMemoryService.Mode == GMSModeInterPod
+}
+
+// IsGroveScalingGroupForced reports whether the ScalingGroup layout is explicitly requested.
+func (s *DynamoComponentDeploymentSharedSpec) IsGroveScalingGroupForced() bool {
+	return s.Experimental != nil &&
+		s.Experimental.Grove != nil &&
+		ptr.Deref(s.Experimental.Grove.ForceScalingGroup, false)
+}
+
+// UsesPCSG reports whether Grove renders this component as a
+// PodCliqueScalingGroup rather than a standalone PodClique.
+func (s *DynamoComponentDeploymentSharedSpec) UsesPCSG() bool {
+	return s.GetNumberOfNodes() > 1 || s.IsInterPodGMSEnabled() || s.IsGroveScalingGroupForced()
+}
+
+// IsInterPodFailoverEnabled reports whether inter-pod GMS failover is configured.
+func (s *DynamoComponentDeploymentSharedSpec) IsInterPodFailoverEnabled() bool {
+	return s.Experimental != nil &&
+		s.Experimental.Failover != nil &&
+		s.Experimental.Failover.Mode == GMSModeInterPod
+}
+
+// GetNumShadows returns the configured number of inter-pod failover shadow engines.
+func (s *DynamoComponentDeploymentSharedSpec) GetNumShadows() int32 {
+	if !s.IsInterPodFailoverEnabled() {
+		return 0
+	}
+	if s.Experimental.Failover.NumShadows < 1 {
+		return 1
+	}
+	return s.Experimental.Failover.NumShadows
+}
+
+// GetTotalEnginePods returns the primary engine plus any configured shadows.
+func (s *DynamoComponentDeploymentSharedSpec) GetTotalEnginePods() int32 {
+	return s.GetNumShadows() + 1
+}
+
+// IsFrontendComponent reports whether this DCD is the Dynamo frontend component.
+func (s *DynamoComponentDeployment) IsFrontendComponent() bool {
+	return s.Spec.ComponentType == ComponentTypeFrontend
+}
+
+// GetParentGraphDeploymentName returns the name of the owning DynamoGraphDeployment,
+// or "" if this DCD is standalone.
+func (s *DynamoComponentDeployment) GetParentGraphDeploymentName() string {
+	for _, ownerRef := range s.ObjectMeta.OwnerReferences {
+		if ownerRef.Kind == "DynamoGraphDeployment" {
+			return ownerRef.Name
+		}
+	}
+	return ""
+}
+
+// GetParentGraphDeploymentNamespace returns the namespace of the owning DGD,
+// which is always the DCD's own namespace.
+func (s *DynamoComponentDeployment) GetParentGraphDeploymentNamespace() string {
+	return s.GetNamespace()
+}
+
+// GetDynamoNamespace returns the Dynamo namespace for this component.
+func (s *DynamoComponentDeployment) GetDynamoNamespace() string {
+	return ComputeDynamoNamespace(s.Spec.GlobalDynamoNamespace, s.GetNamespace(), s.GetParentGraphDeploymentName())
+}
+
+// ComputeDynamoNamespace is the single source of truth for derived Dynamo namespaces.
+// It returns the global namespace when requested; otherwise it combines the
+// Kubernetes namespace and DGD name, replacing dots with hyphens
+// for endpoint path parsing. Values over the Kubernetes label limit are shortened
+// with a 16-character SHA-256 suffix derived from the original namespace/name pair.
+// Inputs must be valid Kubernetes namespace and DGD names.
+func ComputeDynamoNamespace(globalDynamoNamespace bool, k8sNamespace, dgdName string) string {
+	// Preserve the explicit global namespace independently of resource names.
+	if globalDynamoNamespace {
+		return commonconsts.GlobalDynamoNamespace
+	}
+
+	// Preserve existing runtime identities that already fit in a Kubernetes label.
+	namespace := k8sNamespace + "-" + strings.ReplaceAll(dgdName, ".", "-")
+	if len(namespace) <= validation.LabelValueMaxLength {
+		return namespace
+	}
+
+	// Hash the original pair so truncation and dot normalization do not merge identities.
+	sum := sha256.Sum256([]byte(k8sNamespace + "/" + dgdName))
+	suffix := hex.EncodeToString(sum[:8])
+	prefix := strings.TrimRight(namespace[:validation.LabelValueMaxLength-len(suffix)-1], "-")
+	return prefix + "-" + suffix
+}
+
+// GetSpec returns the spec as an interface, used by generic resource helpers.
+func (s *DynamoComponentDeployment) GetSpec() any {
+	return s.Spec
+}
+
+// SetSpec assigns the spec from an interface value.
+func (s *DynamoComponentDeployment) SetSpec(spec any) {
+	s.Spec = spec.(DynamoComponentDeploymentSpec)
+}
+
+// GetComponentStatuses returns per-component replica status. In the standalone
+// DCD case the map contains a single entry keyed by the DCD's own name,
+// mirroring the DGD behaviour and letting generic callers treat both the same
+// way.
+func (s *DynamoComponentDeployment) GetComponentStatuses() map[string]ComponentReplicaStatus {
+	if s.Status.Component == nil {
+		return map[string]ComponentReplicaStatus{}
+	}
+	componentName := s.Spec.ComponentName
+	if componentName == "" {
+		componentName = s.GetName()
+	}
+	return map[string]ComponentReplicaStatus{componentName: *s.Status.Component}
+}
+
+// GetState returns "ready" or "not_ready" based on status conditions.
+func (s *DynamoComponentDeployment) GetState() string {
+	ready, _ := s.IsReady()
+	if ready {
+		return commonconsts.ResourceStateReady
+	}
+	return commonconsts.ResourceStateNotReady
+}

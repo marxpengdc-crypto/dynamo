@@ -1,0 +1,553 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""
+Test Execution Times (Last Run: 2025-12-09):
+- test_request_cancellation_sglang_aggregated: ~46s (gpu_1)
+- test_request_cancellation_sglang_decode_cancel: ~60s (gpu_2, estimate)
+- Total: 46.06s (0:00:46) for aggregated test only
+"""
+
+import logging
+import os
+import shutil
+import time
+
+import pytest
+
+from tests.fault_tolerance.cancellation.utils import (
+    DynamoFrontendProcess,
+    poll_for_pattern,
+    read_log_content,
+    read_streaming_responses,
+    send_cancellable_request,
+    send_completion_request,
+    verify_frontend_cancellation_metrics,
+    verify_runtime_cancellation_metrics,
+)
+from tests.utils.constants import FAULT_TOLERANCE_MODEL_NAME, DynamoPortRange
+from tests.utils.managed_process import ManagedProcess, check_health_ready
+from tests.utils.payloads import check_health_generate, check_models_api
+from tests.utils.port_utils import allocate_port, deallocate_port
+
+FOLLOWUP_TIMEOUT_S = 30.0
+PREFILL_CANCELLATION_MAX_TOKENS = 1
+DECODE_HANDOFF_CANCELLATION_MAX_TOKENS = 256
+
+
+logger = logging.getLogger(__name__)
+
+pytestmark = [
+    pytest.mark.fault_tolerance,
+    pytest.mark.sglang,
+    pytest.mark.e2e,
+    pytest.mark.model(FAULT_TOLERANCE_MODEL_NAME),
+    pytest.mark.parametrize("request_plane", ["nats", "tcp"], indirect=True),
+]
+
+
+class DynamoWorkerProcess(ManagedProcess):
+    """Process manager for Dynamo worker with SGLang backend"""
+
+    def __init__(
+        self,
+        request,
+        system_port: int,
+        frontend_port: int,
+        mode: str = "agg",
+        serialize_requests: bool = False,
+    ):
+        """
+        Initialize SGLang worker process.
+
+        Args:
+            request: pytest request object
+            system_port: Port for system metrics server
+            frontend_port: Port where frontend is running
+            mode: One of "agg", "prefill", "decode"
+            serialize_requests: Disable CUDA graphs and run one request at a time for
+                cancellation timing tests.
+        """
+        command = [
+            "python3",
+            "-m",
+            "dynamo.sglang",
+            "--model-path",
+            FAULT_TOLERANCE_MODEL_NAME,
+            "--served-model-name",
+            FAULT_TOLERANCE_MODEL_NAME,
+            "--page-size",
+            "16",
+            "--tp",
+            "1",
+            "--trust-remote-code",
+        ]
+        if serialize_requests:
+            command.extend(["--disable-cuda-graph", "--max-running-requests", "1"])
+
+        # Add mode-specific arguments
+        if mode == "agg":
+            # Aggregated mode - add skip-tokenizer-init like the serve test
+            command.append("--skip-tokenizer-init")
+        else:
+            # Disaggregated mode - add disaggregation arguments like disagg.sh
+            command.extend(
+                [
+                    "--disaggregation-mode",
+                    mode,
+                    "--disaggregation-bootstrap-port",
+                    "12345",  # TODO: use dynamic port allocation
+                    "--host",
+                    "0.0.0.0",
+                    "--disaggregation-transfer-backend",
+                    "nixl",
+                ]
+            )
+
+        # Configure health check based on worker type
+        if mode in ["prefill", "decode"]:
+            # Prefill and decode workers check their own status endpoint
+            health_check_urls = [
+                (f"http://localhost:{system_port}/health", check_health_ready)
+            ]
+        else:
+            # Aggregated workers check both system status and frontend
+            health_check_urls = [
+                (f"http://localhost:{system_port}/health", check_health_ready),
+                (f"http://localhost:{frontend_port}/v1/models", check_models_api),
+                (
+                    f"http://localhost:{frontend_port}/health?instances=true",
+                    check_health_generate,
+                ),
+            ]
+
+        # Set environment variables
+        env = os.environ.copy()
+        env["DYN_REQUEST_PLANE"] = request.getfixturevalue("request_plane")
+
+        env["DYN_LOG"] = "debug"
+        # Disable canary health check - these tests expect full control over requests
+        # sent to the workers where canary health check intermittently sends dummy
+        # requests to workers interfering with the test process which may cause
+        # intermittent failures
+        env["DYN_HEALTH_CHECK_ENABLED"] = "false"
+        env["DYN_SYSTEM_USE_ENDPOINT_HEALTH_STATUS"] = '["generate"]'
+        env["DYN_SYSTEM_PORT"] = str(system_port)
+        env["DYN_HTTP_PORT"] = str(frontend_port)
+        # Forward-pass metrics: SGLang publishes FPM over a per-worker ipc://
+        # path, so the env var only enables the feature (the value is never
+        # bound). Allocate one per worker for cleanup symmetry with system_port.
+        self.fpm_port = allocate_port(DynamoPortRange.FPM.value)
+        request.addfinalizer(lambda port=self.fpm_port: deallocate_port(port))
+        env["DYN_FORWARDPASS_METRIC_PORT"] = str(self.fpm_port)
+
+        # Set GPU assignment for disaggregated mode (like disagg.sh)
+        if mode == "decode":
+            env["CUDA_VISIBLE_DEVICES"] = "1"  # Use GPU 1 for decode worker
+        elif mode == "prefill":
+            env["CUDA_VISIBLE_DEVICES"] = "0"  # Use GPU 0 for prefill worker
+        # For agg (aggregated) mode, use default GPU assignment
+
+        # Set log directory based on worker type
+        log_dir = f"{request.node.name}_{mode}_worker"
+
+        # Clean up any existing log directory from previous runs
+        try:
+            shutil.rmtree(log_dir)
+            logger.info(f"Cleaned up existing log directory: {log_dir}")
+        except FileNotFoundError:
+            # Directory doesn't exist, which is fine
+            pass
+
+        super().__init__(
+            command=command,
+            env=env,
+            health_check_urls=health_check_urls,
+            timeout=300,
+            display_output=True,
+            terminate_all_matching_process_names=False,
+            # Ensure any orphaned SGLang engine cores or child helpers are cleaned up
+            stragglers=[
+                "SGLANG:EngineCore",
+            ],
+            straggler_commands=[
+                "-m dynamo.sglang",
+            ],
+            log_dir=log_dir,
+        )
+
+        self.mode = mode
+        self.system_port = system_port
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Release allocated port when worker exits."""
+        try:
+            # system_port is a required parameter, always set in __init__
+            deallocate_port(self.system_port)
+            deallocate_port(self.fpm_port)
+        except Exception as e:
+            logging.warning(f"Failed to release SGLang worker port: {e}")
+
+        return super().__exit__(exc_type, exc_val, exc_tb)
+
+
+@pytest.mark.timeout(160)  # 3x average
+@pytest.mark.gpu_1
+@pytest.mark.skip(reason="DYN-2265")
+@pytest.mark.nightly
+def test_request_cancellation_sglang_aggregated(
+    request, runtime_services_dynamic_ports, predownload_models
+):
+    """
+    End-to-end test for request cancellation functionality in aggregated mode.
+
+    This test verifies that when a request is cancelled by the client,
+    the system properly handles the cancellation and cleans up resources
+    on the worker side in aggregated (agg) mode.
+
+    Tests 3 cancellation scenarios:
+    1. Completion request
+    2. Chat completion request
+    3. Chat completion request (streaming)
+
+    Timing (Last Run: 2025-12-09): ~46s total
+    - Engine initialization: ~14s
+    - Testing 3 scenarios: ~30s (~10s each)
+    - Teardown: ~2s
+
+    TODO: Test is currently flaky/failing due to SGLang limitations with prefill cancellation.
+    See: https://github.com/sgl-project/sglang/issues/11139
+    """
+    logger.info("Sanity check if latest test is getting executed")
+
+    # Allocate ports to avoid conflicts with parallel tests
+    system_port = allocate_port(DynamoPortRange.SERVE.value)
+    request.addfinalizer(lambda port=system_port: deallocate_port(port))
+
+    # Step 1: Start the frontend (allocates its own port)
+    with DynamoFrontendProcess(request) as frontend:
+        logger.info("Frontend started successfully")
+
+        # Step 2: Start an aggregated worker
+        with DynamoWorkerProcess(
+            request,
+            system_port=system_port,
+            frontend_port=frontend.frontend_port,
+            mode="agg",
+        ) as worker:
+            logger.info(f"Aggregated Worker PID: {worker.get_pid()}")
+            # TODO: Why wait after worker ready fixes frontend 404 / 500 flakiness?
+            time.sleep(2)
+
+            # Step 3: Test request cancellation with polling approach
+            frontend_log_offset, worker_log_offset = 0, 0
+
+            test_scenarios = [
+                ("completion", "Completion request cancellation"),
+                ("chat_completion", "Chat completion request cancellation"),
+                (
+                    "chat_completion_stream",
+                    "Chat completion stream request cancellation",
+                ),
+            ]
+
+            for idx, (request_type, description) in enumerate(test_scenarios):
+                logger.info(f"Testing {description.lower()}...")
+
+                # Send the request (non-blocking)
+                cancellable_req = send_cancellable_request(
+                    frontend.frontend_port, request_type
+                )
+
+                # Poll for "New Request ID" pattern (Dynamo context ID)
+                request_id, worker_log_offset = poll_for_pattern(
+                    process=worker,
+                    pattern="New Request ID: ",
+                    log_offset=worker_log_offset,
+                    match_type="contains",
+                )
+
+                # For streaming, read one response first to trigger SGLang ID logging
+                if request_type == "chat_completion_stream":
+                    read_streaming_responses(cancellable_req, expected_count=1)
+
+                # Wait for SGLang to actually start processing (get SGLang request ID)
+                _, worker_log_offset = poll_for_pattern(
+                    process=worker,
+                    pattern="New SGLang Request ID: ",
+                    log_offset=worker_log_offset,
+                    match_type="contains",
+                )
+
+                # Now we know SGLang has the request, cancel it
+                cancellable_req.cancel()
+                logger.info(f"Cancelled request ID: {request_id}")
+
+                # Poll for "Aborted Request ID" with matching ID
+                _, worker_log_offset = poll_for_pattern(
+                    process=worker,
+                    pattern=f"Aborted Request ID: {request_id}",
+                    log_offset=worker_log_offset,
+                    max_wait_ms=2000,
+                )
+
+                # Verify frontend log has kill message
+                _, frontend_log_offset = poll_for_pattern(
+                    process=frontend,
+                    pattern="issued control message control_msg=Kill",
+                    log_offset=frontend_log_offset,
+                )
+
+                logger.info(f"{description} detected successfully")
+
+                # Verify cancellation metrics after each scenario
+                verify_frontend_cancellation_metrics(
+                    frontend_port=frontend.frontend_port,
+                    request_type=request_type,
+                    expected_count=1,
+                )
+                verify_runtime_cancellation_metrics(
+                    worker_system_port=worker.system_port,
+                    expected_count=idx + 1,
+                )
+
+
+@pytest.mark.timeout(300)  # 3x average
+@pytest.mark.gpu_2
+@pytest.mark.pre_merge
+def test_request_cancellation_sglang_decode_cancel(
+    request, runtime_services_dynamic_ports, predownload_models
+):
+    """
+    End-to-end test for request cancellation during decode phase.
+
+    This test verifies that when a request is cancelled by the client during the decode phase,
+    the system properly handles the cancellation and cleans up resources
+    on both the prefill and decode workers in a disaggregated setup.
+
+    Note: This test requires 2 GPUs to run decode and prefill workers on separate GPUs.
+
+    Timing (Last Run: 2025-12-09): ~60s total (estimated)
+    - Engine initialization: ~20s (decode + prefill workers)
+    - Testing stream cancellation during decode: ~38s
+    - Teardown: ~2s
+    """
+
+    # Allocate ports to avoid conflicts with parallel tests
+    decode_system_port = allocate_port(DynamoPortRange.SERVE.value)
+    request.addfinalizer(lambda port=decode_system_port: deallocate_port(port))
+    prefill_system_port = allocate_port(DynamoPortRange.SERVE.value)
+    request.addfinalizer(lambda port=prefill_system_port: deallocate_port(port))
+
+    # Step 1: Start the frontend (allocates its own port)
+    with DynamoFrontendProcess(request) as frontend:
+        logger.info("Frontend started successfully")
+
+        # Step 2: Start the decode worker
+        with DynamoWorkerProcess(
+            request,
+            system_port=decode_system_port,
+            frontend_port=frontend.frontend_port,
+            mode="decode",
+        ) as decode_worker:
+            logger.info(f"Decode Worker PID: {decode_worker.get_pid()}")
+
+            # Step 3: Start the prefill worker
+            with DynamoWorkerProcess(
+                request,
+                system_port=prefill_system_port,
+                frontend_port=frontend.frontend_port,
+                mode="prefill",
+            ) as prefill_worker:
+                logger.info(f"Prefill Worker PID: {prefill_worker.get_pid()}")
+
+                # TODO: Why wait after worker ready fixes frontend 404 / 500 flakiness?
+                time.sleep(2)
+
+                # Step 4: Test request cancellation during decode phase
+                logger.info(
+                    "Testing chat completion stream request cancellation during decode phase..."
+                )
+
+                # Send streaming request (non-blocking)
+                cancellable_req = send_cancellable_request(
+                    frontend.frontend_port, "chat_completion_stream"
+                )
+
+                # Each poll below waits on another process's log line reaching the
+                # file through stderr; 500 ms, the helper's default, is too short.
+
+                # Poll for "New Request ID" pattern in decode worker (Dynamo context ID)
+                request_id, decode_log_offset = poll_for_pattern(
+                    process=decode_worker,
+                    pattern="New Request ID: ",
+                    match_type="contains",
+                    max_wait_ms=10000,
+                )
+
+                # Verify same request ID reached prefill worker
+                _, prefill_log_offset = poll_for_pattern(
+                    process=prefill_worker,
+                    pattern=f"New Request ID: {request_id}",
+                    max_wait_ms=10000,
+                )
+
+                # Read one response first to trigger SGLang ID logging in decode worker
+                read_streaming_responses(cancellable_req, expected_count=1)
+
+                # Wait for SGLang to start processing in decode worker
+                _, decode_log_offset = poll_for_pattern(
+                    process=decode_worker,
+                    pattern="New SGLang Request ID: ",
+                    log_offset=decode_log_offset,
+                    match_type="contains",
+                    max_wait_ms=10000,
+                )
+
+                # Now we know SGLang has the request in decode worker, cancel it
+                cancellable_req.cancel()
+                logger.info(f"Cancelled request ID: {request_id}")
+
+                # The budget covers the whole cancellation chain: socket close,
+                # frontend Kill, request plane, monitor wake-up.
+                _, decode_log_offset = poll_for_pattern(
+                    process=decode_worker,
+                    pattern=f"Aborted Request ID: {request_id}",
+                    log_offset=decode_log_offset,
+                    max_wait_ms=5000,
+                )
+
+                # Verify frontend log has kill message
+                _, frontend_log_offset = poll_for_pattern(
+                    process=frontend,
+                    pattern="issued control message control_msg=Kill",
+                    max_wait_ms=5000,
+                )
+
+                logger.info(
+                    "Chat completion stream cancellation in decode phase detected successfully"
+                )
+
+                # Verify cancellation metrics
+                verify_frontend_cancellation_metrics(
+                    frontend_port=frontend.frontend_port,
+                    request_type="chat_completion_stream",
+                    expected_count=1,
+                )
+                verify_runtime_cancellation_metrics(
+                    worker_system_port=decode_worker.system_port,
+                    expected_count=1,
+                )
+                # Prefill may finish draining before or receive this cancellation.
+                verify_runtime_cancellation_metrics(
+                    worker_system_port=prefill_worker.system_port,
+                    expected_count=(0, 1),
+                    component="prefill",
+                )
+
+
+@pytest.mark.timeout(900)
+@pytest.mark.gpu_2
+@pytest.mark.pre_merge
+@pytest.mark.parametrize("cancel_phase", ["prefill_received", "decode_handoff"])
+def test_request_cancellation_sglang_prefill_cancel(
+    request, runtime_services_dynamic_ports, predownload_models, cancel_phase
+):
+    decode_system_port = allocate_port(DynamoPortRange.SERVE.value)
+    request.addfinalizer(lambda port=decode_system_port: deallocate_port(port))
+    prefill_system_port = allocate_port(DynamoPortRange.SERVE.value)
+    request.addfinalizer(lambda port=prefill_system_port: deallocate_port(port))
+
+    with DynamoFrontendProcess(request) as frontend:
+        with DynamoWorkerProcess(
+            request,
+            system_port=decode_system_port,
+            frontend_port=frontend.frontend_port,
+            mode="decode",
+            serialize_requests=True,
+        ) as decode_worker:
+            with DynamoWorkerProcess(
+                request,
+                system_port=prefill_system_port,
+                frontend_port=frontend.frontend_port,
+                mode="prefill",
+                serialize_requests=True,
+            ) as prefill_worker:
+                time.sleep(2)
+                decode_log_offset = len(read_log_content(decode_worker.log_path))
+                max_tokens = (
+                    PREFILL_CANCELLATION_MAX_TOKENS
+                    if cancel_phase == "prefill_received"
+                    else DECODE_HANDOFF_CANCELLATION_MAX_TOKENS
+                )
+                cancellable_req = send_cancellable_request(
+                    frontend.frontend_port,
+                    "completion",
+                    use_long_prompt=True,
+                    max_tokens=max_tokens,
+                )
+                request_id, prefill_log_offset = poll_for_pattern(
+                    process=prefill_worker,
+                    pattern="New Request ID: ",
+                    match_type="contains",
+                    max_wait_ms=10000,
+                    poll_interval_ms=50,
+                    cancellable_request=cancellable_req,
+                )
+
+                if cancel_phase == "decode_handoff":
+                    poll_for_pattern(
+                        process=decode_worker,
+                        pattern="Using bootstrap_info:",
+                        log_offset=decode_log_offset,
+                        match_type="contains",
+                        max_wait_ms=15000,
+                        poll_interval_ms=50,
+                        cancellable_request=cancellable_req,
+                    )
+
+                cancellable_req.cancel()
+                poll_for_pattern(
+                    process=prefill_worker,
+                    pattern=f"Aborted Request ID: {request_id}",
+                    log_offset=prefill_log_offset,
+                    max_wait_ms=15000,
+                    poll_interval_ms=50,
+                )
+                poll_for_pattern(
+                    process=decode_worker,
+                    pattern=f"Aborted Request ID: {request_id}",
+                    max_wait_ms=15000,
+                    poll_interval_ms=50,
+                )
+
+                followup = send_completion_request(
+                    prompt="hello",
+                    max_tokens=4,
+                    frontend_port=frontend.frontend_port,
+                    timeout_s=FOLLOWUP_TIMEOUT_S,
+                )
+                followup.wait(FOLLOWUP_TIMEOUT_S)
+                response = followup.get_response()
+                assert response.status_code == 200, (
+                    "Request after prefill cancellation failed "
+                    f"with HTTP {response.status_code}; the prefill/decode "
+                    "pair appears wedged."
+                )
+
+                verify_frontend_cancellation_metrics(
+                    frontend_port=frontend.frontend_port,
+                    request_type="completion",
+                    expected_count=1,
+                )
+                verify_runtime_cancellation_metrics(
+                    worker_system_port=prefill_worker.system_port,
+                    expected_count=1,
+                    component="prefill",
+                    max_wait_ms=15000,
+                )
+                verify_runtime_cancellation_metrics(
+                    worker_system_port=decode_worker.system_port,
+                    expected_count=1,
+                    max_wait_ms=15000,
+                )

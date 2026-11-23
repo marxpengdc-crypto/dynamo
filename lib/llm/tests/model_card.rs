@@ -1,0 +1,615 @@
+// SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+use dynamo_llm::common::checked_file::CheckedFile;
+use dynamo_llm::local_model::runtime_config::TokenizerBackend;
+use dynamo_llm::model_card::{ModelDeploymentCard, PromptFormatterArtifact, TokenizerKind};
+use dynamo_llm::tokenizers::{
+    BasetenTokenizer, EncodeSegment, HuggingFaceTokenizer, TikTokenTokenizer, traits::Encoder,
+};
+use std::path::PathBuf;
+use tempfile::{TempDir, tempdir};
+use tokenizers::models::bpe::{BPE, Vocab};
+
+#[path = "common/mistral_model.rs"]
+mod mistral_model;
+
+const HF_PATH: &str = "tests/data/sample-models/TinyLlama_v1.1";
+const TIKTOKEN_PATH: &str = "tests/data/sample-models/mock-tiktoken";
+const MISTRAL_TEKKEN_PATH: &str = "tests/data/sample-models/mock-mistral-tekken";
+
+fn unsupported_alternate_tokenizer() -> (TempDir, PathBuf) {
+    let dir = tempdir().unwrap();
+    let tokenizer_path = dir.path().join("tokenizer.json");
+    std::fs::write(
+        &tokenizer_path,
+        r#"{
+            "version": "1.0",
+            "truncation": null,
+            "padding": null,
+            "added_tokens": [],
+            "normalizer": null,
+            "pre_tokenizer": {"type": "Whitespace"},
+            "post_processor": null,
+            "decoder": null,
+            "model": {
+                "type": "WordLevel",
+                "vocab": {"[UNK]": 0, "hello": 1},
+                "unk_token": "[UNK]"
+            }
+        }"#,
+    )
+    .unwrap();
+    (dir, tokenizer_path)
+}
+
+#[tokio::test]
+async fn test_model_info_from_hf_like_local_repo() {
+    let mdc = ModelDeploymentCard::load_from_disk(HF_PATH, None).unwrap();
+    let info = mdc.model_info.as_ref().unwrap().get_model_info().unwrap();
+    assert_eq!(info.model_type(), "llama");
+    assert_eq!(info.bos_token_id(), Some(1));
+    assert_eq!(info.eos_token_ids(), vec![2]);
+    assert_eq!(info.max_position_embeddings(), Some(2048));
+    assert_eq!(info.vocab_size(), Some(32000));
+    assert_eq!(mdc.architectural_max_context_length, Some(2048));
+    assert_eq!(mdc.runtime_config.context_length, None);
+    assert_eq!(mdc.effective_context_length(), 2048);
+}
+
+#[tokio::test]
+async fn test_model_info_from_non_existent_local_repo() {
+    let path = "tests/data/sample-models/this-model-does-not-exist";
+    let result = ModelDeploymentCard::load_from_disk(path, None);
+    assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn test_tokenizer_from_hf_like_local_repo() {
+    let mdc = ModelDeploymentCard::load_from_disk(HF_PATH, None).unwrap();
+    // Verify tokenizer file was found
+    match mdc.tokenizer.unwrap() {
+        TokenizerKind::HfTokenizerJson(_) => (),
+        other => panic!("Expected HfTokenizerJson, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_unsupported_tekken_version_keeps_the_python_path() {
+    let dir = tempdir().unwrap();
+    let mut tekken: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(format!("{MISTRAL_TEKKEN_PATH}/tekken.json")).unwrap(),
+    )
+    .unwrap();
+    tekken["config"]["version"] = "v11".into();
+    std::fs::write(dir.path().join("tekken.json"), tekken.to_string()).unwrap();
+    std::fs::copy(
+        format!("{MISTRAL_TEKKEN_PATH}/params.json"),
+        dir.path().join("params.json"),
+    )
+    .unwrap();
+
+    let mdc = ModelDeploymentCard::load_from_disk(dir.path(), None).unwrap();
+    assert!(mdc.tokenizer.is_none());
+}
+
+#[test]
+fn test_mistral_native_checkpoint_serves_on_the_rust_frontend() {
+    let mdc = ModelDeploymentCard::load_from_disk(MISTRAL_TEKKEN_PATH, None).unwrap();
+    assert!(matches!(mdc.tokenizer, Some(TokenizerKind::TekkenJson(_))));
+    assert!(
+        mdc.model_info.is_none(),
+        "no config.json to describe the model"
+    );
+    assert_eq!(mdc.architectural_max_context_length, Some(32768));
+
+    let info = mdc.resolved_model_info().unwrap().unwrap();
+    assert_eq!(info.bos_token_id(), Some(1));
+    assert_eq!(info.eos_token_ids(), vec![2]);
+    assert_eq!(info.vocab_size(), Some(1040));
+
+    let tokenizer = mdc.tokenizer().unwrap();
+    let ids = tokenizer
+        .encode_segments(&[
+            EncodeSegment::control("<s>"),
+            EncodeSegment::control("[INST]"),
+            EncodeSegment::ordinary("hi [INST]"),
+        ])
+        .unwrap();
+    assert_eq!(&ids.token_ids()[..2], &[1, 3]);
+    assert_eq!(ids.token_ids().iter().filter(|&&id| id == 3).count(), 1);
+
+    let dynamo_renderer::PromptFormatter::OAI(formatter) =
+        dynamo_llm::preprocessor::prompt::prompt_formatter_from_mdc(&mdc).unwrap();
+    assert!(formatter.renders_continuation_natively());
+    let mut request: dynamo_llm::protocols::openai::chat_completions::NvCreateChatCompletionRequest =
+        serde_json::from_value(serde_json::json!({
+            "model": "mistral",
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": "high"
+        }))
+        .unwrap();
+    // The HTTP boundary folds the top-level field into the template args.
+    request.normalize_reasoning_template_args().unwrap();
+    assert_eq!(
+        formatter.render(&request).unwrap(),
+        r#"<s>[MODEL_SETTINGS]{"reasoning_effort": "high"}[/MODEL_SETTINGS][INST]hi[/INST]"#
+    );
+}
+
+#[test]
+fn native_selection_preserves_dual_format_metadata() {
+    for version in ["v13", "v15"] {
+        for with_hf_config in [false, true] {
+            let dir = mistral_model::model_dir(with_hf_config, version, &["low", "medium", "high"]);
+            let card = ModelDeploymentCard::load_from_disk(dir.path(), None).unwrap();
+            assert!(matches!(
+                card.tokenizer,
+                Some(TokenizerKind::TekkenJson(_) | TokenizerKind::TekkenJsonWithHfFallback { .. })
+            ));
+            let ids = card
+                .tokenizer()
+                .unwrap()
+                .encode_segments(&[
+                    EncodeSegment::control("<s>"),
+                    EncodeSegment::control("[INST]"),
+                    EncodeSegment::ordinary("hi [INST]"),
+                ])
+                .unwrap();
+            assert_eq!(&ids.token_ids()[..2], &[1, 3]);
+            assert_eq!(ids.token_ids().iter().filter(|&&id| id == 3).count(), 1);
+            let dynamo_renderer::PromptFormatter::OAI(formatter) =
+                dynamo_llm::preprocessor::prompt::prompt_formatter_from_mdc(&card).unwrap();
+            let request = serde_json::from_value::<
+                dynamo_llm::protocols::openai::chat_completions::NvCreateChatCompletionRequest,
+            >(
+                serde_json::json!({"model":"test", "messages":[{"role":"user","content":"hi"}]}),
+            )
+            .unwrap();
+            let prompt = formatter.render(&request).unwrap();
+            assert!(prompt.starts_with("<s>"));
+            assert!(prompt.ends_with("[INST]hi[/INST]"));
+            assert!(!prompt.contains("BUNDLED HF DEFAULT"));
+            if version == "v15" {
+                assert!(prompt.contains(r#""reasoning_effort": "high""#));
+            }
+            let wire = serde_json::to_value(&card).unwrap();
+            let roundtrip: ModelDeploymentCard = serde_json::from_value(wire.clone()).unwrap();
+            assert_eq!(roundtrip.mdcsum(), card.mdcsum());
+            if with_hf_config {
+                assert!(wire["tokenizer"]["tekken_json_with_hf_fallback"].is_object());
+                assert_eq!(card.architectural_max_context_length, Some(65536));
+                assert_eq!(
+                    card.resolved_model_info().unwrap().unwrap().model_type(),
+                    "mistral_large4"
+                );
+                assert!(card.gen_config.is_some());
+            } else {
+                assert!(wire["tokenizer"]["tekken_json"].is_object());
+                assert_eq!(card.architectural_max_context_length, Some(32768));
+            }
+        }
+    }
+}
+
+#[test]
+fn explicit_templates_and_unavailable_native_tokenizers_keep_hf_selection() {
+    for version in ["v11", "v15"] {
+        let dir = mistral_model::model_dir(true, version, &["low", "high"]);
+        let custom = dir.path().join("explicit.jinja");
+        std::fs::write(&custom, "EXPLICIT TEMPLATE").unwrap();
+        let card = ModelDeploymentCard::load_from_disk(dir.path(), Some(&custom)).unwrap();
+        assert!(matches!(
+            card.tokenizer,
+            Some(TokenizerKind::HfTokenizerJson(_))
+        ));
+        assert!(card.chat_template_file.as_ref().unwrap().is_custom());
+        if version == "v11" {
+            let card = ModelDeploymentCard::load_from_disk(dir.path(), None).unwrap();
+            assert!(matches!(
+                card.tokenizer,
+                Some(TokenizerKind::HfTokenizerJson(_))
+            ));
+        }
+        std::fs::remove_file(dir.path().join("tekken.json")).unwrap();
+        let card = ModelDeploymentCard::load_from_disk(dir.path(), None).unwrap();
+        assert!(matches!(
+            card.tokenizer,
+            Some(TokenizerKind::HfTokenizerJson(_))
+        ));
+    }
+    let dir = mistral_model::model_dir(false, "v15", &["low", "high"]);
+    let custom = dir.path().join("explicit.jinja");
+    std::fs::write(&custom, "EXPLICIT TEMPLATE").unwrap();
+    assert!(
+        ModelDeploymentCard::load_from_disk(dir.path(), Some(&custom))
+            .unwrap_err()
+            .to_string()
+            .contains("Custom chat templates require")
+    );
+}
+
+#[test]
+fn dual_cards_keep_hf_fallback_changes_in_admission_and_cache_identity() {
+    let dir = mistral_model::model_dir(true, "v15", &["low", "high"]);
+    let first = ModelDeploymentCard::load_from_disk(dir.path(), None).unwrap();
+    let first_checksum = first.mdcsum().to_string();
+    let path = dir.path().join("tokenizer.json");
+    let mut hf: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    hf["normalizer"] = serde_json::json!({"type":"Lowercase"});
+    std::fs::write(&path, serde_json::to_vec(&hf).unwrap()).unwrap();
+    let second = ModelDeploymentCard::load_from_disk(dir.path(), None).unwrap();
+    assert_eq!(
+        first.tokenizer.as_ref().unwrap().checksum(),
+        second.tokenizer.as_ref().unwrap().checksum()
+    );
+    assert_ne!(first_checksum, second.mdcsum());
+    assert_ne!(first.local_dir(), second.local_dir());
+    let read: ModelDeploymentCard =
+        serde_json::from_value(serde_json::to_value(&second).unwrap()).unwrap();
+    assert_eq!(read.mdcsum(), second.mdcsum());
+}
+
+#[tokio::test]
+async fn dual_tokenizer_metadata_urls_download_and_relocate_both_artifacts() {
+    let dir = mistral_model::model_dir(true, "v15", &["low", "high"]);
+    let mut card = ModelDeploymentCard::load_from_disk(dir.path(), None).unwrap();
+    let checksum = card.mdcsum().to_string();
+    card.move_to_url(url::Url::from_directory_path(dir.path()).unwrap().as_str())
+        .unwrap();
+    let wire = serde_json::to_value(&card).unwrap();
+    let tokenizer = &wire["tokenizer"]["tekken_json_with_hf_fallback"];
+    assert!(tokenizer["tekken"]["path"].is_string());
+    assert!(tokenizer["hf"]["path"].is_string());
+    card.download_config(None).await.unwrap();
+    assert_eq!(card.mdcsum(), checksum);
+    assert!(card.tokenizer.as_ref().unwrap().is_local());
+    let filenames: Vec<_> = card
+        .iter_metadata_files()
+        .iter()
+        .filter_map(|(file, _)| file.path().and_then(|path| path.file_name()))
+        .map(|name| name.to_string_lossy().into_owned())
+        .collect();
+    assert!(filenames.iter().any(|name| name == "tekken.json"));
+    assert!(filenames.iter().any(|name| name == "tokenizer.json"));
+}
+
+#[test]
+#[serial_test::serial]
+fn test_basetenkenizer_model_card_matches_hf_and_uses_prefix_cache() {
+    temp_env::with_vars(
+        [
+            ("DYN_TOKENIZER_CACHE", Some("1")),
+            ("DYN_TOKENIZER_CACHE_EXTEND", Some("1")),
+        ],
+        || {
+            let model = "model-card-basetenkenizer-cache-integration";
+            let dir = tempdir().unwrap();
+            let tokenizer_path = dir.path().join("tokenizer.json");
+            let vocab = Vocab::from_iter(
+                [
+                    "<unk>", " ", "!", ",", "H", "T", "d", "e", "h", "l", "o", "r", "w", "He",
+                    "ll", "llo", "or", "ld",
+                ]
+                .into_iter()
+                .enumerate()
+                .map(|(id, token)| (token.to_string(), id as u32)),
+            );
+            let merges = [("H", "e"), ("l", "l"), ("ll", "o"), ("o", "r"), ("l", "d")]
+                .into_iter()
+                .map(|(left, right)| (left.to_string(), right.to_string()))
+                .collect();
+            let bpe = BPE::builder()
+                .vocab_and_merges(vocab, merges)
+                .unk_token("<unk>".to_string())
+                .build()
+                .unwrap();
+            tokenizers::Tokenizer::new(bpe)
+                .save(&tokenizer_path, false)
+                .unwrap();
+            std::fs::write(
+                dir.path().join("tokenizer_config.json"),
+                r#"{
+                    "added_tokens_decoder": {
+                        "18": {
+                            "content": "<special>",
+                            "single_word": false,
+                            "lstrip": false,
+                            "rstrip": false,
+                            "normalized": false,
+                            "special": true
+                        }
+                    }
+                }"#,
+            )
+            .unwrap();
+
+            let mut mdc = ModelDeploymentCard::with_name_only(model);
+            mdc.tokenizer = Some(TokenizerKind::HfTokenizerJson(
+                CheckedFile::from_disk(&tokenizer_path).unwrap(),
+            ));
+            mdc.runtime_config.tokenizer_backend = Some(TokenizerBackend::Basetenkenizer);
+
+            let production = mdc.tokenizer().unwrap();
+            let direct = HuggingFaceTokenizer::from_file(tokenizer_path.to_str().unwrap()).unwrap();
+
+            let cached_tokens =
+                dynamo_runtime::metrics::frontend_perf::TOKENIZER_CACHE_CACHED_TOKENS_TOTAL
+                    .with_label_values(&[model]);
+            let uncached_tokens =
+                dynamo_runtime::metrics::frontend_perf::TOKENIZER_CACHE_UNCACHED_TOKENS_TOTAL
+                    .with_label_values(&[model]);
+            let cached_before = cached_tokens.get();
+            let uncached_before = uncached_tokens.get();
+
+            let prompts = ["<special>Hello, world!", "<special>The world"];
+            let mut returned_tokens = 0_u64;
+            for prompt in prompts {
+                let actual = production.encode(prompt).unwrap().token_ids().to_vec();
+                let expected = direct.encode(prompt).unwrap().token_ids().to_vec();
+                assert_eq!(
+                    actual.first(),
+                    Some(&18),
+                    "the sibling-only special token must retain its configured token ID"
+                );
+                assert_eq!(
+                    actual, expected,
+                    "Baseten and HuggingFace paths must remain token-exact"
+                );
+                returned_tokens += actual.len() as u64;
+            }
+
+            let cached_delta = cached_tokens.get() - cached_before;
+            let uncached_delta = uncached_tokens.get() - uncached_before;
+            assert!(
+                cached_delta > 0,
+                "the second request should reuse the shared special-token prefix"
+            );
+            assert_eq!(
+                cached_delta + uncached_delta,
+                returned_tokens,
+                "cache token accounting must cover every returned token"
+            );
+            assert_eq!(
+                production.decode(&[18], false).unwrap().as_str(),
+                "<special>",
+                "the sibling-only special token must remain decodable"
+            );
+
+            production
+                .encode_segments(&[EncodeSegment::new("Hello, world!", false)])
+                .expect("selected Baseten backend must preserve segmented encoding support");
+        },
+    );
+}
+
+#[test]
+#[serial_test::serial]
+fn test_basetenkenizer_load_failure_falls_back_to_hf() {
+    temp_env::with_vars(
+        [
+            ("DYN_TOKENIZER_CACHE", Some("0")),
+            ("DYN_TOKENIZER_FALLBACK", None),
+        ],
+        || {
+            let (_dir, tokenizer_path) = unsupported_alternate_tokenizer();
+
+            assert!(
+                BasetenTokenizer::from_file(tokenizer_path.to_str().unwrap()).is_err(),
+                "fixture must remain unsupported by the Baseten BPE backend"
+            );
+
+            let mut mdc = ModelDeploymentCard::with_name_only("baseten-fallback");
+            mdc.tokenizer = Some(TokenizerKind::HfTokenizerJson(
+                CheckedFile::from_disk(&tokenizer_path).unwrap(),
+            ));
+            mdc.runtime_config.tokenizer_backend = Some(TokenizerBackend::Basetenkenizer);
+
+            let tokenizer = mdc
+                .tokenizer()
+                .expect("unsupported Baseten tokenizer must fall back to HuggingFace");
+            assert_eq!(
+                tokenizer.encode("hello").unwrap().token_ids(),
+                &[1],
+                "fallback must remain usable"
+            );
+        },
+    );
+}
+
+#[test]
+#[serial_test::serial]
+fn test_alternate_tokenizer_load_failure_is_rejected_when_fallback_is_disabled() {
+    temp_env::with_vars(
+        [
+            ("DYN_TOKENIZER_CACHE", Some("0")),
+            ("DYN_TOKENIZER_FALLBACK", Some("1")),
+        ],
+        || {
+            for backend in [
+                TokenizerBackend::Fastokens,
+                TokenizerBackend::Basetenkenizer,
+            ] {
+                let (_dir, tokenizer_path) = unsupported_alternate_tokenizer();
+                let mut mdc = ModelDeploymentCard::with_name_only("strict-tokenizer");
+                mdc.tokenizer = Some(TokenizerKind::HfTokenizerJson(
+                    CheckedFile::from_disk(&tokenizer_path).unwrap(),
+                ));
+                mdc.runtime_config.tokenizer_backend = Some(backend);
+                mdc.runtime_config.tokenizer_fallback_enabled = Some(false);
+
+                let error = mdc
+                    .tokenizer()
+                    .err()
+                    .expect("unsupported alternate tokenizer must fail without fallback")
+                    .to_string();
+                assert!(error.contains(backend.as_str()));
+                assert!(error.contains("fallback is disabled"));
+            }
+        },
+    );
+}
+
+#[test]
+#[serial_test::serial]
+fn test_hf_model_card_disables_serialized_padding_and_truncation() {
+    temp_env::with_vars([("DYN_TOKENIZER_CACHE", Some("0"))], || {
+        let dir = tempdir().unwrap();
+        let tokenizer_path = dir.path().join("tokenizer.json");
+        std::fs::write(
+            &tokenizer_path,
+            r#"{
+                "version": "1.0",
+                "truncation": {
+                    "direction": "Right",
+                    "max_length": 2,
+                    "strategy": "LongestFirst",
+                    "stride": 0
+                },
+                "padding": {
+                    "strategy": {"Fixed": 8},
+                    "direction": "Right",
+                    "pad_to_multiple_of": null,
+                    "pad_id": 0,
+                    "pad_type_id": 0,
+                    "pad_token": "[UNK]"
+                },
+                "added_tokens": [],
+                "normalizer": null,
+                "pre_tokenizer": {"type": "Whitespace"},
+                "post_processor": null,
+                "decoder": null,
+                "model": {
+                    "type": "WordLevel",
+                    "vocab": {"[UNK]": 0, "hello": 1, "world": 2, "again": 3},
+                    "unk_token": "[UNK]"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let raw = HuggingFaceTokenizer::from_file(tokenizer_path.to_str().unwrap()).unwrap();
+        assert_eq!(
+            raw.encode("hello world again").unwrap().token_ids(),
+            &[1, 2, 0, 0, 0, 0, 0, 0],
+            "fixture must exercise serialized truncation and padding"
+        );
+
+        let mut mdc = ModelDeploymentCard::with_name_only("hf-online-normalization");
+        mdc.tokenizer = Some(TokenizerKind::HfTokenizerJson(
+            CheckedFile::from_disk(&tokenizer_path).unwrap(),
+        ));
+
+        let tokenizer = mdc.tokenizer().unwrap();
+        assert_eq!(
+            tokenizer.encode("hello world again").unwrap().token_ids(),
+            &[1, 2, 3],
+            "online tokenization must not apply serialized padding or truncation"
+        );
+    });
+}
+
+#[test]
+#[serial_test::serial]
+fn test_tiktoken_model_card_cache_matches_direct_tokenizer_and_records_tokens() {
+    let model = "model-card-tiktoken-cache-integration";
+    let mut mdc = ModelDeploymentCard::load_from_disk(TIKTOKEN_PATH, None).unwrap();
+    mdc.set_name(model);
+
+    let production = mdc.tokenizer().unwrap();
+    let direct =
+        TikTokenTokenizer::from_file_auto(&format!("{TIKTOKEN_PATH}/tiktoken.model")).unwrap();
+
+    let cached_tokens = dynamo_runtime::metrics::frontend_perf::TOKENIZER_CACHE_CACHED_TOKENS_TOTAL
+        .with_label_values(&[model]);
+    let uncached_tokens =
+        dynamo_runtime::metrics::frontend_perf::TOKENIZER_CACHE_UNCACHED_TOKENS_TOTAL
+            .with_label_values(&[model]);
+    let cached_before = cached_tokens.get();
+    let uncached_before = uncached_tokens.get();
+
+    let prompts = [
+        "<|im_start|>system\nYou are concise.<|im_end|><|im_start|>user\nExplain prefix caching.<|im_end|>",
+        "<|im_start|>system\nYou are concise.<|im_end|><|im_start|>user\nNow include Unicode: 北京 😀.<|im_end|>",
+    ];
+    let mut returned_tokens = 0_u64;
+    for prompt in prompts {
+        let actual = production.encode(prompt).unwrap().token_ids().to_vec();
+        let expected = direct.encode(prompt).unwrap().token_ids().to_vec();
+        assert_eq!(
+            actual, expected,
+            "cached production path must remain token-exact"
+        );
+        returned_tokens += actual.len() as u64;
+    }
+
+    let cached_delta = cached_tokens.get() - cached_before;
+    let uncached_delta = uncached_tokens.get() - uncached_before;
+    assert!(
+        cached_delta > 0,
+        "the second request should reuse the shared chat prefix"
+    );
+    assert_eq!(
+        cached_delta + uncached_delta,
+        returned_tokens,
+        "cache token accounting must cover every returned token"
+    );
+}
+
+#[tokio::test]
+async fn test_prompt_formatter_from_hf_like_local_repo() {
+    let mdc = ModelDeploymentCard::load_from_disk(HF_PATH, None).unwrap();
+    // Verify prompt formatter was found
+    match mdc.prompt_formatter {
+        Some(PromptFormatterArtifact::HfTokenizerConfigJson(_)) => (),
+        _ => panic!("Expected HfTokenizerConfigJson prompt formatter"),
+    }
+}
+
+#[tokio::test]
+async fn test_missing_required_files() {
+    // Create empty temp directory
+    let temp_dir = tempdir().unwrap();
+    let result = ModelDeploymentCard::load_from_disk(temp_dir.path(), None);
+    assert!(result.is_err());
+    let err = result.unwrap_err().to_string();
+    // Should fail because config.json is missing
+    assert!(err.contains("unable to extract"));
+}
+
+/// Models without tokenizer.json (e.g. Qwen3-Omni which ships vocab.json + merges.txt)
+/// should load successfully with tokenizer set to None. The frontend must use a
+/// non-Rust chat processor for these models (e.g. --dyn-chat-processor vllm).
+#[tokio::test]
+async fn test_model_loads_without_tokenizer_json() {
+    let path = "tests/data/sample-models/mock-no-tokenizer-json";
+    let mdc = ModelDeploymentCard::load_from_disk(path, None).unwrap();
+    assert!(
+        mdc.tokenizer.is_none(),
+        "Expected tokenizer to be None for model without tokenizer.json"
+    );
+    assert!(!mdc.has_tokenizer(), "has_tokenizer() should be false");
+    // Model info should still be loaded
+    assert!(mdc.model_info.is_some());
+}
+
+/// chat_template.json should be picked up as a fallback when chat_template.jinja
+/// does not exist (e.g. Qwen3-Omni). The fixture's tokenizer_config.json has no
+/// inline chat_template, so this is the only template source.
+#[tokio::test]
+async fn test_chat_template_json_fallback() {
+    let path = "tests/data/sample-models/mock-no-tokenizer-json";
+    let mdc = ModelDeploymentCard::load_from_disk(path, None).unwrap();
+    match &mdc.chat_template_file {
+        Some(PromptFormatterArtifact::HfChatTemplateJson { file, is_custom }) => {
+            assert!(!is_custom, "Should not be marked as custom template");
+            let p = file.path().expect("Should be a local path");
+            assert!(
+                p.ends_with("chat_template.json"),
+                "Expected chat_template.json, got {:?}",
+                p
+            );
+        }
+        other => panic!("Expected HfChatTemplateJson, got {:?}", other),
+    }
+}

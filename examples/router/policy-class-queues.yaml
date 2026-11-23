@@ -1,0 +1,35 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Requests select a class by name with the x-dynamo-meta-policy-class header.
+# A missing name uses default_policy_class; an unknown name fails the request.
+# While both queues are backlogged, the 800:200 quanta split uncached-token
+# scheduling credit 80/20.
+# Within a class, the default edf queue_policy dispatches the earliest due time
+# first: router ingress plus slo_ttft_ms, unless a request classifier sets a
+# deadline. Equal budgets keep arrival order. With controlled_delay, priority
+# also rejects a request still waiting when its due time passes; standard's
+# budget only orders it. An explicit deadline expires in every class.
+default_policy_class: standard
+policy_classes:
+  - name: priority
+    quantum: 800
+    slo_ttft_ms: 1000
+    controlled_delay: true
+    prefill_busy_threshold_frac: 1.0
+    request_queue_limit_per_worker: 256
+  - name: standard
+    quantum: 200
+    slo_ttft_ms: 3000
+    prefill_busy_threshold_frac: 1.0
+    request_queue_limit_per_worker: 1024
+
+models:
+  # A model profile replaces the root profile. Its only class is the default.
+  example/large-model:
+    policy_classes:
+      - name: standard
+        quantum: 1000
+        slo_ttft_ms: 3000
+        prefill_busy_threshold_frac: 1.0
+        request_queue_limit_per_worker: 1024

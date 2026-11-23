@@ -1,0 +1,1522 @@
+#  SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+#  SPDX-License-Identifier: Apache-2.0
+
+#
+# Use SGLang for input and output processing
+#
+
+import asyncio
+import json
+import logging
+import math
+import os
+import time
+from collections.abc import AsyncGenerator
+from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import wait as _futures_wait
+from dataclasses import dataclass
+from typing import Any, cast
+
+from sglang.srt.parser.conversation import chat_template_exists
+
+try:
+    import fastokens
+except ImportError:  # Optional: only `--tokenizer fastokens` needs it.
+    fastokens = None
+
+from dynamo._internal import ModelDeploymentCard
+from dynamo.common.multimodal.cache_uuid import reject_unsupported_multimodal_uuids
+from dynamo.common.token_budget import TOKEN_BUDGET_RUNTIME_KEY, TokenBudget
+from dynamo.common.utils.input_params import resolve_thinking_token_budget
+from dynamo.frontend.frontend_args import FrontendConfig
+from dynamo.llm import ModelCardInstanceId, PythonAsyncEngine, RoutedEngine
+from dynamo.llm.exceptions import (
+    InvalidArgument,
+    RoutedEngineError,
+    Unknown,
+    WorkerUnavailable,
+)
+
+from .responses_history import responses_tools_request
+from .sglang_prepost import (
+    ReasoningParser,
+    SglangStreamingPostProcessor,
+    ToolCallParserType,
+    _client_wants_separate_reasoning,
+    _effective_reasoning_parser_name,
+    _get_history_tool_calls_count,
+    _guided_output_requires_reasoning,
+    convert_tools,
+    create_parsers,
+    detect_force_reasoning_from_template,
+    preprocess_chat_request,
+    resolve_skip_special_tokens,
+)
+from .sglang_prompt_renderer import PromptRenderer, build_prompt_renderer
+from .structural_tag_policy import runtime_structural_tag_options
+from .thinking import runtime_default_thinking_mode
+from .usage import response_usage, update_usage_metadata
+from .utils import (
+    PreprocessError,
+    PromptLogprobsAccumulator,
+    as_error_envelope,
+    extract_mm_urls,
+    handle_engine_error,
+    make_internal_error,
+    nvext_extra_field_requested,
+    read_jinja_chat_template,
+    request_id_from_context,
+    resolve_chat_template,
+    worker_warmup,
+)
+
+try:
+    from sglang.srt.hf_transformers import get_tokenizer
+except ModuleNotFoundError as exc:
+    if exc.name != "sglang.srt.hf_transformers":
+        raise
+    # SGLang 0.5.11 to 0.5.23 (current CUDA and XPU pins).
+    # Remove once both pins are newer.
+    from sglang.srt.utils.hf_transformers import get_tokenizer
+
+
+logger = logging.getLogger(__name__)
+
+
+def _cached_tokens_from_usage(usage: dict[str, Any] | None) -> int | None:
+    if not isinstance(usage, dict):
+        return None
+    prompt_details = usage.get("prompt_tokens_details")
+    if not isinstance(prompt_details, dict):
+        return None
+    cached_tokens = prompt_details.get("cached_tokens")
+    return cached_tokens if isinstance(cached_tokens, int) else None
+
+
+def _request_logprobs_count(request: dict[str, Any]) -> int | None:
+    """Map OpenAI chat logprob fields onto ``output_options.logprobs``.
+
+    The result is the number of alternatives per token. ``logprobs: true``
+    without ``top_logprobs`` is ``0``: the sampled token only. A positive
+    ``top_logprobs`` requires ``logprobs: true``, as in OpenAI.
+    """
+    logprobs = request.get("logprobs")
+    top_logprobs = request.get("top_logprobs")
+    if top_logprobs is not None and (
+        not isinstance(top_logprobs, int)
+        or isinstance(top_logprobs, bool)
+        or top_logprobs < 0
+    ):
+        raise PreprocessError("`top_logprobs` must be an integer >= 0.")
+    if top_logprobs and logprobs is not True:
+        raise PreprocessError(
+            "When using `top_logprobs`, `logprobs` must be set to true."
+        )
+    if logprobs is True:
+        return top_logprobs if top_logprobs is not None else 0
+    if isinstance(logprobs, int) and not isinstance(logprobs, bool):
+        return logprobs
+    return None
+
+
+def _normalize_eos_token_ids(value: Any) -> list[int]:
+    if isinstance(value, int) and not isinstance(value, bool):
+        return [value]
+    if isinstance(value, (list, tuple, set)):
+        token_ids: list[int] = []
+        seen: set[int] = set()
+        for token_id in value:
+            if isinstance(token_id, int) and not isinstance(token_id, bool):
+                if token_id not in seen:
+                    token_ids.append(token_id)
+                    seen.add(token_id)
+        return token_ids
+    return []
+
+
+_I32_MIN = -(2**31)
+_I32_MAX = 2**31 - 1
+_U32_MAX = 2**32 - 1
+
+
+def _is_i32(value: Any) -> bool:
+    return (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and _I32_MIN <= value <= _I32_MAX
+    )
+
+
+def _is_u32(value: Any) -> bool:
+    return (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and 0 <= value <= _U32_MAX
+    )
+
+
+def _finite_float(value: Any) -> float | None:
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return None
+    try:
+        result = float(value)
+    except OverflowError:
+        return None
+    return result if math.isfinite(result) else None
+
+
+def _routing_from_agent_hints(nvext: dict[str, Any]) -> dict[str, Any] | None:
+    agent_hints = nvext.get("agent_hints")
+    if not isinstance(agent_hints, dict):
+        return None
+
+    routing: dict[str, Any] = {}
+    priority = agent_hints.get("priority")
+    if _is_i32(priority):
+        priority_value = cast(int, priority)
+        routing["priority"] = priority_value
+        routing["priority_jump"] = float(max(priority_value, 0))
+    else:
+        latency_sensitivity = _finite_float(agent_hints.get("latency_sensitivity"))
+        if latency_sensitivity is not None:
+            routing["priority_jump"] = latency_sensitivity
+
+    strict_priority = agent_hints.get("strict_priority")
+    if _is_u32(strict_priority):
+        routing["strict_priority"] = strict_priority
+
+    expected_output_tokens = agent_hints.get("osl")
+    if _is_u32(expected_output_tokens):
+        routing["expected_output_tokens"] = expected_output_tokens
+
+    return routing or None
+
+
+def _request_stop_strings(request: dict[str, Any]) -> set[str]:
+    stop = request.get("stop")
+    if isinstance(stop, str):
+        return {stop}
+    if isinstance(stop, list):
+        return {item for item in stop if isinstance(item, str)}
+    return set()
+
+
+def _request_stop_token_ids(request: dict[str, Any]) -> list[int]:
+    """Merge ``stop_token_ids`` with the legacy integer-valued ``stop`` form."""
+    values: list[Any] = list(request.get("stop_token_ids") or [])
+    stop = request.get("stop")
+    if isinstance(stop, list) and all(
+        isinstance(item, int) and not isinstance(item, bool) for item in stop
+    ):
+        values.extend(stop)
+    return _normalize_eos_token_ids(values)
+
+
+def _tokenizer_eos_token_ids(tokenizer: Any) -> list[int]:
+    eos_token_ids = _normalize_eos_token_ids(getattr(tokenizer, "eos_token_ids", None))
+    if eos_token_ids:
+        return eos_token_ids
+    return _normalize_eos_token_ids(getattr(tokenizer, "eos_token_id", None))
+
+
+def _model_eos_token_ids(tokenizer: Any, source_path: str) -> list[int]:
+    """Merge tokenizer EOS IDs with the model generation configuration.
+
+    SGLang mode detokenizes in the frontend, bypassing both Dynamo's Rust EOS
+    resolution and SGLang's own ``trim_matched_stop``, so the merge is redone here.
+    For most models the tokenizer's EOS is already the real terminal token and this
+    is a no-op. Kimi-K3 splits them: it closes messages with the XTML protocol token
+    163586 ``<|end_of_msg|>``, declared only in generation config, while the
+    tokenizer reports a different token, 163585 ``[EOS]``.
+    Strips the trailing token only; splitting reasoning is ``force_reasoning``'s job.
+    """
+    token_ids = _tokenizer_eos_token_ids(tokenizer)
+    generation_config_path = os.path.join(source_path, "generation_config.json")
+    try:
+        with open(generation_config_path, encoding="utf-8") as config_file:
+            generation_config = json.load(config_file)
+    except FileNotFoundError:
+        return token_ids
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning(
+            "Could not read EOS IDs from %s: %s",
+            generation_config_path,
+            exc,
+        )
+        return token_ids
+
+    configured_ids = _normalize_eos_token_ids(
+        generation_config.get("eos_token_id")
+        if isinstance(generation_config, dict)
+        else None
+    )
+    seen = set(token_ids)
+    token_ids.extend(token_id for token_id in configured_ids if token_id not in seen)
+    return token_ids
+
+
+def _sglang_tokenizer_backend(frontend_backend: str) -> str:
+    """Map the frontend `--tokenizer` value to SGLang's `tokenizer_backend`."""
+    if frontend_backend == "fastokens":
+        return "fastokens"
+    if frontend_backend != "default":
+        logger.warning(
+            "--tokenizer %s has no SGLang chat processor equivalent; using HuggingFace",
+            frontend_backend,
+        )
+    return "huggingface"
+
+
+def _load_tokenizer(
+    source_path: str, trust_remote_code: bool, tokenizer_backend: str = "huggingface"
+):
+    """Load the SGLang tokenizer, falling back to an on-disk chat template
+    (e.g. chat_template.json) when the tokenizer defines none."""
+    if tokenizer_backend == "huggingface":
+        tokenizer = get_tokenizer(source_path, trust_remote_code=trust_remote_code)
+    else:
+        if tokenizer_backend == "fastokens" and fastokens is not None:
+            # Idempotent. SGLang patches only once per process, so re-patch here
+            # in case an earlier model's fallback unpatched transformers.
+            fastokens.patch_transformers()
+        tokenizer = get_tokenizer(
+            source_path,
+            trust_remote_code=trust_remote_code,
+            tokenizer_backend=tokenizer_backend,
+        )
+    if getattr(tokenizer, "chat_template", None) is None:
+        tokenizer.chat_template = resolve_chat_template(source_path, backend="sglang")
+    return tokenizer
+
+
+def _load_tokenizer_with_fallback(
+    source_path: str,
+    trust_remote_code: bool,
+    tokenizer_backend: str,
+    tokenizer_fallback: bool,
+) -> tuple[Any, str]:
+    """Load the tokenizer; return it with the backend actually in use.
+
+    Follows the Rust frontend's `--tokenizer-fallback` contract: when fastokens
+    is missing or cannot load the model's tokenizer, log a warning and use
+    HuggingFace, or raise when fallback is disabled.
+    """
+    try:
+        return (
+            _load_tokenizer(source_path, trust_remote_code, tokenizer_backend),
+            tokenizer_backend,
+        )
+    except (ImportError, RuntimeError) as exc:
+        if tokenizer_backend == "huggingface" or not tokenizer_fallback:
+            raise
+        logger.warning(
+            "Failed to load the %s tokenizer backend, falling back to HuggingFace: %s",
+            tokenizer_backend,
+            exc,
+        )
+    if fastokens is not None:
+        # The failed load left transformers patched process-wide, which would
+        # also break the HuggingFace load.
+        fastokens.unpatch_transformers()
+    return _load_tokenizer(source_path, trust_remote_code), "huggingface"
+
+
+def _runtime_config_parser_name(
+    mdc: ModelDeploymentCard,
+    key: str,
+) -> str | None:
+    runtime_config = mdc.runtime_config()
+    if not isinstance(runtime_config, dict):
+        return None
+    value = runtime_config.get(key)
+    return value if isinstance(value, str) and value else None
+
+
+def _runtime_token_budget(mdc: ModelDeploymentCard) -> TokenBudget | None:
+    runtime_config = mdc.runtime_config()
+    if not isinstance(runtime_config, dict):
+        return None
+    runtime_data = runtime_config.get("runtime_data")
+    if not isinstance(runtime_data, dict):
+        return None
+    value = runtime_data.get(TOKEN_BUDGET_RUNTIME_KEY)
+    if value is None:
+        return None
+
+    if isinstance(value, dict):
+        combined_limit = value.get("combined_limit")
+        reject_prompt = value.get("reject_prompt_overflow", False)
+        reject_total = value.get("reject_total_overflow", False)
+        if (
+            type(combined_limit) is int
+            and 0 <= combined_limit <= _U32_MAX
+            and isinstance(reject_prompt, bool)
+            and isinstance(reject_total, bool)
+        ):
+            return TokenBudget(combined_limit, reject_prompt, reject_total)
+
+    logger.warning("Ignoring invalid %s runtime metadata", TOKEN_BUDGET_RUNTIME_KEY)
+    return None
+
+
+def _validate_requested_token_budget(
+    prompt_len: int, max_tokens: int | None, token_budget: TokenBudget
+) -> None:
+    limit = token_budget.combined_limit
+    if prompt_len >= limit:
+        if token_budget.reject_prompt_overflow:
+            raise InvalidArgument(
+                f"The prompt has {prompt_len} input tokens, leaving no room for "
+                f"generation within the {limit}-token context window. "
+                "Please reduce the input length."
+            )
+        # Backend truncation can change the prompt length.
+        return
+
+    if (
+        token_budget.reject_total_overflow
+        and max_tokens is not None
+        and prompt_len + max_tokens > limit
+    ):
+        raise InvalidArgument(
+            f"This model accepts at most {limit} combined input and output tokens. "
+            f"The request has {prompt_len} input tokens and asks for {max_tokens} "
+            "output tokens. Please reduce the input length or requested output length."
+        )
+
+
+def _guided_json_is_content(preproc: dict[str, Any]) -> bool:
+    return (
+        "json" in (preproc["sampling_options"]["guided_decoding"] or {})
+        and not preproc["require_reasoning"]
+    )
+
+
+def _unsupported_n_message(n: int) -> str:
+    return f"Unsupported value: 'n={n}'. " "This endpoint currently supports only n=1."
+
+
+_FINISH_REASON_MAP: dict[str, str] = {
+    "eos": "stop",
+    "stop": "stop",
+    "length": "length",
+    "error": "error",
+    "abort": "stop",
+    "cancelled": "stop",
+    "content_filter": "stop",
+}
+
+
+def _finish_reason_error_message(
+    raw_reason: str | dict[str, Any] | None,
+) -> str | None:
+    """Extract a backend error before OpenAI finish-reason projection."""
+    if isinstance(raw_reason, dict):
+        error_message = raw_reason.get("error")
+        return error_message if isinstance(error_message, str) else None
+    if isinstance(raw_reason, str) and raw_reason.startswith("error"):
+        _, separator, detail = raw_reason.partition(":")
+        return detail.strip() if separator and detail.strip() else raw_reason
+    return None
+
+
+def _map_finish_reason(raw: str | dict[str, Any] | None) -> str | None:
+    """Map Dynamo router finish reasons to OpenAI finish reasons.
+
+    Exact matches use the dict.  Prefixed variants (``error:timeout``,
+    ``abort:cancelled``) are handled by ``startswith`` fallbacks.
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, str):
+        logger.warning("Malformed finish_reason from router: %r", raw)
+        return None
+    mapped = _FINISH_REASON_MAP.get(raw)
+    if mapped is not None:
+        return mapped
+    if raw.startswith("error"):
+        return "error"
+    if raw.startswith("abort"):
+        return "stop"
+    return raw
+
+
+# ---------------------------------------------------------------------------
+# Worker process globals (initialized once per process by _init_worker)
+# ---------------------------------------------------------------------------
+_w_tokenizer: Any = None
+_w_tool_call_parser_name: str | None = None
+_w_reasoning_parser_name: str | None = None
+_w_exclude_tools_when_tool_choice_none: bool = True
+_w_template_force_reasoning: bool = False
+_w_default_thinking_mode: str | None = None
+_w_structural_tag_mode: str = "off"
+_w_structural_tag_scope: str = "auto"
+_w_structural_tag_schema: str = "auto"
+_w_prompt_renderer: PromptRenderer | None = None
+
+
+def _load_chat_template(chat_template: str | None) -> str | None:
+    """Load a chat template override from a Jinja template file."""
+    if not chat_template:
+        return None
+    if chat_template_exists(chat_template):
+        raise ValueError(
+            "SGLang built-in chat template names are not supported by "
+            "Dynamo's SGLang chat processor; pass a .jinja template file path."
+        )
+    expanded_template = os.path.expanduser(os.path.expandvars(chat_template))
+    if not os.path.exists(expanded_template):
+        raise FileNotFoundError(f"Chat template file not found: {expanded_template}")
+    if not os.path.isfile(expanded_template):
+        raise FileNotFoundError(
+            f"Chat template path is not a file: {expanded_template}"
+        )
+    if not expanded_template.endswith(".jinja"):
+        raise ValueError(
+            "Dynamo's SGLang chat processor supports only .jinja chat template "
+            f"files, got: {expanded_template}"
+        )
+    return read_jinja_chat_template(expanded_template, backend="sglang")
+
+
+@dataclass
+class SglangPreprocessWorkerResult:
+    """Picklable return value from the SGLang preprocess worker."""
+
+    prompt_token_ids: list[int]
+    dynamo_preproc: dict[str, Any]
+    request: dict[str, Any]
+    force_reasoning: bool = False
+    named_zero_arg_tool: str | None = None
+    # Keep the same boundary parser in the pool and inline paths, including
+    # tool requests that display reasoning as content.
+    effective_reasoning_parser_name: str | None = None
+
+
+def _init_worker(
+    model_path: str,
+    tool_call_parser_name: str | None,
+    reasoning_parser_name: str | None,
+    exclude_tools_when_tool_choice_none: bool = True,
+    trust_remote_code: bool = False,
+    template_force_reasoning: bool = False,
+    chat_template: str | None = None,
+    default_thinking_mode: str | None = None,
+    structural_tag_mode: str = "off",
+    structural_tag_scope: str = "auto",
+    structural_tag_schema: str = "auto",
+    isolate_tool_call_markers: bool = False,
+    tokenizer_backend: str = "huggingface",
+    tokenizer_fallback: bool = True,
+) -> None:
+    """Initialize a worker process with its own tokenizer."""
+    global _w_tokenizer, _w_tool_call_parser_name, _w_reasoning_parser_name
+    global _w_exclude_tools_when_tool_choice_none, _w_template_force_reasoning
+    global _w_default_thinking_mode, _w_structural_tag_mode
+    global _w_structural_tag_scope, _w_structural_tag_schema, _w_prompt_renderer
+    _w_tokenizer, _ = _load_tokenizer_with_fallback(
+        model_path, trust_remote_code, tokenizer_backend, tokenizer_fallback
+    )
+    if chat_template is not None:
+        _w_tokenizer.chat_template = chat_template
+    _w_tool_call_parser_name = tool_call_parser_name
+    _w_reasoning_parser_name = reasoning_parser_name
+    _w_exclude_tools_when_tool_choice_none = exclude_tools_when_tool_choice_none
+    _w_template_force_reasoning = template_force_reasoning
+    _w_default_thinking_mode = default_thinking_mode
+    _w_structural_tag_mode = structural_tag_mode
+    _w_structural_tag_scope = structural_tag_scope
+    _w_structural_tag_schema = structural_tag_schema
+    _w_prompt_renderer = build_prompt_renderer(
+        _w_tokenizer,
+        model_path=model_path,
+        chat_template=chat_template,
+        tool_call_parser_name=tool_call_parser_name,
+        reasoning_parser_name=reasoning_parser_name,
+        isolate_tool_call_markers=isolate_tool_call_markers,
+    )
+
+
+def _preprocess_worker(
+    request: dict[str, Any],
+    model_name: str,
+    eos_token_ids: list[int] | None,
+) -> SglangPreprocessWorkerResult:
+    """Preprocess a request in a worker process and return a picklable result."""
+    pre = preprocess_chat_request(
+        request,
+        tokenizer=_w_tokenizer,
+        tool_call_parser_name=_w_tool_call_parser_name,
+        reasoning_parser_name=_w_reasoning_parser_name,
+        exclude_tools_when_tool_choice_none=_w_exclude_tools_when_tool_choice_none,
+        template_force_reasoning=_w_template_force_reasoning,
+        default_thinking_mode=_w_default_thinking_mode,
+        structural_tag_mode=_w_structural_tag_mode,
+        structural_tag_scope=_w_structural_tag_scope,
+        structural_tag_schema=_w_structural_tag_schema,
+        prompt_renderer=_w_prompt_renderer,
+    )
+
+    n = request.get("n", 1)
+    if n != 1:
+        raise PreprocessError(_unsupported_n_message(n))
+
+    dynamo_preproc = _build_dynamo_preproc(
+        request,
+        pre.prompt_token_ids,
+        model_name,
+        eos_token_ids,
+        pre.guided_decoding,
+        pre.tool_call_parser,
+        pre.reasoning_parser,
+        require_reasoning=_guided_output_requires_reasoning(
+            request, pre.force_reasoning, _w_reasoning_parser_name, pre.guided_decoding
+        ),
+        force_reasoning=pre.force_reasoning,
+    )
+
+    effective_reasoning_parser_name = _effective_reasoning_parser_name(
+        request, _w_reasoning_parser_name, pre.force_reasoning
+    )
+
+    return SglangPreprocessWorkerResult(
+        prompt_token_ids=pre.prompt_token_ids,
+        dynamo_preproc=dynamo_preproc,
+        request=request,
+        force_reasoning=pre.force_reasoning,
+        effective_reasoning_parser_name=effective_reasoning_parser_name,
+        named_zero_arg_tool=pre.named_zero_arg_tool,
+    )
+
+
+def _build_dynamo_preproc(
+    request: dict[str, Any],
+    prompt_token_ids: list[int],
+    model_name: str,
+    eos_token_ids: int | list[int] | None,
+    guided_decoding: dict[str, Any] | None = None,
+    tool_call_parser: ToolCallParserType | None = None,
+    reasoning_parser: ReasoningParser | None = None,
+    require_reasoning: bool = False,
+    force_reasoning: bool = False,
+) -> dict[str, Any]:
+    """Build the Dynamo preprocessed request dict from request fields."""
+    thinking_token_budget = resolve_thinking_token_budget(request)
+    require_reasoning = require_reasoning or (
+        thinking_token_budget is not None and force_reasoning
+    )
+    max_tokens = request.get("max_completion_tokens") or request.get("max_tokens")
+
+    stop = request.get("stop")
+    stop_token_ids = _request_stop_token_ids(request)
+    if isinstance(stop, str):
+        stop = [stop]
+    elif isinstance(stop, list) and all(
+        isinstance(item, int) and not isinstance(item, bool) for item in stop
+    ):
+        stop = []
+    elif stop is None:
+        stop = []
+
+    nvext = request.get("nvext") or {}
+    routing = request.get("routing")
+    nvext_routing = (
+        _routing_from_agent_hints(nvext) if isinstance(nvext, dict) else None
+    )
+    if isinstance(nvext, dict):
+        # Preserve explicit targets for the router to resolve in the current phase.
+        # Rank zero is a valid target; only absent/null values are omitted.
+        worker_routing = {
+            key: nvext[key]
+            for key in (
+                "backend_instance_id",
+                "decode_worker_id",
+                "prefill_worker_id",
+                "dp_rank",
+                "prefill_dp_rank",
+            )
+            if nvext.get(key) is not None
+        }
+        if worker_routing:
+            nvext_routing = {**(nvext_routing or {}), **worker_routing}
+    if isinstance(routing, dict):
+        if nvext_routing:
+            routing = {**nvext_routing, **routing}
+    else:
+        routing = nvext_routing
+
+    # PreprocessedRequest.logit_bias is HashMap<u32, f32>, so JSON's str keys must
+    # become int; the HTTP layer has already validated the keys and values.
+    logit_bias = request.get("logit_bias")
+    logit_bias = (
+        {int(k): float(v) for k, v in logit_bias.items()} if logit_bias else None
+    )
+
+    preproc = {
+        "model": model_name,
+        "token_ids": prompt_token_ids,
+        "require_reasoning": require_reasoning,
+        "stop_conditions": {
+            "max_tokens": max_tokens,
+            "stop": stop,
+            "stop_token_ids": stop_token_ids,
+            "min_tokens": request.get("min_tokens", 0),
+            "ignore_eos": request.get("ignore_eos", False),
+            "max_thinking_tokens": thinking_token_budget,
+        },
+        "sampling_options": {
+            "n": request.get("n", 1),
+            "presence_penalty": request.get("presence_penalty", 0.0),
+            "frequency_penalty": request.get("frequency_penalty", 0.0),
+            "repetition_penalty": request.get("repetition_penalty", 1.0),
+            "temperature": request.get("temperature", 1.0),
+            "top_p": request.get("top_p", 1.0),
+            # SGLang uses -1 for "disabled", OpenAI/vLLM use 0
+            "top_k": request.get("top_k", 0) or -1,
+            "min_p": request.get("min_p", 0.0),
+            "seed": request.get("seed"),
+            "logit_bias": logit_bias,
+            "guided_decoding": guided_decoding,
+        },
+        "output_options": {
+            "logprobs": _request_logprobs_count(request),
+            "prompt_logprobs": (
+                request.get("prompt_logprobs")
+                if request.get("stream") is not True
+                or nvext_extra_field_requested(request, "prompt_logprobs")
+                else None
+            ),
+            # Preserve special tokens when a parser is active so delimiters
+            # remain visible. Mirrors the post-processor's decode behavior.
+            "skip_special_tokens": resolve_skip_special_tokens(
+                request.get("skip_special_tokens"),
+                has_parser=tool_call_parser is not None or reasoning_parser is not None,
+            ),
+            "return_tokens_as_token_ids": request.get("return_tokens_as_token_ids"),
+        },
+        "eos_token_ids": _normalize_eos_token_ids(eos_token_ids),
+        "annotations": [],
+        "routing": routing,
+    }
+
+    try:
+        # Forward multimodal URLs so the backend handler can load the media.
+        mm_data, mm_uuids = extract_mm_urls(request.get("messages", []))
+        reject_unsupported_multimodal_uuids(mm_uuids)
+    except ValueError as exc:
+        raise PreprocessError(str(exc)) from exc
+    if mm_data:
+        preproc["multi_modal_data"] = mm_data
+
+    nvext_passthrough = {
+        key: nvext[key] for key in ("metadata_upload", "extra_fields") if key in nvext
+    }
+    if nvext_passthrough:
+        preproc["extra_args"] = {"nvext": nvext_passthrough}
+
+    return preproc
+
+
+class SglangProcessor:
+    def __init__(
+        self,
+        tokenizer,
+        routed_engine: RoutedEngine,
+        tool_call_parser_name: str | None,
+        reasoning_parser_name: str | None,
+        eos_token_ids: list[int] | None,
+        debug_perf: bool = False,
+        preprocess_pool: ProcessPoolExecutor | None = None,
+        preprocess_workers: int = 0,
+        stream_interval: int = 1,
+        default_thinking_mode: str | None = None,
+        structural_tag_mode: str = "off",
+        structural_tag_scope: str = "auto",
+        structural_tag_schema: str = "auto",
+        prompt_renderer: PromptRenderer | None = None,
+        token_budget: TokenBudget | None = None,
+    ):
+        self.tokenizer = tokenizer
+        # Detect force_reasoning once from the chat template, matching
+        # sglang's template_manager. Per-request overrides still apply
+        # (see resolve_request_force_reasoning).
+        self.template_force_reasoning = detect_force_reasoning_from_template(
+            getattr(tokenizer, "chat_template", None)
+        )
+        if self.template_force_reasoning:
+            logger.info(
+                "Detected force-reasoning pattern in chat template; "
+                "thinking tokens will route to delta.reasoning_content by "
+                "default (clients can opt out via "
+                "separate_reasoning=false or "
+                "chat_template_kwargs.enable_thinking=false)."
+            )
+        self.routed_engine = routed_engine
+        self.tool_call_parser_name = tool_call_parser_name
+        self.reasoning_parser_name = reasoning_parser_name
+        self.exclude_tools_when_tool_choice_none = True
+        self.eos_token_ids = _normalize_eos_token_ids(eos_token_ids)
+        self.debug_perf = debug_perf
+        self.stream_interval = stream_interval
+        self.default_thinking_mode = default_thinking_mode
+        self.structural_tag_mode = structural_tag_mode
+        self.structural_tag_scope = structural_tag_scope
+        self.structural_tag_schema = structural_tag_schema
+        self.prompt_renderer = prompt_renderer
+        self.token_budget = token_budget
+        self.preprocess_pool = preprocess_pool
+        if preprocess_pool is not None:
+            self._worker_semaphore: asyncio.Semaphore | None = asyncio.Semaphore(
+                preprocess_workers + 2
+            )
+        else:
+            self._worker_semaphore = None
+
+    async def generator(
+        self, request: dict[str, Any], context: Any | None = None
+    ) -> AsyncGenerator[dict[str, Any], None]:
+        """Main entry point: preprocess, route, post-process a chat request."""
+        if request.get("responses_native_tools") and not (
+            self.exclude_tools_when_tool_choice_none
+            and request.get("tool_choice") == "none"
+        ):
+            # Inline and pool postprocessing must use the same tool identities
+            # as the prompt, including when parsers are recreated in the parent.
+            request = responses_tools_request(
+                request,
+                self.tokenizer.get_chat_template(
+                    chat_template=request.get("chat_template"),
+                    tools=request.get("tools"),
+                ),
+            )
+        if self.debug_perf:
+            from .perf_instrumentation import (  # type: ignore[import-not-found, import-untyped]
+                enter_generator,
+                exit_generator,
+            )
+
+            active = enter_generator()
+            t_start = time.monotonic()
+            logger.info("[perf] sglang generator enter: active_requests=%d", active)
+
+        try:
+            if self.preprocess_pool is None:
+                async for item in self._generator_inner(request, context=context):
+                    yield item
+            else:
+                async for item in self._generator_inner_pool(request, context=context):
+                    yield item
+        finally:
+            if self.debug_perf:
+                active = exit_generator()
+                elapsed_ms = (time.monotonic() - t_start) * 1000.0
+                logger.info(
+                    "[perf] sglang generator exit: total=%.2fms active_requests=%d",
+                    elapsed_ms,
+                    active,
+                )
+
+    def _build_postprocessor(
+        self,
+        request: dict[str, Any],
+        dynamo_preproc: dict[str, Any],
+        *,
+        tool_call_parser: ToolCallParserType | None,
+        reasoning_parser: ReasoningParser | None,
+        named_zero_arg_tool: str | None,
+        prompt_token_ids: list[int],
+    ) -> SglangStreamingPostProcessor:
+        """Parsers are passed in because the pool path must recreate them in the
+        main process; they are not picklable.
+        """
+        return SglangStreamingPostProcessor(
+            tokenizer=self.tokenizer,
+            tool_call_parser=tool_call_parser,
+            reasoning_parser=reasoning_parser,
+            history_tool_calls_count=_get_history_tool_calls_count(
+                request.get("messages", [])
+            ),
+            sglang_tools=convert_tools(
+                request.get("chat_template_tools") or request.get("tools")
+            ),
+            tool_call_parser_name=self.tool_call_parser_name,
+            named_zero_arg_tool=named_zero_arg_tool,
+            guided_json_is_content=_guided_json_is_content(dynamo_preproc),
+            separate_reasoning=_client_wants_separate_reasoning(request),
+            eos_token_ids=self.eos_token_ids,
+            prompt_token_ids=prompt_token_ids,
+            stop_strings=_request_stop_strings(request),
+            skip_special_tokens=request.get("skip_special_tokens"),
+            stop_token_ids=set(_request_stop_token_ids(request)),
+        )
+
+    async def _generator_inner(
+        self, request: dict[str, Any], context: Any | None = None
+    ) -> AsyncGenerator[dict[str, Any], None]:
+        """Single-process path: preprocess, dispatch, stream post-process."""
+        request_id = request_id_from_context(context)
+
+        try:
+            if self.debug_perf:
+                t0 = time.monotonic()
+
+            pre = preprocess_chat_request(
+                request,
+                tokenizer=self.tokenizer,
+                tool_call_parser_name=self.tool_call_parser_name,
+                reasoning_parser_name=self.reasoning_parser_name,
+                exclude_tools_when_tool_choice_none=self.exclude_tools_when_tool_choice_none,
+                template_force_reasoning=self.template_force_reasoning,
+                default_thinking_mode=self.default_thinking_mode,
+                structural_tag_mode=self.structural_tag_mode,
+                structural_tag_scope=self.structural_tag_scope,
+                structural_tag_schema=self.structural_tag_schema,
+                prompt_renderer=self.prompt_renderer,
+            )
+
+            if self.debug_perf:
+                t1 = time.monotonic()
+                logger.info(
+                    "[perf] sglang preprocess: %.2fms (request=%s)",
+                    (t1 - t0) * 1000.0,
+                    request_id,
+                )
+
+            tokens = pre.prompt_token_ids
+
+            n = request.get("n", 1)
+            if n != 1:
+                logger.error("Unsupported n=%d, only n=1 is supported", n)
+                raise InvalidArgument(_unsupported_n_message(n))
+
+            dynamo_preproc = _build_dynamo_preproc(
+                request,
+                tokens,
+                request["model"],
+                self.eos_token_ids,
+                pre.guided_decoding,
+                pre.tool_call_parser,
+                pre.reasoning_parser,
+                require_reasoning=_guided_output_requires_reasoning(
+                    request,
+                    pre.force_reasoning,
+                    self.reasoning_parser_name,
+                    pre.guided_decoding,
+                ),
+                force_reasoning=pre.force_reasoning,
+            )
+        except PreprocessError as exc:
+            raise InvalidArgument(str(exc)) from exc
+        except InvalidArgument:
+            raise
+        except Exception as exc:
+            logger.exception("SGLang preprocessing failed for request %s", request_id)
+            raise Unknown(f"Preprocessing error: {exc}") from exc
+
+        post = self._build_postprocessor(
+            request,
+            dynamo_preproc,
+            tool_call_parser=pre.tool_call_parser,
+            reasoning_parser=pre.reasoning_parser,
+            named_zero_arg_tool=pre.named_zero_arg_tool,
+            prompt_token_ids=pre.prompt_token_ids,
+        )
+
+        async for item in self._generate_and_stream(
+            request_id, request, dynamo_preproc, tokens, post, context=context
+        ):
+            yield item
+
+    async def _generator_inner_pool(
+        self, request: dict[str, Any], context: Any | None = None
+    ) -> AsyncGenerator[dict[str, Any], None]:
+        """Pool path: preprocess in worker, stream in main process."""
+        request_id = request_id_from_context(context)
+
+        # --- Phase 1: Preprocess (semaphore held) ---
+        assert self._worker_semaphore is not None
+        assert self.preprocess_pool is not None
+        try:
+            async with self._worker_semaphore:
+                future = self.preprocess_pool.submit(
+                    _preprocess_worker,
+                    request,
+                    request["model"],
+                    self.eos_token_ids,
+                )
+                preproc_result: SglangPreprocessWorkerResult = (
+                    await asyncio.wrap_future(future)
+                )
+        except InvalidArgument:
+            raise
+        except PreprocessError as exc:
+            raise InvalidArgument(str(exc)) from exc
+        except Exception as exc:
+            logger.exception(
+                "SGLang worker preprocessing failed for request %s", request_id
+            )
+            raise Unknown(f"Worker error: {exc}") from exc
+
+        # --- Phase 2: Recreate parsers in main process (not picklable) ---
+        # The worker already decided effective_reasoning_parser_name based on
+        # the request's separate_reasoning flag and computed force_reasoning;
+        # we mirror those choices to keep pool- and inline-path outputs
+        # identical.
+        tool_call_parser, reasoning_parser = create_parsers(
+            request,
+            tool_call_parser_name=self.tool_call_parser_name,
+            reasoning_parser_name=preproc_result.effective_reasoning_parser_name,
+            force_reasoning=preproc_result.force_reasoning,
+            guided_decoding=preproc_result.dynamo_preproc["sampling_options"][
+                "guided_decoding"
+            ],
+            tokenizer=self.tokenizer,
+        )
+
+        post = self._build_postprocessor(
+            request,
+            preproc_result.dynamo_preproc,
+            tool_call_parser=tool_call_parser,
+            reasoning_parser=reasoning_parser,
+            named_zero_arg_tool=preproc_result.named_zero_arg_tool,
+            prompt_token_ids=preproc_result.prompt_token_ids,
+        )
+
+        async for item in self._generate_and_stream(
+            request_id,
+            request,
+            preproc_result.dynamo_preproc,
+            preproc_result.prompt_token_ids,
+            post,
+            context=context,
+        ):
+            yield item
+
+    async def _generate_and_stream(
+        self,
+        request_id: str,
+        request: dict[str, Any],
+        dynamo_preproc: dict[str, Any],
+        tokens: list[int],
+        post: SglangStreamingPostProcessor,
+        context: Any | None = None,
+    ) -> AsyncGenerator[dict[str, Any], None]:
+        """Shared streaming logic for both single-process and pool paths."""
+        # Media expansion is backend-owned on this path, so only text-only
+        # requests have an exact frontend-visible prompt length.
+        if self.token_budget is not None and not dynamo_preproc.get("multi_modal_data"):
+            stop_conditions = dynamo_preproc.get("stop_conditions") or {}
+            _validate_requested_token_budget(
+                len(tokens), stop_conditions.get("max_tokens"), self.token_budget
+            )
+        token_count = 0
+        post_proc_total_ms = 0.0
+        created_ts = int(time.time())
+        stream_interval = self.stream_interval
+        prompt_logprobs = PromptLogprobsAccumulator(request)
+        logprobs_count = _request_logprobs_count(request)
+        include_completion_ids = nvext_extra_field_requested(
+            request, "completion_token_ids"
+        )
+        include_prompt_ids = nvext_extra_field_requested(request, "prompt_token_ids")
+
+        try:
+            dynamo_stream = await self.routed_engine.generate(
+                dynamo_preproc, context=context
+            )
+
+            # Accumulate tokens for batched detokenization when
+            # stream_interval > 1.  Flush every N tokens or on
+            # finish_reason.  Use si=1 for the first chunk to minimize
+            # TTFT, then switch to the configured interval.
+            pending_token_ids: list[int] = []
+            pending_log_probs: list[float] | None = None
+            pending_top_logprobs: list[list[dict[str, Any]]] | None = None
+            # Requested generated IDs wait here while parsing emits no chunk.
+            completion_ids: list[int] = []
+            latest_usage: dict[str, Any] = {}
+            pending_terminal: dict[str, Any] | None = None
+            first_chunk = True
+            input_tokens = len(tokens)
+            cumulative_output_tokens = 0
+            # Rust postprocessor is bypassed on this path, so emit the multimodal
+            # content-part counts here too (else frontend metrics report zero media).
+            _mm_counts, _ = extract_mm_urls(request.get("messages", []))
+            _mm_counts = _mm_counts or {}
+            image_count = len(_mm_counts.get("image_url", []))
+            video_count = len(_mm_counts.get("video_url", []))
+            audio_count = len(_mm_counts.get("audio_url", []))
+
+            def flush_pending(
+                *,
+                finish_reason: str | None,
+                stop_reason: Any | None,
+                stop_terminated: bool,
+                engine_data: Any | None,
+            ) -> dict[str, Any]:
+                nonlocal pending_token_ids
+                nonlocal pending_log_probs
+                nonlocal pending_top_logprobs
+                nonlocal completion_ids
+                nonlocal latest_usage
+                nonlocal first_chunk
+                nonlocal post_proc_total_ms
+                nonlocal token_count
+
+                chunk_token_count = len(pending_token_ids)
+                mapped_response: dict[str, Any] = {
+                    "token_ids": pending_token_ids,
+                    "finish_reason": finish_reason,
+                    "stop_reason": stop_reason,
+                    "stop_terminated": stop_terminated,
+                }
+                if pending_log_probs is not None:
+                    mapped_response["log_probs"] = pending_log_probs
+                if pending_top_logprobs is not None:
+                    mapped_response["top_logprobs"] = pending_top_logprobs
+
+                if self.debug_perf:
+                    t_pp0 = time.monotonic()
+
+                choice = post.process_output(mapped_response)
+                if include_completion_ids:
+                    completion_ids.extend(pending_token_ids)
+                    if post.locally_finished:
+                        # IDs that decoding withheld before the stop are still queued.
+                        dropped = post.post_stop_token_count()
+                        del completion_ids[len(completion_ids) - dropped :]
+
+                if post.locally_finished and not latest_usage:
+                    latest_usage = {
+                        "prompt_tokens": input_tokens,
+                        "completion_tokens": cumulative_output_tokens,
+                        "total_tokens": input_tokens + cumulative_output_tokens,
+                    }
+                usage_for_metrics = latest_usage
+
+                if self.debug_perf:
+                    t_pp1 = time.monotonic()
+                    post_proc_total_ms += (t_pp1 - t_pp0) * 1000.0
+                    token_count += chunk_token_count
+
+                envelope: dict[str, Any] = {"_dynamo_annotated": True}
+                if choice:
+                    dynamo_out: dict[str, Any] = {
+                        "id": f"chatcmpl-{request_id}",
+                        "choices": [choice],
+                        "created": created_ts,
+                        "model": request["model"],
+                        "object": "chat.completion.chunk",
+                    }
+                    if usage := response_usage(
+                        request,
+                        latest_usage,
+                        prompt_tokens=input_tokens,
+                        completion_tokens=cumulative_output_tokens,
+                        finished=bool(finish_reason or post.locally_finished),
+                    ):
+                        dynamo_out["usage"] = usage
+                    response_nvext: dict[str, Any] = {}
+                    effective_stop_reason = (
+                        stop_reason
+                        if stop_reason is not None
+                        else post.local_stop_reason
+                    )
+                    if (
+                        effective_stop_reason is not None
+                        and nvext_extra_field_requested(request, "stop_reason")
+                    ):
+                        response_nvext["stop_reason"] = effective_stop_reason
+                    if engine_data is not None and nvext_extra_field_requested(
+                        request, "engine_data"
+                    ):
+                        response_nvext["engine_data"] = engine_data
+                    if include_completion_ids:
+                        response_nvext["completion_token_ids"] = completion_ids
+                        completion_ids = []
+                    if include_prompt_ids and (finish_reason or post.locally_finished):
+                        response_nvext["prompt_token_ids"] = tokens
+                    if response_nvext:
+                        dynamo_out["nvext"] = response_nvext
+
+                    prompt_logprobs.attach(dynamo_out)
+                    envelope["data"] = dynamo_out
+
+                metrics: dict[str, Any] = {
+                    "input_tokens": input_tokens,
+                    "output_tokens": cumulative_output_tokens,
+                    "chunk_tokens": chunk_token_count,
+                }
+                # Include nonzero counts on every frame (text-only carries nothing).
+                if image_count:
+                    metrics["image_count"] = image_count
+                if video_count:
+                    metrics["video_count"] = video_count
+                if audio_count:
+                    metrics["audio_count"] = audio_count
+                cached_tokens = _cached_tokens_from_usage(usage_for_metrics)
+                if cached_tokens is not None:
+                    metrics["cached_tokens"] = cached_tokens
+                # Attach metrics to data when available; otherwise use an annotation.
+                if data := envelope.get("data"):
+                    data["llm_metrics"] = metrics
+                else:
+                    envelope["event"] = "llm_metrics"
+                    envelope["comment"] = [json.dumps(metrics)]
+
+                pending_token_ids = []
+                pending_log_probs = None
+                pending_top_logprobs = None
+                first_chunk = False
+                return envelope
+
+            def finalize_terminal(terminal: dict[str, Any]) -> dict[str, Any]:
+                data = terminal["data"]
+                if usage := response_usage(
+                    request,
+                    latest_usage,
+                    prompt_tokens=input_tokens,
+                    completion_tokens=cumulative_output_tokens,
+                    finished=True,
+                ):
+                    data["usage"] = usage
+                cached_tokens = _cached_tokens_from_usage(latest_usage)
+                if cached_tokens is not None:
+                    data["llm_metrics"]["cached_tokens"] = cached_tokens
+                prompt_logprobs.attach(data)
+                return terminal
+
+            async for dynamo_response in dynamo_stream:
+                if dynamo_response.is_error():
+                    comments = dynamo_response.comments() or []
+                    message = "; ".join(comments) or "unknown routed_engine error"
+                    logger.error(
+                        "routed_engine error for request %s: %s",
+                        request_id,
+                        message,
+                    )
+                    yield as_error_envelope(make_internal_error(request_id, message))
+                    break
+                engine_response = dynamo_response.data()
+
+                if engine_response is None:
+                    # No data or error fields, means we may have a comment or other kind of event.
+                    # Skip for now.
+                    continue
+
+                if (
+                    not isinstance(engine_response, dict)
+                    or "token_ids" not in engine_response
+                ):
+                    yield as_error_envelope(
+                        handle_engine_error(engine_response, request_id, logger)
+                    )
+                    break
+
+                raw_finish_reason = engine_response.get("finish_reason")
+                # Backend errors (structured or legacy "error: ..." strings)
+                # end the stream before OpenAI finish-reason projection.
+                error_message = _finish_reason_error_message(raw_finish_reason)
+                if error_message is not None:
+                    logger.error(
+                        "Router reported a generation error for request %s: %s",
+                        request_id,
+                        error_message,
+                    )
+                    yield as_error_envelope(
+                        make_internal_error(request_id, error_message)
+                    )
+                    break
+                finish_reason = _map_finish_reason(raw_finish_reason)
+                backend_finished = raw_finish_reason is not None
+                prompt_logprobs.update(engine_response)
+                if usage := engine_response.get("completion_usage"):
+                    update_usage_metadata(latest_usage, usage)
+                if pending_terminal is not None:
+                    if prompt_logprobs.needs_payload and not backend_finished:
+                        continue
+                    yield finalize_terminal(pending_terminal)
+                    break
+
+                new_ids = engine_response["token_ids"]
+                log_probs = (
+                    engine_response.get("log_probs")
+                    if logprobs_count is not None
+                    else None
+                )
+                top_logprobs = (
+                    engine_response.get("top_logprobs") if logprobs_count else None
+                )
+                if top_logprobs is not None:
+                    top_logprobs = [
+                        entries[:logprobs_count] for entries in top_logprobs
+                    ]
+
+                if new_ids and pending_token_ids:
+                    pending_logprob_shape = (
+                        pending_log_probs is not None,
+                        pending_top_logprobs is not None,
+                    )
+                    chunk_logprob_shape = (
+                        log_probs is not None,
+                        top_logprobs is not None,
+                    )
+                    if pending_logprob_shape != chunk_logprob_shape:
+                        envelope = flush_pending(
+                            finish_reason=None,
+                            stop_reason=None,
+                            stop_terminated=False,
+                            engine_data=None,
+                        )
+                        if (
+                            post.locally_finished
+                            and prompt_logprobs.needs_payload
+                            and not backend_finished
+                        ):
+                            pending_terminal = envelope
+                            continue
+                        yield envelope
+                        if post.locally_finished:
+                            break
+
+                chunk_tokens = len(new_ids)
+                cumulative_output_tokens += chunk_tokens
+                stop_reason = engine_response.get("stop_reason")
+                stop_terminated = raw_finish_reason in {"eos", "stop"}
+
+                engine_data = engine_response.get("engine_data")
+
+                pending_token_ids.extend(new_ids)
+                if log_probs is not None:
+                    if pending_log_probs is None:
+                        pending_log_probs = []
+                    pending_log_probs.extend(log_probs)
+                if top_logprobs is not None:
+                    if pending_top_logprobs is None:
+                        pending_top_logprobs = []
+                    pending_top_logprobs.extend(top_logprobs)
+
+                # Flush on finish or when we've accumulated enough tokens.
+                # First chunk flushes immediately (si=1) to minimize TTFT.
+                flush_threshold = (
+                    1 if first_chunk or post.has_pending_stop_text else stream_interval
+                )
+                if finish_reason or len(pending_token_ids) >= flush_threshold:
+                    envelope = flush_pending(
+                        finish_reason=finish_reason,
+                        stop_reason=stop_reason,
+                        stop_terminated=stop_terminated,
+                        engine_data=engine_data,
+                    )
+                    if (
+                        post.locally_finished
+                        and prompt_logprobs.needs_payload
+                        and not backend_finished
+                    ):
+                        # Preserve terminal metadata without emitting post-stop text.
+                        pending_terminal = envelope
+                        continue
+                    yield envelope
+                    if post.locally_finished:
+                        break
+            else:
+                if pending_terminal is not None:
+                    yield finalize_terminal(pending_terminal)
+        except (InvalidArgument, RoutedEngineError, Unknown, WorkerUnavailable):
+            raise
+        except Exception as e:
+            logger.exception("Error generating response for request %s", request_id)
+            raise Unknown(
+                f"Error generating response for request {request_id}: {e}"
+            ) from e
+        finally:
+            if self.debug_perf and token_count > 0:
+                logger.info(
+                    "[perf] sglang stream done: request=%s tokens=%d "
+                    "post_processor_total=%.2fms (%.3fms/tok)",
+                    request_id,
+                    token_count,
+                    post_proc_total_ms,
+                    post_proc_total_ms / token_count,
+                )
+
+
+class SglangEngineFactory:
+    def __init__(
+        self,
+        config: FrontendConfig,
+        debug_perf: bool = False,
+        tool_call_parser_name: str | None = None,
+        reasoning_parser_name: str | None = None,
+        chat_template: str | None = None,
+    ):
+        self.config = config
+        self.debug_perf = debug_perf
+        self.tool_call_parser_name = tool_call_parser_name
+        self.reasoning_parser_name = reasoning_parser_name
+        self.chat_template = chat_template
+
+        self.trust_remote_code = config.trust_remote_code
+        self.tokenizer_backend = _sglang_tokenizer_backend(config.tokenizer_backend)
+        self.tokenizer_fallback = config.tokenizer_fallback
+        self.stream_interval = 20
+        raw_stream_interval = os.getenv("DYN_SGLANG_STREAM_INTERVAL")
+        if raw_stream_interval:
+            try:
+                self.stream_interval = max(1, int(raw_stream_interval))
+            except ValueError:
+                logger.warning(
+                    "Invalid DYN_SGLANG_STREAM_INTERVAL=%r, using default=%d",
+                    raw_stream_interval,
+                    self.stream_interval,
+                )
+
+    async def chat_engine_factory(
+        self,
+        instance_id: ModelCardInstanceId,
+        mdc: ModelDeploymentCard,
+        routed_engine: RoutedEngine,
+    ) -> PythonAsyncEngine:
+        """Called by Rust when a model is discovered."""
+        model_type = mdc.model_type()
+        if not model_type.supports_chat():
+            raise RuntimeError(
+                f"model type {model_type} is not supported by this factory"
+            )
+        loop = asyncio.get_running_loop()
+
+        local_dir = mdc.local_dir()
+        if not os.path.isdir(local_dir):
+            raise RuntimeError(
+                f"MDC local_dir {local_dir!r} not populated for model {mdc.name()!r}; "
+                f"download_config must run before the engine factory."
+            )
+
+        logger.info("Loading SGLang tokenizer from %s", local_dir)
+        tokenizer, tokenizer_backend = _load_tokenizer_with_fallback(
+            local_dir,
+            self.trust_remote_code,
+            self.tokenizer_backend,
+            self.tokenizer_fallback,
+        )
+        logger.info("SGLang tokenizer backend: %s", tokenizer_backend)
+        chat_template = _load_chat_template(self.chat_template)
+        if chat_template is not None:
+            logger.info("Using custom chat template override")
+            tokenizer.chat_template = chat_template
+
+        eos_token_ids = _model_eos_token_ids(tokenizer, local_dir)
+
+        # Static reasoning-template scan (mirrors sglang's template_manager).
+        # Shared with worker-pool processes via initargs so they compute the
+        # same per-request force_reasoning flag as the main process.
+        template_force_reasoning = detect_force_reasoning_from_template(
+            getattr(tokenizer, "chat_template", None)
+        )
+
+        tool_call_parser_name = (
+            self.tool_call_parser_name
+            or _runtime_config_parser_name(mdc, "tool_call_parser")
+        )
+        reasoning_parser_name = (
+            self.reasoning_parser_name
+            or _runtime_config_parser_name(mdc, "reasoning_parser")
+        )
+        default_thinking_mode = runtime_default_thinking_mode(mdc.runtime_config())
+        (
+            structural_tag_mode,
+            structural_tag_scope,
+            structural_tag_schema,
+        ) = runtime_structural_tag_options(mdc.runtime_config())
+
+        if tool_call_parser_name:
+            logger.info("SGLang tool call parser: %s", tool_call_parser_name)
+        if reasoning_parser_name:
+            logger.info("SGLang reasoning parser: %s", reasoning_parser_name)
+        if default_thinking_mode:
+            logger.info("SGLang default thinking mode: %s", default_thinking_mode)
+
+        prompt_renderer = build_prompt_renderer(
+            tokenizer,
+            model_path=local_dir,
+            chat_template=chat_template,
+            tool_call_parser_name=tool_call_parser_name,
+            reasoning_parser_name=reasoning_parser_name,
+            isolate_tool_call_markers=self.config.isolate_tool_call_markers,
+        )
+        preprocess_pool = None
+        preprocess_workers = self.config.preprocess_workers
+        assert preprocess_workers is not None  # Resolved by FrontendConfig.validate().
+        if preprocess_workers > 0:
+            logger.info(
+                "Creating SGLang preprocess worker pool with %d workers for %s",
+                preprocess_workers,
+                local_dir,
+            )
+            preprocess_pool = ProcessPoolExecutor(
+                max_workers=preprocess_workers,
+                initializer=_init_worker,
+                initargs=(
+                    local_dir,
+                    tool_call_parser_name,
+                    reasoning_parser_name,
+                    self.config.exclude_tools_when_tool_choice_none,
+                    self.trust_remote_code,
+                    template_force_reasoning,
+                    chat_template,
+                    default_thinking_mode,
+                    structural_tag_mode,
+                    structural_tag_scope,
+                    structural_tag_schema,
+                    self.config.isolate_tool_call_markers,
+                    # The main process's result, so workers skip a failed backend.
+                    tokenizer_backend,
+                    self.tokenizer_fallback,
+                ),
+            )
+            futures = [
+                preprocess_pool.submit(worker_warmup) for _ in range(preprocess_workers)
+            ]
+            done, not_done = _futures_wait(futures, timeout=120)
+            if not_done:
+                for f in not_done:
+                    f.cancel()
+                preprocess_pool.shutdown(wait=False, cancel_futures=True)
+                raise RuntimeError(
+                    "Timed out waiting for SGLang preprocess worker pool warmup"
+                )
+            try:
+                for f in done:
+                    f.result()
+            except Exception:
+                preprocess_pool.shutdown(wait=False, cancel_futures=True)
+                raise
+            logger.info(
+                "SGLang preprocess worker pool ready (%d workers)", preprocess_workers
+            )
+
+        logger.info("SGLang processor stream_interval=%d", self.stream_interval)
+
+        gen = SglangProcessor(
+            tokenizer,
+            routed_engine,
+            tool_call_parser_name,
+            reasoning_parser_name,
+            eos_token_ids,
+            debug_perf=self.debug_perf,
+            preprocess_pool=preprocess_pool,
+            preprocess_workers=preprocess_workers,
+            stream_interval=self.stream_interval,
+            default_thinking_mode=default_thinking_mode,
+            structural_tag_mode=structural_tag_mode,
+            structural_tag_scope=structural_tag_scope,
+            structural_tag_schema=structural_tag_schema,
+            prompt_renderer=prompt_renderer,
+            token_budget=_runtime_token_budget(mdc),
+        )
+        gen.exclude_tools_when_tool_choice_none = (
+            self.config.exclude_tools_when_tool_choice_none
+        )
+
+        return PythonAsyncEngine(gen.generator, loop)

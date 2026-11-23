@@ -1,0 +1,492 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package controller
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+
+	podcontroller "github.com/ai-dynamo/dynamo/deploy/operator/internal/controller/pods"
+
+	"github.com/ai-dynamo/dynamo/deploy/operator/internal/secret"
+
+	networkingv1beta1 "istio.io/client-go/pkg/apis/networking/v1beta1"
+	corev1 "k8s.io/api/core/v1"
+	resourcev1 "k8s.io/api/resource/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/util/validation/field"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/events"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	gaiev1 "sigs.k8s.io/gateway-api-inference-extension/api/v1"
+
+	configv1alpha1 "github.com/ai-dynamo/dynamo/deploy/operator/api/config/v1alpha1"
+	nvidiacomv1alpha1 "github.com/ai-dynamo/dynamo/deploy/operator/api/v1alpha1"
+	nvidiacomv1beta1 "github.com/ai-dynamo/dynamo/deploy/operator/api/v1beta1"
+	"github.com/ai-dynamo/dynamo/deploy/operator/internal/checkpoint"
+	"github.com/ai-dynamo/dynamo/deploy/operator/internal/consts"
+	commoncontroller "github.com/ai-dynamo/dynamo/deploy/operator/internal/controller_common"
+	"github.com/ai-dynamo/dynamo/deploy/operator/internal/dynamo"
+	"github.com/ai-dynamo/dynamo/deploy/operator/internal/dynamo/epp"
+	"github.com/ai-dynamo/dynamo/deploy/operator/internal/features"
+	snapshotv1alpha1 "github.com/ai-dynamo/snapshot/api/v1alpha1"
+)
+
+const (
+	reasonFailedToInitializeWorkerHash        Reason = "failed_to_initialize_worker_hash"
+	reasonFailedToMigrateWorkerHash           Reason = "failed_to_migrate_worker_hash"
+	reasonNoMultinodeOrchestrator             Reason = "no_multinode_orchestrator_available"
+	reasonFailedToReconcileResources          Reason = "failed_to_reconcile_the_resources"
+	reasonRollingUpdateFailed                 Reason = "rolling_update_failed"
+	reasonWaitingForCheckpoint                Reason = "waiting_for_checkpoint"
+	reasonComponentCrashLooping               Reason = "component_crash_looping"
+	reasonSelectedWorkloadProviderUnavailable Reason = "selected_workload_provider_unavailable"
+	reasonUnsupportedWorkloadProvider         Reason = "unsupported_workload_provider"
+)
+
+// DynamoGraphDeploymentReconciler reconciles a DynamoGraphDeployment object
+type DynamoGraphDeploymentReconciler struct {
+	client.Client
+	Config                *configv1alpha1.OperatorConfiguration
+	RuntimeConfig         *commoncontroller.RuntimeConfig
+	RestConfig            *rest.Config
+	Recorder              events.EventRecorder
+	DockerSecretRetriever DockerSecretRetriever
+	SSHKeyManager         *secret.SSHKeyManager
+}
+
+// +kubebuilder:rbac:groups=nvidia.com,resources=dynamographdeployments,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=nvidia.com,resources=dynamographdeployments/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=nvidia.com,resources=dynamographdeployments/finalizers,verbs=update
+// +kubebuilder:rbac:groups=nvidia.com,resources=dynamographdeploymentscalingadapters,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=grove.io,resources=podcliquesets,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=grove.io,resources=podcliques,verbs=get;list;watch
+// +kubebuilder:rbac:groups=grove.io,resources=podcliques/scale,verbs=get;update;patch
+// +kubebuilder:rbac:groups=grove.io,resources=podcliquescalinggroups,verbs=get;list;watch
+// +kubebuilder:rbac:groups=grove.io,resources=podcliquescalinggroups/scale,verbs=get;update;patch
+// +kubebuilder:rbac:groups=grove.io,resources=clustertopologybindings,verbs=get;list;watch
+// +kubebuilder:rbac:groups=disaggregatedset.x-k8s.io,resources=disaggregatedsets,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=scheduling.run.ai,resources=queues,verbs=get;list
+// +kubebuilder:rbac:groups=inference.networking.k8s.io,resources=inferencepools,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=networking.istio.io,resources=destinationrules,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=nvidia.com,resources=snapshotjobs,verbs=get;list;watch;create;patch;delete
+// +kubebuilder:rbac:groups=nvidia.com,resources=podsnapshots,verbs=get;list;watch;patch;delete
+// +kubebuilder:rbac:groups=resource.k8s.io,resources=resourceclaimtemplates,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=resource.k8s.io,resources=deviceclasses,verbs=get;list;watch
+// +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch
+// +kubebuilder:rbac:groups=core,resources=persistentvolumeclaims,verbs=get;list;watch;create;delete
+// +kubebuilder:rbac:groups=core,resources=serviceaccounts,verbs=get;list;watch;create;update
+// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles,verbs=get;list;watch;create;update
+// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=rolebindings,verbs=get;list;watch;create;update
+// +kubebuilder:rbac:groups=apps,resources=daemonsets,verbs=get;list;watch
+
+// Reconcile is part of the main kubernetes reconciliation loop which aims to
+// move the current state of the cluster closer to the desired state.
+// TODO(user): Modify the Reconcile function to compare the state specified by
+// the DynamoGraphDeployment object against the actual cluster state, and then
+// perform operations to make the cluster state reflect the state specified by
+// the user.
+//
+// For more details, check Reconcile and its Result here:
+// - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.19.1/pkg/reconcile
+func (r *DynamoGraphDeploymentReconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ctrl.Result, err error) {
+	logger := log.FromContext(ctx)
+	// retrieve the CRD
+	dynamoDeployment := &nvidiacomv1beta1.DynamoGraphDeployment{}
+	if err = r.Get(ctx, req.NamespacedName, dynamoDeployment); err != nil {
+		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+
+	// Finalize deleting resources before validating their now-immutable live configuration.
+	if !dynamoDeployment.GetDeletionTimestamp().IsZero() {
+		_, err = commoncontroller.HandleFinalizer(ctx, dynamoDeployment, r.Client, r)
+		if errors.Is(err, errAutomaticSnapshotCleanupPending) {
+			return ctrl.Result{Requeue: true}, nil
+		}
+		if err != nil {
+			logger.Error(err, "failed to handle the finalizer")
+		}
+		return ctrl.Result{}, err
+	}
+
+	// Reject stored LPX graphs before provider selection or any workload writes.
+	if dynamoDeployment.HasLPXComponent() && !r.RuntimeConfig.Gate.Enabled(features.LPX) {
+		programResult := newWorkloadProgramResult(dynamoDeployment)
+		programResult.Fail(dynamoDeployment.Generation, "lpx_disabled", errors.New("LPX integration is disabled"))
+		return programResult.Result, r.persistWorkloadProgramResult(ctx, dynamoDeployment, programResult)
+	}
+
+	// Lock in the provider before allowing any other reconciliation effects.
+	provider, err := r.ensureWorkloadProvider(ctx, dynamoDeployment)
+
+	// Keep adoption and patch failures retryable while making an invalid stored selection terminal.
+	if err != nil {
+		if !errors.Is(err, errUnsupportedWorkloadProvider) {
+			return ctrl.Result{}, err
+		}
+
+		// Persist the invalid selection diagnosis before suppressing automatic retries.
+		programResult := newWorkloadProgramResult(dynamoDeployment)
+		programResult.Fail(dynamoDeployment.Generation, reasonUnsupportedWorkloadProvider, err)
+		if statusErr := r.persistWorkloadProgramResult(ctx, dynamoDeployment, programResult); statusErr != nil {
+			return programResult.Result, statusErr
+		}
+		return programResult.Result, reconcile.TerminalError(err)
+	}
+
+	// Reject unsupported stored configurations before any primary-resource mutation.
+	var compatibilityErrs []error
+	for i := range dynamoDeployment.Spec.Components {
+		component := &dynamoDeployment.Spec.Components[i]
+		if snapshotFailoverErr := dynamo.ValidateSnapshotFailover(component, field.NewPath("spec", "components").Index(i), dynamoDeployment.Spec.BackendFramework).ToAggregate(); snapshotFailoverErr != nil {
+			compatibilityErrs = append(compatibilityErrs, snapshotFailoverErr)
+		}
+		for _, compatibilityErr := range checkpoint.ValidateCheckpointCompatibility(component.Experimental) {
+			compatibilityErrs = append(
+				compatibilityErrs,
+				fmt.Errorf("component %q: %w", component.ComponentName, compatibilityErr),
+			)
+		}
+	}
+	if compatibilityErr := errors.Join(compatibilityErrs...); compatibilityErr != nil {
+		programResult := newWorkloadProgramResult(dynamoDeployment)
+		programResult.Fail(dynamoDeployment.Generation, reasonFailedToReconcileResources, compatibilityErr)
+		if statusErr := r.persistWorkloadProgramResult(ctx, dynamoDeployment, programResult); statusErr != nil {
+			logger.Error(statusErr, "unable to update status after compatibility failure")
+			return ctrl.Result{}, statusErr
+		}
+		return ctrl.Result{}, nil
+	}
+
+	// Add the finalizer only after the live object passes compatibility preflight.
+	if _, err = commoncontroller.HandleFinalizer(ctx, dynamoDeployment, r.Client, r); err != nil {
+		logger.Error(err, "failed to handle the finalizer")
+		programResult := newWorkloadProgramResult(dynamoDeployment)
+		programResult.Fail(dynamoDeployment.Generation, "failed_to_handle_the_finalizer", err)
+		if statusErr := r.persistWorkloadProgramResult(ctx, dynamoDeployment, programResult); statusErr != nil {
+			logger.Error(statusErr, "unable to update status after finalizer failure")
+		}
+		return ctrl.Result{}, err
+	}
+
+	program, err := r.selectWorkloadProgram(provider)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	programResult, programErr := program.Reconcile(ctx, workloadProgramRequest{
+		DGD: dynamoDeployment,
+	})
+	ownershipConflictCondition, ownershipConflictTransition := applyOwnershipConflict(
+		programResult.Status.Conditions,
+		dynamoDeployment.Generation,
+		programErr,
+	)
+	if ownershipConflictCondition != nil {
+		meta.SetStatusCondition(&programResult.Status.Conditions, *ownershipConflictCondition)
+	}
+	if ownershipConflictTransition == ownershipConflictRaised {
+		programResult.Eventf(corev1.EventTypeWarning, ownershipConflictCondition.Reason,
+			"Refusing to reconcile a resource with conflicting controller ownership: %s", ownershipConflictCondition.Message)
+	}
+	result = programResult.Result
+	if statusErr := r.persistWorkloadProgramResult(ctx, dynamoDeployment, programResult); statusErr != nil {
+		logger.Error(statusErr, "unable to persist workload program status")
+		return result, statusErr
+	}
+	if programErr != nil {
+		logger.Error(programErr, "failed to reconcile the workload program")
+		return result, programErr
+	}
+
+	logger.Info("Reconciliation done")
+	return result, nil
+}
+
+func (r *DynamoGraphDeploymentReconciler) persistWorkloadProgramResult(
+	ctx context.Context,
+	dgd *nvidiacomv1beta1.DynamoGraphDeployment,
+	result workloadProgramResult,
+) error {
+	dgd.Status = result.Status
+	if err := r.Status().Update(ctx, dgd); err != nil {
+		return fmt.Errorf("update DynamoGraphDeployment status: %w", err)
+	}
+	if r.Recorder != nil {
+		for _, event := range result.Events {
+			r.Recorder.Eventf(dgd, nil, event.Type, event.Reason, "Update", "%s", event.Message)
+		}
+	}
+	return nil
+}
+
+func (r *DynamoGraphDeploymentReconciler) FinalizeResource(ctx context.Context, dynamoDeployment *nvidiacomv1beta1.DynamoGraphDeployment) error {
+	syncer := newDGDResourceSyncer(r.Client, r.Recorder)
+	return newDGDCheckpointsReconciler(
+		syncer,
+		r.Config,
+		r.RuntimeConfig,
+		r.DockerSecretRetriever,
+	).deleteAutoCheckpointsForDGD(ctx, dynamoDeployment)
+}
+
+func workloadRoutingAnnotationsChanged(update event.UpdateEvent) bool {
+	oldDGD, oldOK := update.ObjectOld.(*nvidiacomv1beta1.DynamoGraphDeployment)
+	newDGD, newOK := update.ObjectNew.(*nvidiacomv1beta1.DynamoGraphDeployment)
+	if !oldOK || !newOK {
+		return false
+	}
+	annotationValue := func(dgd *nvidiacomv1beta1.DynamoGraphDeployment, key string) string {
+		return strings.ToLower(dgd.GetAnnotations()[key])
+	}
+	return annotationValue(oldDGD, consts.KubeAnnotationEnableDisaggregatedSet) != annotationValue(newDGD, consts.KubeAnnotationEnableDisaggregatedSet) ||
+		annotationValue(oldDGD, consts.KubeAnnotationEnableGrove) != annotationValue(newDGD, consts.KubeAnnotationEnableGrove)
+}
+
+// SetupWithManager sets up the controller with the Manager.
+func (r *DynamoGraphDeploymentReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	controllerBuilder, err := r.controllerBuilder(mgr)
+	if err != nil {
+		return err
+	}
+	return controllerBuilder.Complete(r)
+}
+
+// controllerBuilder shares production watches and indexes with instrumented reconcilers.
+func (r *DynamoGraphDeploymentReconciler) controllerBuilder(mgr ctrl.Manager) (*builder.Builder, error) {
+	if err := mgr.GetFieldIndexer().IndexField(
+		context.Background(),
+		&corev1.Pod{},
+		podcontroller.ComponentIndex,
+		podcontroller.ComponentIndexValues,
+	); err != nil {
+		return nil, fmt.Errorf("register DGD component Pod index: %w", err)
+	}
+
+	// Index native PodSnapshot references so dependency events can find affected DGDs.
+	if r.RuntimeConfig.Gate.Enabled(features.Checkpoint) {
+		if err := mgr.GetFieldIndexer().IndexField(
+			context.Background(),
+			&nvidiacomv1beta1.DynamoGraphDeployment{},
+			dgdPodSnapshotRefIndex,
+			dgdPodSnapshotRefIndexValues,
+		); err != nil {
+			return nil, fmt.Errorf("register DGD PodSnapshot reference index: %w", err)
+		}
+	}
+
+	ctrlBuilder := ctrl.NewControllerManagedBy(mgr).
+		For(&nvidiacomv1beta1.DynamoGraphDeployment{}, builder.WithPredicates(
+			dgdPrimaryPredicate(),
+		)).
+		Named(consts.ResourceTypeDynamoGraphDeployment).
+		Watches(
+			&corev1.Pod{},
+			handler.EnqueueRequestsFromMapFunc(mapDGDWorkerPodToRequests),
+			builder.WithPredicates(dgdWorkerPodEventPredicate()),
+		).
+		Owns(&nvidiacomv1beta1.DynamoComponentDeployment{}, builder.WithPredicates(predicate.Funcs{
+			CreateFunc:  func(ce event.CreateEvent) bool { return true },
+			DeleteFunc:  func(de event.DeleteEvent) bool { return true },
+			UpdateFunc:  func(de event.UpdateEvent) bool { return true },
+			GenericFunc: func(ge event.GenericEvent) bool { return true },
+		})).
+		Owns(&nvidiacomv1alpha1.DynamoGraphDeploymentScalingAdapter{}, builder.WithPredicates(predicate.Funcs{
+			// ignore creation cause we don't want to be called again after we create the adapter
+			CreateFunc:  func(ce event.CreateEvent) bool { return false },
+			DeleteFunc:  func(de event.DeleteEvent) bool { return true },
+			UpdateFunc:  func(de event.UpdateEvent) bool { return false }, // Adapter updates are handled by adapter controller
+			GenericFunc: func(ge event.GenericEvent) bool { return false },
+		})).
+		Owns(&corev1.PersistentVolumeClaim{}, builder.WithPredicates(predicate.Funcs{
+			// ignore creation cause we don't want to be called again after we create the PVC
+			CreateFunc:  func(ce event.CreateEvent) bool { return false },
+			DeleteFunc:  func(de event.DeleteEvent) bool { return true },
+			UpdateFunc:  func(de event.UpdateEvent) bool { return true },
+			GenericFunc: func(ge event.GenericEvent) bool { return true },
+		})).
+		// Deleting a component or elastic-EP leader Service must bring it back: without
+		// this watch the discovery endpoint stays absent until some unrelated watched
+		// resource happens to trigger a reconcile.
+		Owns(&corev1.Service{}, builder.WithPredicates(predicate.Funcs{
+			// ignore creation cause we don't want to be called again after we create the service
+			CreateFunc:  func(ce event.CreateEvent) bool { return false },
+			DeleteFunc:  func(de event.DeleteEvent) bool { return true },
+			UpdateFunc:  func(de event.UpdateEvent) bool { return true },
+			GenericFunc: func(ge event.GenericEvent) bool { return true },
+		})).
+		WithEventFilter(deploymentEventFilter(r.Config, r.RuntimeConfig))
+
+	// Restore owned pools after deletion or spec drift without requiring GAIE on every cluster.
+	_, poolMappingErr := mgr.GetRESTMapper().RESTMapping(epp.InferencePoolGVK.GroupKind(), epp.InferencePoolGVK.Version)
+	if poolMappingErr != nil && !meta.IsNoMatchError(poolMappingErr) {
+		return nil, fmt.Errorf("discover InferencePool API for DGD watch: %w", poolMappingErr)
+	}
+	if poolMappingErr == nil {
+		ctrlBuilder = ctrlBuilder.Owns(&gaiev1.InferencePool{}, builder.WithPredicates(
+			predicate.GenerationChangedPredicate{},
+		))
+	}
+
+	// Watch standalone Snapshot resources only when their external APIs were detected.
+	if r.RuntimeConfig.Gate.Enabled(features.Checkpoint) {
+		ctrlBuilder = ctrlBuilder.
+			Watches(
+				&snapshotv1alpha1.SnapshotJob{},
+				handler.EnqueueRequestsFromMapFunc(r.mapAutoSnapshotJobToDGDRequests),
+				builder.WithPredicates(predicate.Funcs{
+					CreateFunc:  func(ce event.CreateEvent) bool { return false },
+					DeleteFunc:  func(de event.DeleteEvent) bool { return true },
+					UpdateFunc:  func(ue event.UpdateEvent) bool { return true },
+					GenericFunc: func(ge event.GenericEvent) bool { return true },
+				}),
+			).
+			Watches(
+				&snapshotv1alpha1.PodSnapshot{},
+				handler.EnqueueRequestsFromMapFunc(r.mapPodSnapshotToDGDRequests),
+				builder.WithPredicates(predicate.ResourceVersionChangedPredicate{}),
+			)
+	}
+	if r.RuntimeConfig.Gate.Enabled(features.DRA) {
+		ctrlBuilder = ctrlBuilder.Watches(
+			&resourcev1.ResourceClaim{},
+			handler.EnqueueRequestsFromMapFunc(r.mapResourceClaimToDGDRequests),
+			builder.WithPredicates(predicate.GenerationChangedPredicate{}),
+		).Watches(
+			&resourcev1.ResourceClaimTemplate{},
+			handler.EnqueueRequestsFromMapFunc(r.mapResourceClaimTemplateToDGDRequests),
+			builder.WithPredicates(predicate.GenerationChangedPredicate{}),
+		).Watches(
+			&resourcev1.DeviceClass{},
+			handler.EnqueueRequestsFromMapFunc(r.mapDeviceClassToDGDRequests),
+			builder.WithPredicates(predicate.GenerationChangedPredicate{}),
+		)
+	}
+	if r.RuntimeConfig.Gate.Enabled(features.Istio) {
+		ctrlBuilder = ctrlBuilder.Owns(&networkingv1beta1.DestinationRule{}, builder.WithPredicates(predicate.Funcs{
+			CreateFunc:  func(ce event.CreateEvent) bool { return false },
+			DeleteFunc:  func(de event.DeleteEvent) bool { return true },
+			UpdateFunc:  func(de event.UpdateEvent) bool { return true },
+			GenericFunc: func(ge event.GenericEvent) bool { return false },
+		}))
+	}
+	if r.RuntimeConfig.Gate.Enabled(features.DisaggregatedSet) {
+		ctrlBuilder = newDisaggregatedSetWatchSetup(mgr.GetClient()).addTo(ctrlBuilder)
+	}
+
+	// LPX child status can wake the DGD only when its controller is enabled.
+	if r.RuntimeConfig.Gate.Enabled(features.LPX) {
+		ctrlBuilder = ctrlBuilder.Owns(&nvidiacomv1alpha1.LPXGraphDeployment{})
+	}
+
+	// Register Grove-owned workload watches only when the Grove feature is enabled.
+	if r.RuntimeConfig.Gate.Enabled(features.Grove) {
+		ctrlBuilder = newGroveWatchSetup(r.Client).addTo(ctrlBuilder)
+	}
+
+	return ctrlBuilder, nil
+}
+
+func (r *DynamoGraphDeploymentReconciler) GetRecorder() events.EventRecorder {
+	return r.Recorder
+}
+
+func isDGDManagedWorkerPod(obj client.Object) bool {
+	pod, ok := obj.(*corev1.Pod)
+	if !ok || pod == nil {
+		return false
+	}
+
+	// Native LWS pods carry a worker hash instead of the DCD selector.
+	labels := pod.GetLabels()
+	return labels[consts.KubeLabelDynamoGraphDeploymentName] != "" &&
+		labels[consts.KubeLabelDynamoComponent] != "" &&
+		(labels[consts.KubeLabelDynamoSelector] != "" || labels[consts.KubeLabelDynamoWorkerHash] != "") &&
+		dynamo.IsWorkerComponent(labels[consts.KubeLabelDynamoComponentType])
+}
+
+// dgdWorkerPodEventPredicate admits only events that can change whether a
+// worker rollout is blocked by an old pod. Creation and deletion change pod
+// membership; updates matter only when membership or terminality changes. A
+// deletion timestamp alone leaves the pod non-terminal and does not enqueue.
+func dgdWorkerPodEventPredicate() predicate.Predicate {
+	return predicate.Funcs{
+		CreateFunc: func(e event.CreateEvent) bool {
+			return isDGDManagedWorkerPod(e.Object)
+		},
+		DeleteFunc: func(e event.DeleteEvent) bool {
+			return isDGDManagedWorkerPod(e.Object)
+		},
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			oldManaged := isDGDManagedWorkerPod(e.ObjectOld)
+			newManaged := isDGDManagedWorkerPod(e.ObjectNew)
+			if oldManaged != newManaged {
+				return true
+			}
+			if !newManaged {
+				return false
+			}
+			oldPod := e.ObjectOld.(*corev1.Pod)
+			newPod := e.ObjectNew.(*corev1.Pod)
+			if oldPod.Labels[consts.KubeLabelDynamoGraphDeploymentName] != newPod.Labels[consts.KubeLabelDynamoGraphDeploymentName] ||
+				oldPod.Labels[consts.KubeLabelDynamoComponent] != newPod.Labels[consts.KubeLabelDynamoComponent] ||
+				oldPod.Labels[consts.KubeLabelDynamoSelector] != newPod.Labels[consts.KubeLabelDynamoSelector] ||
+				oldPod.Labels[consts.KubeLabelDynamoWorkerHash] != newPod.Labels[consts.KubeLabelDynamoWorkerHash] {
+				return true
+			}
+			return isTerminalPhase(oldPod.Status.Phase) != isTerminalPhase(newPod.Status.Phase)
+		},
+		GenericFunc: func(event.GenericEvent) bool {
+			return false
+		},
+	}
+}
+
+func mapDGDWorkerPodToRequests(_ context.Context, obj client.Object) []ctrl.Request {
+	if !isDGDManagedWorkerPod(obj) {
+		return nil
+	}
+	dgdName := obj.GetLabels()[consts.KubeLabelDynamoGraphDeploymentName]
+	return []ctrl.Request{{Namespace: obj.GetNamespace(), Name: dgdName}}
+}
+
+func (r *DynamoGraphDeploymentReconciler) mapAutoSnapshotJobToDGDRequests(ctx context.Context, obj client.Object) []ctrl.Request {
+	snapshotJob, ok := obj.(*snapshotv1alpha1.SnapshotJob)
+	if !ok || snapshotJob == nil {
+		return nil
+	}
+	if snapshotJob.Annotations == nil || snapshotJob.Annotations[consts.CheckpointAutoAnnotation] != consts.KubeLabelValueTrue {
+		return nil
+	}
+	if snapshotJob.Labels == nil {
+		return nil
+	}
+	dgdName := snapshotJob.Labels[consts.KubeLabelDynamoGraphDeploymentName]
+	if dgdName == "" {
+		return nil
+	}
+	return []ctrl.Request{{Namespace: snapshotJob.Namespace, Name: dgdName}}
+}

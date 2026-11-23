@@ -1,0 +1,77 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package compatibility
+
+import (
+	semver "github.com/Masterminds/semver/v3"
+	"github.com/ai-dynamo/dynamo/deploy/operator/internal/runtimeversion"
+)
+
+// Feature gates gated on the operator origin version (the operator version that
+// first reconciled / created the DGD resource).
+
+var (
+	// FrontendStartupProbe requires runtime support and pins defaults to new workloads.
+	// The published 1.6 operator did not render this default, even for 1.6 runtimes.
+	FrontendStartupProbe = RuntimeGate{
+		Name:              "FrontendStartupProbe",
+		MinOriginVersion:  *semver.MustParse("1.7.0"),
+		MinRuntimeVersion: runtimeversion.Version{Major: 1, Minor: 6},
+	}
+
+	// GroveNativeMinAvailable enables native availability defaults for newly created Grove workloads.
+	// Existing graphs retain their persisted minimum form. This gate does not select a rollout strategy.
+	GroveNativeMinAvailable = Gate{
+		Name:             "GroveNativeMinAvailable",
+		MinOriginVersion: *semver.MustParse("1.6.0"),
+	}
+
+	// VLLMMultiprocessing gates the use of vLLM native multiprocessing (mp)
+	// instead of Ray for multi-node deployments. Enabled for DGDs originally
+	// created by operator >= 1.0.0.
+	VLLMMultiprocessing = Gate{
+		Name:             "VLLMMultiprocessing",
+		MinOriginVersion: *semver.MustParse("1.0.0"),
+	}
+
+	// MultinodeTopologyAliases gates the injection of backend-independent rank
+	// and leader-address environment variables. Enabled for DGDs originally
+	// created by operator >= 1.6.0 so an operator upgrade does not roll existing
+	// multinode workloads solely to add the aliases.
+	MultinodeTopologyAliases = Gate{
+		Name:             "MultinodeTopologyAliases",
+		MinOriginVersion: *semver.MustParse("1.6.0"),
+	}
+
+	// TRTLLMMpirunMapByNode places GPUs-per-pod mpirun ranks on each TRT-LLM node. Enabled for
+	// DGDs created by operator >= 1.7.0 so an upgrade does not roll existing multinode workloads.
+	TRTLLMMpirunMapByNode = Gate{
+		Name:             "TRTLLMMpirunMapByNode",
+		MinOriginVersion: *semver.MustParse("1.7.0"),
+	}
+
+	// FrontendSidecarProbeReplacement makes an authored frontend-sidecar probe
+	// replace the operator default as a complete value, matching main and the
+	// runtime sidecar. The published 1.6 operator field-merged these probes with
+	// its defaults, so older workloads keep that merge to preserve their rendered
+	// pod template across an operator-only upgrade.
+	FrontendSidecarProbeReplacement = Gate{
+		Name:             "FrontendSidecarProbeReplacement",
+		MinOriginVersion: *semver.MustParse("1.7.0"),
+	}
+)

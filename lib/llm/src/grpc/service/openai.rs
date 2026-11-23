@@ -1,0 +1,384 @@
+// SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+use dynamo_runtime::{
+    pipeline::{AsyncEngineContextProvider, Context},
+    protocols::annotated::AnnotationsProvider,
+};
+use futures::{Stream, StreamExt, stream};
+use std::sync::Arc;
+
+use crate::grpc::service::dispatch_error_status;
+// Re-exported so the old per-module path keeps resolving for outside users.
+pub use crate::grpc::service::grpc_monitor_for_disconnects;
+use crate::http::service::metadata::extract_metadata_from_grpc;
+use crate::protocols::openai::ParsingOptions;
+use crate::protocols::openai::completions::{
+    NvCreateCompletionRequest, NvCreateCompletionResponse,
+};
+use crate::types::Annotated;
+
+use super::kserve;
+use super::kserve::inference;
+
+// [gluo NOTE] These are common utilities that should be shared between frontends
+use crate::http::service::{
+    disconnect::create_connection_monitor,
+    metrics::{CancellationLabels, Endpoint, process_response_and_observe_metrics},
+};
+use dynamo_protocols::types::{CompletionFinishReason, CreateCompletionRequest, Prompt};
+
+use tonic::{Status, metadata::MetadataMap};
+
+/// Dynamo Annotation for the request ID
+pub const ANNOTATION_REQUEST_ID: &str = "request_id";
+
+// [gluo NOTE] strip down version of lib/llm/src/http/service/openai.rs
+// dupliating it here as the original file has coupling with HTTP objects.
+
+/// OpenAI Completions Request Handler
+///
+/// This method will handle the incoming request for the `/v1/completions endpoint`. The endpoint is a "source"
+/// for an `OpenAICompletionsStreamingEngine` and will return a stream of
+/// responses which will be forward to the client.
+///
+/// Note: For all requests, streaming or non-streaming, we always call the engine with streaming enabled. For
+/// non-streaming requests, we will fold the stream into a single response as part of this handler.
+pub async fn completion_response_stream(
+    state: Arc<kserve::State>,
+    request: NvCreateCompletionRequest,
+    metadata: &MetadataMap,
+) -> Result<
+    (
+        impl Stream<Item = Annotated<NvCreateCompletionResponse>>,
+        ParsingOptions,
+    ),
+    Status,
+> {
+    // Client ids remain in the payload; only a server-minted id may key in-flight state.
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let streaming = request.inner.stream.unwrap_or(false);
+    let model_name = request.inner.model.clone();
+    let cancellation_labels = CancellationLabels {
+        model: model_name.clone(),
+        endpoint: "grpc_completions".to_string(),
+        request_type: if streaming { "stream" } else { "unary" }.to_string(),
+    };
+    let metadata = extract_metadata_from_grpc(metadata)
+        .map_err(|err| Status::invalid_argument(err.to_string()))?;
+    let request = Context::with_id_and_metadata(request, request_id.clone(), metadata);
+    let context = request.context();
+
+    // create the connection handles
+    let (mut connection_handle, stream_handle) = create_connection_monitor(
+        context.clone(),
+        Some(state.metrics_clone()),
+        cancellation_labels,
+    )
+    .await;
+    // update the request to always stream
+    let mut request = request.map(|mut req| {
+        req.inner.stream = Some(true);
+        req
+    });
+
+    // todo - make the protocols be optional for model name
+    // todo - when optional, if none, apply a default
+    let model = &request.inner.model;
+
+    // todo - error handling should be more robust
+    let (engine, parsing_options) = state
+        .manager()
+        .get_completions_engine_with_parsing(model)
+        .map_err(|e| match e {
+            crate::discovery::ModelManagerError::ModelUnavailable(_) => {
+                Status::unavailable("model temporarily unavailable")
+            }
+            _ => Status::not_found("model not found"),
+        })?;
+
+    let http_queue_guard = state.metrics_clone().create_http_queue_guard(model);
+
+    let inflight_guard = state.metrics_clone().create_inflight_guard(
+        model,
+        Endpoint::Completions,
+        streaming,
+        &request_id,
+    );
+
+    let mut response_collector = inflight_guard.response_collector();
+    inflight_guard.request_metrics().attach_to(&mut request);
+
+    // prepare to process any annotations
+    let annotations = request.annotations();
+
+    // issue the generate call on the engine
+    let stream = engine.generate(request).await.map_err(|e| {
+        // Deadline is checked before overload so a chain carrying both markers
+        // keeps the deadline outcome. RESOURCE_EXHAUSTED mirrors the HTTP
+        // surfaces' 429: the deadline elapsed waiting for capacity, so it is
+        // backpressure rather than a gateway timeout. No rejection accounting.
+        if crate::http::service::metrics::request_deadline_exceeded(e.as_ref()) {
+            return Status::resource_exhausted(
+                crate::http::service::metrics::REQUEST_DEADLINE_EXCEEDED_MESSAGE,
+            );
+        }
+        if crate::http::service::metrics::request_was_rejected(e.as_ref()) {
+            state.metrics_clone().inc_rejection(
+                &model_name,
+                crate::http::service::metrics::Endpoint::Completions,
+            );
+            return Status::resource_exhausted(e.to_string());
+        }
+        dispatch_error_status(e.as_ref(), "Failed to generate completions")
+    })?;
+
+    // capture the context to cancel the stream if the client disconnects
+    let ctx = stream.context();
+
+    // prepare any requested annotations
+    let annotations = annotations.map_or(Vec::new(), |annotations| {
+        annotations
+            .iter()
+            .filter_map(|annotation| {
+                if annotation == ANNOTATION_REQUEST_ID {
+                    Annotated::<NvCreateCompletionResponse>::from_annotation(
+                        ANNOTATION_REQUEST_ID,
+                        &request_id,
+                    )
+                    .ok()
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+    });
+
+    // apply any annotations to the front of the stream
+    let stream = stream::iter(annotations).chain(stream);
+
+    // Tap on the stream to collect response metrics and handle http_queue_guard
+    let mut http_queue_guard = Some(http_queue_guard);
+    let stream = stream.inspect(move |response| {
+        // Calls observe_response() on each token - drops http_queue_guard on first token
+        process_response_and_observe_metrics(
+            response,
+            &mut response_collector,
+            &mut http_queue_guard,
+        );
+    });
+
+    let stream = grpc_monitor_for_disconnects(stream, ctx, inflight_guard, stream_handle);
+
+    // if we got here, then we will return a response and the potentially long running task has completed successfully
+    // without need to be cancelled.
+    connection_handle.disarm();
+
+    Ok((stream, parsing_options))
+}
+
+impl TryFrom<inference::ModelInferRequest> for NvCreateCompletionRequest {
+    type Error = Status;
+
+    fn try_from(request: inference::ModelInferRequest) -> Result<Self, Self::Error> {
+        // Protocol requires if `raw_input_contents` is used to hold input data,
+        // it must be used for all inputs.
+        if !request.raw_input_contents.is_empty()
+            && request.inputs.len() != request.raw_input_contents.len()
+        {
+            return Err(Status::invalid_argument(
+                "`raw_input_contents` must be used for all inputs",
+            ));
+        }
+
+        // iterate through inputs
+        let mut text_input = None;
+        let mut stream = false;
+        for (idx, input) in request.inputs.iter().enumerate() {
+            match input.name.as_str() {
+                "text_input" => {
+                    if input.datatype != "BYTES" {
+                        return Err(Status::invalid_argument(format!(
+                            "Expected 'text_input' to be of type BYTES for string input, got {:?}",
+                            input.datatype
+                        )));
+                    }
+                    if input.shape != vec![1] && input.shape != vec![1, 1] {
+                        return Err(Status::invalid_argument(format!(
+                            "Expected 'text_input' to have shape [1], got {:?}",
+                            input.shape
+                        )));
+                    }
+                    match &input.contents {
+                        Some(content) => {
+                            let bytes = content.bytes_contents.first().ok_or_else(|| {
+                                Status::invalid_argument(
+                                    "'text_input' must contain exactly one element",
+                                )
+                            })?;
+                            text_input = Some(String::from_utf8_lossy(bytes).to_string());
+                        }
+                        None => {
+                            let raw_input =
+                                request.raw_input_contents.get(idx).ok_or_else(|| {
+                                    Status::invalid_argument("Missing raw input for 'text_input'")
+                                })?;
+                            if raw_input.len() < 4 {
+                                return Err(Status::invalid_argument(
+                                    "'text_input' raw input must be length-prefixed (>= 4 bytes)",
+                                ));
+                            }
+                            // We restrict the 'text_input' only contain one element, only need to
+                            // parse the first element. Skip first four bytes that is used to store
+                            // the length of the input.
+                            text_input = Some(String::from_utf8_lossy(&raw_input[4..]).to_string());
+                        }
+                    }
+                }
+                "streaming" | "stream" => {
+                    if input.datatype != "BOOL" {
+                        return Err(Status::invalid_argument(format!(
+                            "Expected '{}' to be of type BOOL, got {:?}",
+                            input.name, input.datatype
+                        )));
+                    }
+                    if input.shape != vec![1] {
+                        return Err(Status::invalid_argument(format!(
+                            "Expected 'stream' to have shape [1], got {:?}",
+                            input.shape
+                        )));
+                    }
+                    match &input.contents {
+                        Some(content) => {
+                            stream = *content.bool_contents.first().ok_or_else(|| {
+                                Status::invalid_argument(
+                                    "'stream' must contain exactly one element",
+                                )
+                            })?;
+                        }
+                        None => {
+                            let raw_input =
+                                request.raw_input_contents.get(idx).ok_or_else(|| {
+                                    Status::invalid_argument("Missing raw input for 'stream'")
+                                })?;
+                            if raw_input.is_empty() {
+                                return Err(Status::invalid_argument(
+                                    "'stream' raw input must contain at least one byte",
+                                ));
+                            }
+                            stream = raw_input[0] != 0;
+                        }
+                    }
+                }
+                _ => {
+                    return Err(Status::invalid_argument(format!(
+                        "Invalid input name: {}, supported inputs are 'text_input', 'stream'",
+                        input.name
+                    )));
+                }
+            }
+        }
+
+        // return error if text_input is None
+        let text_input = match text_input {
+            Some(input) => input,
+            None => {
+                return Err(Status::invalid_argument(
+                    "Missing required input: 'text_input'",
+                ));
+            }
+        };
+
+        Ok(NvCreateCompletionRequest {
+            no_stop_trim: None,
+            inner: CreateCompletionRequest {
+                model: request.model_name,
+                prompt: Prompt::String(text_input),
+                stream: Some(stream),
+                user: if request.id.is_empty() {
+                    None
+                } else {
+                    Some(request.id.clone())
+                },
+                ..Default::default()
+            },
+            common: Default::default(),
+            nvext: None,
+            metadata: None,
+            return_tokens_as_token_ids: None,
+            unsupported_fields: Default::default(),
+        })
+    }
+}
+
+impl TryFrom<NvCreateCompletionResponse> for inference::ModelInferResponse {
+    type Error = anyhow::Error;
+
+    fn try_from(response: NvCreateCompletionResponse) -> Result<Self, Self::Error> {
+        let mut outputs = vec![];
+        let mut text_output = vec![];
+        let mut finish_reason = vec![];
+        for choice in &response.inner.choices {
+            text_output.push(choice.text.clone());
+            let reason_str = match choice.finish_reason.as_ref() {
+                Some(CompletionFinishReason::Stop) => "stop",
+                Some(CompletionFinishReason::Length) => "length",
+                Some(CompletionFinishReason::ContentFilter) => "content_filter",
+                None => "",
+            };
+            finish_reason.push(reason_str.to_string());
+        }
+        outputs.push(inference::model_infer_response::InferOutputTensor {
+            name: "text_output".to_string(),
+            datatype: "BYTES".to_string(),
+            shape: vec![text_output.len() as i64],
+            contents: Some(inference::InferTensorContents {
+                bytes_contents: text_output
+                    .into_iter()
+                    .map(|text| text.as_bytes().to_vec())
+                    .collect(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        outputs.push(inference::model_infer_response::InferOutputTensor {
+            name: "finish_reason".to_string(),
+            datatype: "BYTES".to_string(),
+            shape: vec![finish_reason.len() as i64],
+            contents: Some(inference::InferTensorContents {
+                bytes_contents: finish_reason
+                    .into_iter()
+                    .map(|text| text.as_bytes().to_vec())
+                    .collect(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+
+        Ok(inference::ModelInferResponse {
+            model_name: response.inner.model,
+            model_version: "1".to_string(),
+            id: response.inner.id,
+            outputs,
+            parameters: ::std::collections::HashMap::<String, inference::InferParameter>::new(),
+            raw_output_contents: vec![],
+        })
+    }
+}
+
+impl TryFrom<NvCreateCompletionResponse> for inference::ModelStreamInferResponse {
+    type Error = anyhow::Error;
+
+    fn try_from(response: NvCreateCompletionResponse) -> Result<Self, Self::Error> {
+        match inference::ModelInferResponse::try_from(response) {
+            Ok(response) => Ok(inference::ModelStreamInferResponse {
+                infer_response: Some(response),
+                ..Default::default()
+            }),
+            Err(e) => Ok(inference::ModelStreamInferResponse {
+                infer_response: None,
+                error_message: format!("Failed to convert response: {}", e),
+            }),
+        }
+    }
+}

@@ -1,0 +1,776 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+import json
+import logging
+import re
+import socket
+import threading
+import time
+from typing import Any, Callable, Dict, cast
+
+import pytest
+import requests
+
+from tests.utils.constants import FAULT_TOLERANCE_MODEL_NAME
+from tests.utils.managed_process import (
+    DynamoFrontendProcess as BaseDynamoFrontendProcess,
+)
+from tests.utils.managed_process import ManagedProcess
+
+logger = logging.getLogger(__name__)
+
+
+class DynamoFrontendProcess(BaseDynamoFrontendProcess):
+    """Fault-tolerance frontend wrapper (keeps env settings from the historical helper)."""
+
+    def __init__(self, request):
+        extra_env = {
+            "DYN_REQUEST_PLANE": request.getfixturevalue("request_plane"),
+            "DYN_LOG": "debug",
+            # These tests expect full control over requests sent to workers. The canary
+            # health check can inject extra requests and cause intermittent failures.
+            "DYN_HEALTH_CHECK_ENABLED": "false",
+        }
+        super().__init__(
+            request,
+            frontend_port=0,  # allocate a free port (xdist-safe)
+            router_mode="round-robin",
+            extra_env=extra_env,
+            terminate_all_matching_process_names=False,
+        )
+
+
+class CancellableRequest:
+    """A wrapper for a single request that can be explicitly cancelled.
+
+    Each instance supports only one post() call and should not be reused.
+    """
+
+    # Class-level tracking for thread-safe socket monitoring
+    _socket_tracking_lock = threading.Lock()
+    _socket_trackers: Dict[
+        Any, Any
+    ] = {}  # Maps thread ID to CancellableRequest instance
+    _original_socket: Callable[..., Any] = socket.socket
+
+    @classmethod
+    def _global_tracked_socket(
+        cls, family=socket.AF_INET, type=socket.SOCK_STREAM, proto=0, fileno=None
+    ):
+        """Global socket tracker that routes to the appropriate CancellableRequest instance"""
+        sock = cls._original_socket(family, type, proto, fileno)
+
+        # Find which CancellableRequest should track this socket
+        thread_id = threading.current_thread().ident
+        with cls._socket_tracking_lock:
+            tracker = cls._socket_trackers.get(thread_id)
+            if tracker:
+                tracker._active_sockets.append(sock)
+
+        return sock
+
+    def __init__(self):
+        self.session = requests.Session()
+        self.response = None
+        self.exception = None
+        self._response_ready = threading.Event()
+        self._cancelled = False
+        self._request_thread = None
+        self._lock = threading.Lock()
+        self._active_sockets = []
+
+    def post(self, *args, **kwargs):
+        """Start a POST request in a separate thread. Can only be called once."""
+
+        def make_request():
+            thread_id = threading.current_thread().ident
+
+            # Register this thread's tracker
+            with self.__class__._socket_tracking_lock:
+                self.__class__._socket_trackers[thread_id] = self
+                # Install global monkey-patch if not already installed
+                if socket.socket != self.__class__._global_tracked_socket:
+                    socket.socket = self.__class__._global_tracked_socket  # type: ignore[assignment,misc]
+
+            try:
+                self.response = self.session.post(*args, **kwargs)
+            except Exception as e:
+                self.exception = e
+            finally:
+                # Unregister this thread's tracker
+                with self.__class__._socket_tracking_lock:
+                    self.__class__._socket_trackers.pop(thread_id, None)
+                    # Only restore original socket if no other trackers are active
+                    if (
+                        not self.__class__._socket_trackers
+                        and socket.socket == self.__class__._global_tracked_socket
+                    ):
+                        socket.socket = self.__class__._original_socket  # type: ignore[assignment,misc]
+                self._response_ready.set()
+
+        with self._lock:
+            if self._request_thread is not None:
+                raise RuntimeError(
+                    "This CancellableRequest instance has already been used. Create a new instance."
+                )
+            self._request_thread = threading.Thread(target=make_request)
+        self._request_thread.start()
+
+    def cancel(self):
+        """Cancel the request by forcefully closing the underlying TCP socket"""
+        with self._lock:
+            if self._cancelled:
+                return
+            self._cancelled = True
+
+        # Do the cleanup outside the lock to avoid holding it during I/O operations
+        # Force close all tracked sockets (this is the actual TCP connection)
+        for sock in self._active_sockets:
+            # Set socket to non-blocking to avoid hanging
+            try:
+                sock.setblocking(0)
+            except Exception as e:
+                logger.warning(f"Failed to set socket to non-blocking: {e}")
+            # Force shutdown both send and receive
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except Exception as e:
+                logger.warning(f"Failed to shutdown socket: {e}")
+            # Close the socket
+            try:
+                sock.close()
+            except Exception as e:
+                logger.warning(f"Failed to close socket: {e}")
+
+        self._active_sockets.clear()
+
+        # Also close at the requests level for cleanup
+        if self.response is not None:
+            self.response.close()
+        for adapter in self.session.adapters.values():
+            adapter.close()
+        self.session.close()
+
+    def raise_for_early_failure(self) -> None:
+        """Raise when a request finishes with an error before reaching a worker."""
+        request_thread = self._request_thread
+        if request_thread is None or request_thread.is_alive():
+            return
+
+        if self.exception is not None:
+            exception = self.exception
+            self.cancel()
+            raise AssertionError(
+                f"Request failed before reaching the worker: {exception}"
+            ) from exception
+
+        if self.response is None:
+            self.cancel()
+            raise AssertionError(
+                "Request finished before reaching the worker without a response"
+            )
+
+        if not 200 <= self.response.status_code < 300:
+            status_code = self.response.status_code
+            response_body = self.response.text.strip()
+            if len(response_body) > 1000:
+                response_body = f"{response_body[:1000]}..."
+            self.cancel()
+            raise AssertionError(
+                "Request failed before reaching the worker: "
+                f"HTTP {status_code}: {response_body}"
+            )
+
+    def wait(self, timeout_s: float = 60.0) -> None:
+        """Block until a non-streaming request finishes.
+
+        Raises:
+            AssertionError: If the request does not finish before timeout_s.
+        """
+        thread = self._request_thread
+        if thread is None:
+            raise RuntimeError("wait() called before post()")
+        thread.join(timeout_s)
+        if thread.is_alive():
+            self.cancel()
+            raise AssertionError(f"Request did not complete within {timeout_s}s")
+
+    def get_response(self, timeout: float = 30.0):
+        """Wait for the request to produce a response or raise an exception."""
+        if not self._response_ready.wait(timeout):
+            raise requests.exceptions.Timeout(
+                f"Timed out after {timeout}s waiting for the HTTP response"
+            )
+        if self._cancelled:
+            raise requests.exceptions.RequestException("Request was cancelled")
+        if self.exception:
+            raise self.exception
+        return self.response
+
+
+def send_completion_request(
+    prompt: str,
+    max_tokens: int,
+    frontend_port: int,
+    timeout_s: float | None = None,
+) -> CancellableRequest:
+    """Send a cancellable completion request to the frontend."""
+    payload = {
+        "model": FAULT_TOLERANCE_MODEL_NAME,
+        "prompt": prompt,
+        "max_tokens": max_tokens,
+    }
+
+    headers = {"Content-Type": "application/json"}
+
+    logger.info(
+        f"Sending completion request with prompt: '{prompt[:50]}...' and max_tokens: {max_tokens}"
+    )
+
+    # Return a cancellable request object
+    cancellable_req = CancellableRequest()
+    cancellable_req.post(
+        f"http://localhost:{frontend_port}/v1/completions",
+        headers=headers,
+        json=payload,
+        timeout=timeout_s,
+    )
+    return cancellable_req
+
+
+def send_chat_completion_request(
+    prompt: str,
+    max_tokens: int,
+    frontend_port: int,
+    stream: bool = False,
+    timeout_s: float | None = None,
+) -> CancellableRequest:
+    """Send a cancellable chat request to the frontend."""
+    payload = {
+        "model": FAULT_TOLERANCE_MODEL_NAME,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": max_tokens,
+        "stream": stream,
+    }
+
+    headers = {"Content-Type": "application/json"}
+
+    logger.info(
+        f"Sending chat completion request (stream={stream}) with prompt: '{prompt[:50]}...' and max_tokens: {max_tokens}"
+    )
+
+    # Return a cancellable request object
+    cancellable_req = CancellableRequest()
+    cancellable_req.post(
+        f"http://localhost:{frontend_port}/v1/chat/completions",
+        headers=headers,
+        json=payload,
+        stream=stream,
+        timeout=timeout_s,
+    )
+    return cancellable_req
+
+
+def send_cancellable_request(
+    frontend_port: int,
+    request_type: str = "completion",
+    use_long_prompt: bool = False,
+    max_tokens: int = 16384,
+    timeout_s: float | None = None,
+) -> CancellableRequest:
+    """Send a request that can be manually cancelled."""
+    prompt = "Tell me a very long and detailed story about the history of artificial intelligence, including all major milestones, researchers, and breakthroughs?"
+    if use_long_prompt:
+        prompt += " Make sure it is" + " long" * 16000 + "!"
+
+    if request_type == "completion":
+        return send_completion_request(prompt, max_tokens, frontend_port, timeout_s)
+    elif request_type == "chat_completion":
+        return send_chat_completion_request(
+            prompt, max_tokens, frontend_port, stream=False, timeout_s=timeout_s
+        )
+    elif request_type == "chat_completion_stream":
+        return send_chat_completion_request(
+            prompt, max_tokens, frontend_port, stream=True, timeout_s=timeout_s
+        )
+    else:
+        raise ValueError(f"Unknown request type: {request_type}")
+
+
+def read_streaming_responses(
+    cancellable_req: CancellableRequest,
+    expected_count: int = 5,
+    deadline_s: float | None = None,
+    drain: bool = False,
+    require_content: bool = False,
+) -> None:
+    """Read a specific number of responses from a streaming request.
+
+    Args:
+        cancellable_req: The CancellableRequest object with an active stream
+        expected_count: Number of responses to read before returning
+        deadline_s: Absolute wall-clock budget for reading the required stream.
+        drain: Continue reading after expected_count until a successful terminal
+            response and ``[DONE]`` marker are received.
+        require_content: Require at least one nonempty generated-text fragment.
+            This is useful for drained health probes that must prove generation,
+            not merely a syntactically complete metadata-only response.
+
+    Raises:
+        pytest.fail if stream ends before expected_count responses
+    """
+    response_raw = cancellable_req.get_response()
+    if response_raw is None:
+        pytest.fail("Failed to get streaming response: response is None")
+    if response_raw.status_code != 200:
+        pytest.fail(
+            f"Failed to get streaming response: status_code={response_raw.status_code}"
+        )
+
+    response = cast(requests.Response, response_raw)  # Type narrowing after checks
+    response_count = 0
+    saw_finish_reason = False
+    saw_done = False
+    saw_content = False
+    deadline = None if deadline_s is None else time.monotonic() + deadline_s
+    deadline_expired = threading.Event()
+    deadline_timer = None
+
+    if deadline_s is not None:
+
+        def expire_stream() -> None:
+            deadline_expired.set()
+            cancellable_req.cancel()
+
+        deadline_timer = threading.Timer(deadline_s, expire_stream)
+        deadline_timer.daemon = True
+        deadline_timer.start()
+
+    def fail_if_deadline_expired() -> None:
+        if deadline_expired.is_set() or (
+            deadline is not None and time.monotonic() >= deadline
+        ):
+            cancellable_req.cancel()
+            pytest.fail(
+                "Streaming response did not reach the required count and terminal "
+                f"state within {deadline_s}s; count={response_count}, "
+                f"expected={expected_count}"
+            )
+
+    try:
+        try:
+            for line in response.iter_lines():
+                fail_if_deadline_expired()
+                if not line:
+                    continue
+                if not line.startswith(b"data:"):
+                    logger.debug("Ignoring non-data SSE line: %s", line[:100])
+                    continue
+
+                payload = line.removeprefix(b"data:").strip()
+                if payload == b"[DONE]":
+                    saw_done = True
+                    break
+
+                try:
+                    event = json.loads(payload)
+                except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                    cancellable_req.cancel()
+                    pytest.fail(f"Invalid JSON in streaming response: {error}")
+
+                if not isinstance(event, dict):
+                    cancellable_req.cancel()
+                    pytest.fail(
+                        "Streaming response event must be a JSON object, "
+                        f"got {type(event).__name__}"
+                    )
+
+                if event.get("error") is not None:
+                    cancellable_req.cancel()
+                    pytest.fail(
+                        f"Streaming response ended with an error: {event['error']}"
+                    )
+
+                response_count += 1
+                saw_finish_reason = saw_finish_reason or any(
+                    choice.get("finish_reason") is not None
+                    for choice in event.get("choices", [])
+                )
+                saw_content = saw_content or any(
+                    isinstance(fragment, str) and bool(fragment)
+                    for choice in event.get("choices", [])
+                    for fragment in (
+                        (choice.get("delta") or {}).get("content"),
+                        choice.get("text"),
+                    )
+                )
+                logger.info(
+                    "Received streaming response %s: %.100s", response_count, event
+                )
+                if (
+                    response_count >= expected_count
+                    and not drain
+                    and (not require_content or saw_content)
+                ):
+                    fail_if_deadline_expired()
+                    logger.info("Successfully read %s responses", response_count)
+                    return
+        except Exception:
+            fail_if_deadline_expired()
+            raise
+
+        fail_if_deadline_expired()
+        if drain and not saw_done:
+            pytest.fail("Streaming response ended without a [DONE] marker")
+        if drain and not saw_finish_reason:
+            pytest.fail("Streaming response ended without a successful finish reason")
+        if require_content and not saw_content:
+            pytest.fail("Streaming response ended without generated content")
+        if response_count >= expected_count:
+            logger.info("Successfully drained %s responses", response_count)
+            return
+
+        pytest.fail(
+            "Stream ended after only "
+            f"{response_count} lines - expected to read at least {expected_count}"
+        )
+    finally:
+        if deadline_timer is not None:
+            deadline_timer.cancel()
+
+
+def _parse_frontend_cancellation_metric(
+    metrics_text: str, model_name: str, endpoint: str, request_type: str
+) -> int:
+    """
+    Parse the frontend cancellation metric from Prometheus metrics text.
+
+    Args:
+        metrics_text: Raw Prometheus metrics text
+        model_name: The model name label value
+        endpoint: The endpoint label value (e.g. "completions", "chat_completions")
+        request_type: The request_type label value ("stream" or "unary")
+
+    Returns:
+        The metric count, or 0 if not found
+    """
+    for line in metrics_text.splitlines():
+        if not line.startswith("dynamo_frontend_model_cancellation_total{"):
+            continue
+        if (
+            f'endpoint="{endpoint}"' in line
+            and f'model="{model_name}"' in line
+            and f'request_type="{request_type}"' in line
+        ):
+            parts = line.rsplit(None, 1)
+            if len(parts) == 2:
+                try:
+                    return int(float(parts[1]))
+                except ValueError:
+                    pass
+
+    return 0
+
+
+def _parse_runtime_cancellation_metric(
+    metrics_text: str,
+    namespace: str = "dynamo",
+    component: str = "backend",
+    endpoint: str = "generate",
+) -> int:
+    """
+    Parse the runtime cancellation metric from Prometheus metrics text.
+
+    The metric is dynamo_component_cancellation_total with auto-injected
+    labels (dynamo_namespace, dynamo_component, dynamo_endpoint).
+
+    Args:
+        metrics_text: Raw Prometheus metrics text
+        namespace: Expected dynamo_namespace label value
+        component: Expected dynamo_component label value
+        endpoint: Expected dynamo_endpoint label value
+
+    Returns:
+        The metric count, or 0 if not found
+    """
+    for line in metrics_text.splitlines():
+        if not line.startswith("dynamo_component_cancellation_total{"):
+            continue
+        if (
+            f'dynamo_namespace="{namespace}"' in line
+            and f'dynamo_component="{component}"' in line
+            and f'dynamo_endpoint="{endpoint}"' in line
+        ):
+            parts = line.rsplit(None, 1)
+            if len(parts) == 2:
+                try:
+                    return int(float(parts[1]))
+                except ValueError:
+                    pass
+
+    return 0
+
+
+def _resolve_cancellation_labels(request_type: str) -> tuple[str, str]:
+    """
+    Map a test request type to frontend metric labels.
+
+    Args:
+        request_type: One of "completion", "chat_completion", "chat_completion_stream"
+
+    Returns:
+        (endpoint, request_type_label) tuple
+    """
+    mapping = {
+        "completion": ("completions", "unary"),
+        "chat_completion": ("chat_completions", "unary"),
+        "chat_completion_stream": ("chat_completions", "stream"),
+    }
+    if request_type not in mapping:
+        pytest.fail(f"Unknown request type: {request_type}")
+    return mapping[request_type]
+
+
+def verify_frontend_cancellation_metrics(
+    frontend_port: int,
+    request_type: str,
+    expected_count: int = 0,
+) -> None:
+    """
+    Verify frontend cancellation metrics.
+
+    Args:
+        frontend_port: Port where the frontend /metrics is served
+        request_type: The test request type ("completion", "chat_completion", "chat_completion_stream")
+        expected_count: Expected cancellation count for this request type
+    """
+    endpoint, req_type_label = _resolve_cancellation_labels(request_type)
+
+    frontend_metrics_url = f"http://localhost:{frontend_port}/metrics"
+    try:
+        response = requests.get(frontend_metrics_url, timeout=5)
+        response.raise_for_status()
+    except requests.RequestException as e:
+        pytest.fail(
+            f"Failed to fetch frontend metrics from {frontend_metrics_url}: {e}"
+        )
+
+    frontend_text = response.text
+    count = _parse_frontend_cancellation_metric(
+        frontend_text, FAULT_TOLERANCE_MODEL_NAME, endpoint, req_type_label
+    )
+
+    logger.info(
+        f"Frontend cancellation metrics - endpoint={endpoint}, "
+        f"request_type={req_type_label}: {count}"
+    )
+
+    assert count == expected_count, (
+        f"Frontend: expected {expected_count} cancellations "
+        f"for endpoint={endpoint}, request_type={req_type_label}, "
+        f"but got {count}"
+    )
+
+
+def verify_runtime_cancellation_metrics(
+    worker_system_port: int,
+    expected_count: int | tuple[int, ...] = 0,
+    component: str = "backend",
+    max_wait_ms: int = 0,
+    poll_interval_ms: int = 100,
+) -> None:
+    """
+    Verify runtime (worker) cancellation metrics.
+
+    Args:
+        worker_system_port: Port where the worker /metrics is served
+        expected_count: Expected cumulative cancellation count or accepted counts
+        component: The dynamo_component label value (e.g. "backend", "prefill")
+        max_wait_ms: If > 0, retry the scrape until the metric matches
+            expected_count or the timeout expires. Use this when the counter
+            increment is asynchronous to whatever signal triggered the check
+        poll_interval_ms: Interval between retries when max_wait_ms > 0.
+    """
+    worker_metrics_url = f"http://localhost:{worker_system_port}/metrics"
+    expected_counts = (
+        (expected_count,) if isinstance(expected_count, int) else expected_count
+    )
+
+    deadline = time.monotonic() + max_wait_ms / 1000.0
+    count = -1
+    while True:
+        try:
+            response = requests.get(worker_metrics_url, timeout=5)
+            response.raise_for_status()
+        except requests.RequestException as e:
+            pytest.fail(
+                f"Failed to fetch worker metrics from {worker_metrics_url}: {e}"
+            )
+
+        worker_text = response.text
+        count = _parse_runtime_cancellation_metric(worker_text, component=component)
+        if count in expected_counts or time.monotonic() >= deadline:
+            break
+        time.sleep(poll_interval_ms / 1000.0)
+
+    logger.info(f"Runtime cancellation metrics (component={component}): {count}")
+
+    assert count in expected_counts, (
+        f"Runtime (component={component}): expected one of {expected_counts} cancellations, "
+        f"but got {count}"
+    )
+
+
+def _parse_labeled_metric(
+    metrics_text: str, metric_name: str, label_filters: Dict[str, str]
+) -> float | None:
+    """Return the first matching line's value, or None if not found."""
+    for line in metrics_text.splitlines():
+        if not line.startswith(f"{metric_name}{{"):
+            continue
+        if not all(f'{k}="{v}"' in line for k, v in label_filters.items()):
+            continue
+        parts = line.rsplit(None, 1)
+        if len(parts) == 2:
+            try:
+                return float(parts[1])
+            except ValueError:
+                pass
+    return None
+
+
+def read_worker_generate_summary(
+    worker_system_port: int,
+    component: str,
+) -> Dict[str, float]:
+    """
+    Read the dynamo-runtime ingress summary metrics for the worker `generate`
+    endpoint. `duration_count` increments only after RequestMetricsGuard::drop,
+    so it confirms the response stream fully drained (i.e. the request wasn't
+    aborted mid-flight).
+    """
+    worker_metrics_url = f"http://localhost:{worker_system_port}/metrics"
+    try:
+        response = requests.get(worker_metrics_url, timeout=5)
+        response.raise_for_status()
+    except requests.RequestException as e:
+        pytest.fail(f"Failed to fetch worker metrics from {worker_metrics_url}: {e}")
+
+    text = response.text
+    filters = {"dynamo_component": component, "dynamo_endpoint": "generate"}
+    return {
+        "duration_sum": _parse_labeled_metric(
+            text, "dynamo_component_request_duration_seconds_sum", filters
+        )
+        or 0.0,
+        "duration_count": _parse_labeled_metric(
+            text, "dynamo_component_request_duration_seconds_count", filters
+        )
+        or 0.0,
+        "response_bytes": _parse_labeled_metric(
+            text, "dynamo_component_response_bytes_total", filters
+        )
+        or 0.0,
+    }
+
+
+def read_log_content(log_path: str | None) -> str:
+    """Read log content from a file"""
+    if log_path is None:
+        pytest.fail("Log path is None - cannot read log content")
+
+    try:
+        with open(log_path, "r") as f:
+            return f.read()
+    except Exception as e:
+        pytest.fail(f"Could not read log file {log_path}: {e}")
+
+
+def strip_ansi_codes(text: str) -> str:
+    """Remove ANSI color codes from text"""
+    ansi_escape = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+    return ansi_escape.sub("", text)
+
+
+def poll_for_pattern(
+    process: ManagedProcess,
+    pattern: str,
+    log_offset: int = 0,
+    max_wait_ms: int = 500,
+    poll_interval_ms: int = 5,
+    match_type: str = "endswith",  # "contains" or "endswith"
+    cancellable_request: CancellableRequest | None = None,
+) -> tuple[str, int]:
+    """
+    Poll process log for a specific pattern.
+
+    Args:
+        process: The process to monitor logs from
+        pattern: The pattern to search for
+        log_offset: Offset in the log to start reading from
+        max_wait_ms: Maximum time to wait for the pattern in milliseconds
+        poll_interval_ms: Interval between polls in milliseconds
+        match_type: How to match the pattern - "contains" or "endswith"
+        cancellable_request: Request to check for an early HTTP or transport failure
+
+    Returns:
+        Tuple of (matched_content, new_log_offset) where matched_content is:
+        - For "contains": everything after the pattern on the same line
+        - For "endswith": empty string (since nothing follows)
+    """
+    max_iterations = max_wait_ms // poll_interval_ms
+    iteration = 0
+    current_offset = log_offset
+
+    logger.info(
+        f"Starting to poll for '{pattern}' pattern (max {max_iterations} iterations)..."
+    )
+
+    while iteration < max_iterations:
+        # Read the process log
+        log_content = read_log_content(process.log_path)
+        new_content = log_content[current_offset:]
+
+        # Look for the pattern
+        for line in new_content.split("\n"):
+            clean_line = strip_ansi_codes(line).strip()
+
+            matched = False
+            result = ""
+
+            if match_type == "contains" and pattern in clean_line:
+                # Find the pattern and return everything after it
+                idx = clean_line.rfind(pattern)  # Use rfind to get last occurrence
+                if idx != -1:
+                    result = clean_line[idx + len(pattern) :].strip()
+                    matched = True
+            elif match_type == "endswith" and clean_line.endswith(pattern):
+                # Pattern is at the end, nothing follows
+                result = ""
+                matched = True
+
+            if matched:
+                logger.info(f"Found pattern '{pattern}' at iteration {iteration}")
+                if match_type == "contains":
+                    logger.info(f"Content after pattern: '{result}'")
+                # Update offset to current position
+                current_offset = len(log_content)
+                return result, current_offset
+
+        # Update offset for next poll
+        current_offset = len(log_content)
+
+        if cancellable_request is not None:
+            cancellable_request.raise_for_early_failure()
+
+        # Wait before next poll
+        time.sleep(poll_interval_ms / 1000.0)
+        iteration += 1
+
+    if cancellable_request is not None:
+        cancellable_request.raise_for_early_failure()
+
+    raise AssertionError(
+        f"Failed to find '{pattern}' pattern after {max_iterations} iterations ({max_wait_ms}ms)"
+    )

@@ -1,0 +1,1532 @@
+// SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+use crate::component::{
+    self, Component, ComponentBuilder, Endpoint, EndpointDiscoverySource, Instance, Namespace,
+};
+use crate::config::environment_names::tcp_response_stream;
+use crate::pipeline::PipelineError;
+use crate::pipeline::network::ResponsePlaneMode;
+use crate::pipeline::network::manager::NetworkManager;
+use crate::service::{ServiceClient, ServiceSet};
+use crate::storage::kv;
+use crate::{discovery, system_status_server, transports};
+use crate::{
+    discovery::{Discovery, DiscoverySpec, EndpointRegistrationLease, EndpointRegistrationManager},
+    metrics::PrometheusUpdateCallback,
+    metrics::{MetricsHierarchy, MetricsRegistry},
+    transports::{etcd, nats, tcp},
+};
+
+use super::utils::GracefulShutdownTracker;
+use crate::SystemHealth;
+use crate::routing_policy::RoutingOccupancyState;
+use crate::runtime::Runtime;
+
+// Used instead of std::cell::OnceCell because get_or_try_init there is nightly
+use async_once_cell::OnceCell;
+
+use std::fmt;
+use std::sync::{Arc, OnceLock, Weak};
+use std::time::Duration;
+use tokio::sync::watch::Receiver;
+
+use anyhow::Result;
+use derive_getters::Dissolve;
+use figment::error;
+use std::collections::HashMap;
+use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
+
+type EndpointDiscoverySourceMap = HashMap<Endpoint, Weak<EndpointDiscoverySource>>;
+type RoutingOccupancyMap = HashMap<Endpoint, Weak<RoutingOccupancyState>>;
+
+fn parse_tcp_response_stream_port(value: Option<&str>) -> Result<u16, PipelineError> {
+    let Some(port) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(0);
+    };
+
+    port.parse::<u16>().map_err(|_| {
+        PipelineError::Generic(format!(
+            "invalid {}: '{}' is not a valid port number",
+            tcp_response_stream::DYN_TCP_RESPONSE_STREAM_PORT,
+            port
+        ))
+    })
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use super::parse_tcp_response_stream_port;
+    use crate::pipeline::PipelineError;
+
+    #[tokio::test]
+    async fn completed_runtime_initialization_rejects_shutdown_before_http_bind() {
+        if crate::test_utils::run_isolated(
+            concat!(
+                module_path!(),
+                "::completed_runtime_initialization_rejects_shutdown_before_http_bind"
+            ),
+            &[],
+        ) {
+            return;
+        }
+
+        use super::{DistributedConfig, DistributedRuntime, Runtime};
+        use crate::system_status_server::SystemProbePolicy;
+
+        temp_env::async_with_vars(
+            [
+                ("DYN_SYSTEM_HOST", Some("127.0.0.1")),
+                ("DYN_SYSTEM_PORT", Some("0")),
+            ],
+            async {
+                let runtime = Runtime::from_current().unwrap();
+                runtime.mark_shutting_down();
+                // Exercise the final bind guard directly: the public constructor
+                // would reject shutdown before polling build at all.
+                let result = DistributedRuntime::build(
+                    runtime.clone(),
+                    DistributedConfig::process_local(),
+                    SystemProbePolicy::RuntimeOnly,
+                )
+                .await;
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("runtime shut down during initialization")
+                );
+                runtime.shutdown();
+            },
+        )
+        .await;
+    }
+
+    #[test]
+    fn response_stream_port_trims_and_treats_empty_as_unset() {
+        for value in [None, Some(""), Some(" \t ")] {
+            assert_eq!(parse_tcp_response_stream_port(value).unwrap(), 0);
+        }
+        assert_eq!(
+            parse_tcp_response_stream_port(Some(" 8080 ")).unwrap(),
+            8080
+        );
+    }
+
+    #[test]
+    fn response_stream_port_rejects_invalid_values() {
+        let error = parse_tcp_response_stream_port(Some(" 65536 ")).unwrap_err();
+        assert!(matches!(
+            error,
+            PipelineError::Generic(message)
+                if message
+                    == "invalid DYN_TCP_RESPONSE_STREAM_PORT: '65536' is not a valid port number"
+        ));
+    }
+}
+
+/// Distributed [Runtime] providing cluster-wide communication, transport, and discovery resources.
+///
+/// `DistributedRuntime` is not a process singleton. Calling [`DistributedRuntime::new`] more than
+/// once creates independent DRT instances with distinct discovery connection IDs, even when they
+/// share a process. Cloning a DRT continues to share the original instance and connection ID.
+///
+/// Production services should normally treat one DRT per service replica/process as a soft
+/// invariant. Multiple DRTs in one process are primarily supported for single-process test
+/// topologies and for the mocker, which models multiple isolated workers in one process.
+#[derive(Clone)]
+pub struct DistributedRuntime {
+    // local runtime
+    runtime: Runtime,
+
+    nats_client: Option<transports::nats::Client>,
+    network_manager: Arc<NetworkManager>,
+    tcp_server: Arc<OnceCell<Arc<transports::tcp::server::TcpStreamServer>>>,
+    quic_response_server:
+        Arc<OnceCell<Arc<crate::pipeline::network::quic_response::QuicResponseServer>>>,
+    system_status_server: Arc<OnceLock<Arc<system_status_server::SystemStatusServerInfo>>>,
+    request_plane: RequestPlaneMode,
+    response_plane: ResponsePlaneMode,
+
+    // Service discovery client
+    discovery_client: Arc<dyn discovery::Discovery>,
+    endpoint_registrations: Arc<EndpointRegistrationManager>,
+
+    // Discovery metadata (only used for Kubernetes backend)
+    // Shared with system status server to expose via /metadata endpoint
+    discovery_metadata: Option<Arc<tokio::sync::RwLock<discovery::DiscoveryMetadata>>>,
+
+    // local registry for components
+    // the registry allows us to use share runtime resources across instances of the same component object.
+    // take for example two instances of a client to the same remote component. The registry allows us to use
+    // a single endpoint watcher for both clients, this keeps the number background tasking watching specific
+    // paths in etcd to a minimum.
+    component_registry: component::Registry,
+
+    endpoint_discovery_sources: Arc<tokio::sync::Mutex<EndpointDiscoverySourceMap>>,
+    routing_occupancy_states: Arc<tokio::sync::Mutex<RoutingOccupancyMap>>,
+
+    // Health Status
+    system_health: Arc<parking_lot::Mutex<SystemHealth>>,
+
+    // Local endpoint registry for in-process calls
+    local_endpoint_registry: crate::local_endpoint_registry::LocalEndpointRegistry,
+
+    // This hierarchy's own metrics registry
+    metrics_registry: MetricsRegistry,
+
+    // Registry for /engine/* route callbacks
+    engine_routes: crate::engine_routes::EngineRouteRegistry,
+
+    // Backs `/v1/metadata/{model_slug}/{model_suffix}/{filename}`.
+    metadata_artifacts: crate::metadata_registry::MetadataArtifactRegistry,
+
+    // Resolved event transport kind — set once at construction time from
+    // DYN_EVENT_PLANE + discovery backend; returned by default_event_transport_kind().
+    event_transport_kind: crate::discovery::EventTransportKind,
+}
+
+impl MetricsHierarchy for DistributedRuntime {
+    fn basename(&self) -> String {
+        "".to_string() // drt has no basename. Basename only begins with the Namespace.
+    }
+
+    fn parent_hierarchies(&self) -> Vec<&dyn MetricsHierarchy> {
+        vec![] // drt is the root, so no parent hierarchies
+    }
+
+    fn get_metrics_registry(&self) -> &MetricsRegistry {
+        &self.metrics_registry
+    }
+
+    fn connection_id(&self) -> Option<u64> {
+        Some(self.discovery_client.instance_id())
+    }
+}
+
+impl std::fmt::Debug for DistributedRuntime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "DistributedRuntime")
+    }
+}
+
+impl DistributedRuntime {
+    pub async fn new(runtime: Runtime, config: DistributedConfig) -> Result<Self> {
+        Self::new_with_probe_policy(
+            runtime,
+            config,
+            system_status_server::SystemProbePolicy::Worker,
+        )
+        .await
+    }
+
+    /// Initialize runtime dependencies, then bind HTTP with the selected probe policy.
+    /// Shutdown cancels pending initialization; no listener exists until it completes.
+    pub async fn new_with_probe_policy(
+        runtime: Runtime,
+        config: DistributedConfig,
+        policy: system_status_server::SystemProbePolicy,
+    ) -> Result<Self> {
+        let shutdown = runtime.shutdown_started_token();
+        tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => anyhow::bail!("runtime shut down during initialization"),
+            result = Self::build(runtime, config, policy) => result,
+        }
+    }
+
+    async fn build(
+        runtime: Runtime,
+        config: DistributedConfig,
+        policy: system_status_server::SystemProbePolicy,
+    ) -> Result<Self> {
+        let (discovery_backend, nats_config, request_plane, response_plane, event_transport_kind) =
+            config.dissolve();
+        let response_plane = match response_plane {
+            // An explicit Velo falls back to tcp under TLS, as the configured one does.
+            Some(mode) => mode.tcp_under_tls(),
+            None => ResponsePlaneMode::configured()?,
+        };
+
+        let config = crate::config::RuntimeConfig::from_settings()?;
+        let nats_client = match nats_config {
+            Some(nc) => Some(
+                nc.connect_with_cancellation(runtime.primary_token())
+                    .await?,
+            ),
+            None => None,
+        };
+
+        // Initialize discovery client based on backend configuration
+        let (discovery_client, discovery_metadata) = match discovery_backend {
+            DiscoveryBackend::Kubernetes => {
+                tracing::info!("Initializing Kubernetes discovery backend");
+                let metadata = Arc::new(tokio::sync::RwLock::new(
+                    crate::discovery::DiscoveryMetadata::new(),
+                ));
+                let client = crate::discovery::KubeDiscoveryClient::new(
+                    metadata.clone(),
+                    runtime.primary_token(),
+                )
+                .await
+                .inspect_err(
+                    |err| tracing::error!(%err, "Failed to initialize Kubernetes discovery client"),
+                )?;
+                (Arc::new(client) as Arc<dyn Discovery>, Some(metadata))
+            }
+            DiscoveryBackend::KvStore(kv_selector) => {
+                tracing::info!("Initializing KV store discovery backend: {kv_selector}");
+                let runtime_clone = runtime.clone();
+                let store = match kv_selector {
+                    kv::Selector::Etcd(etcd_config) => {
+                        let etcd_client = etcd::Client::new(*etcd_config, runtime_clone).await.inspect_err(|err|
+                            tracing::error!(%err, "Could not connect to etcd. Pass `--discovery-backend ..` to use a different backend or start etcd."))?;
+                        kv::Manager::etcd(etcd_client)
+                    }
+                    kv::Selector::File(root) => kv::Manager::file(runtime.primary_token(), root),
+                    kv::Selector::Memory => kv::Manager::memory(),
+                };
+                use crate::discovery::KVStoreDiscovery;
+                (
+                    Arc::new(KVStoreDiscovery::new(store, runtime.primary_token()))
+                        as Arc<dyn Discovery>,
+                    None,
+                )
+            }
+        };
+
+        let starting_health_status = config.starting_health_status.clone();
+        let use_endpoint_health_status = config.use_endpoint_health_status.clone();
+        let health_endpoint_path = config.system_health_path.clone();
+        let live_endpoint_path = config.system_live_path.clone();
+        let system_health = Arc::new(parking_lot::Mutex::new(SystemHealth::new(
+            starting_health_status,
+            use_endpoint_health_status,
+            config.health_check_enabled,
+            health_endpoint_path,
+            live_endpoint_path,
+        )));
+
+        let component_registry = component::Registry::new();
+
+        // NetworkManager for request plane
+        let network_manager = NetworkManager::new(
+            runtime.child_token(),
+            nats_client.clone().map(|c| c.client().clone()),
+            component_registry.clone(),
+            request_plane,
+        );
+
+        let endpoint_registrations = EndpointRegistrationManager::new(
+            discovery_client.clone(),
+            runtime.secondary(),
+            runtime.primary_token(),
+        );
+        let distributed_runtime = Self {
+            runtime,
+            network_manager: Arc::new(network_manager),
+            nats_client,
+            tcp_server: Arc::new(OnceCell::new()),
+            quic_response_server: Arc::new(OnceCell::new()),
+            system_status_server: Arc::new(OnceLock::new()),
+            discovery_client,
+            endpoint_registrations,
+            discovery_metadata,
+            component_registry,
+            endpoint_discovery_sources: Arc::new(Mutex::new(HashMap::new())),
+            routing_occupancy_states: Arc::new(Mutex::new(HashMap::new())),
+            metrics_registry: crate::MetricsRegistry::new(),
+            system_health,
+            request_plane,
+            response_plane,
+            local_endpoint_registry: crate::local_endpoint_registry::LocalEndpointRegistry::new(),
+            engine_routes: crate::engine_routes::EngineRouteRegistry::new(),
+            metadata_artifacts: crate::metadata_registry::MetadataArtifactRegistry::new(),
+            event_transport_kind,
+        };
+
+        if response_plane == ResponsePlaneMode::Quic {
+            crate::metrics::quic_response::ensure_registered(
+                distributed_runtime.get_metrics_registry(),
+            );
+        }
+        if response_plane == ResponsePlaneMode::Velo {
+            distributed_runtime.velo_response_service().await?;
+            crate::pipeline::network::velo_response::register_metrics(
+                distributed_runtime.get_metrics_registry(),
+            );
+        }
+
+        // Initialize the uptime gauge in SystemHealth
+        distributed_runtime
+            .system_health
+            .lock()
+            .initialize_uptime_gauge(&distributed_runtime)?;
+
+        // Register an update callback so the uptime gauge is refreshed before
+        // every Prometheus scrape (both system status server and frontend).
+        {
+            let system_health = distributed_runtime.system_health.clone();
+            distributed_runtime
+                .metrics_registry
+                .add_update_callback(std::sync::Arc::new(move || {
+                    system_health.lock().update_uptime_gauge();
+                    Ok(())
+                }));
+        }
+
+        // Opt-in OTLP metrics export. Deliberately not tied to the system
+        // status server: that server is disabled by default
+        // (DYN_SYSTEM_PORT=-1), and gating export on it would make
+        // OTEL_METRICS_EXPORTER=otlp a silent no-op in the default
+        // configuration. Traces and logs are set up in logging::init() for the
+        // same reason -- an OTEL_* variable should mean the same thing for
+        // every signal. Metrics cannot join them there because the exporter
+        // needs the registry, which only exists once the runtime does.
+        match crate::metrics::otlp_export::ExportConfig::from_env() {
+            Ok(Some(export_config)) => {
+                tracing::info!(
+                    endpoint = %export_config.endpoint,
+                    interval_ms = export_config.interval.as_millis(),
+                    "exporting metrics over OTLP"
+                );
+                // Hold a graceful-shutdown guard for the task's life so the
+                // final export is not abandoned mid-RPC. `child_token()`
+                // derives from the endpoint shutdown token, which Phase 1
+                // cancels *before* the Phase 2 wait, so the exporter is told to
+                // stop and then waited for -- it cannot deadlock the wait on a
+                // token that only fires in Phase 3.
+                let shutdown_guard = distributed_runtime
+                    .runtime
+                    .graceful_shutdown_tracker()
+                    .register_task();
+                let registry = distributed_runtime.metrics_registry.clone();
+                let cancel = distributed_runtime.runtime.child_token();
+                tokio::spawn(async move {
+                    crate::metrics::otlp_export::run(registry, export_config, cancel).await;
+                    drop(shutdown_guard);
+                });
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::error!(%error, "OTLP metrics export is misconfigured; not exporting");
+            }
+        }
+
+        // Start health check manager if enabled
+        if config.health_check_enabled {
+            let health_check_config = crate::health_check::HealthCheckConfig {
+                canary_wait_time: std::time::Duration::from_secs(config.canary_wait_time_secs),
+                request_timeout: std::time::Duration::from_secs(
+                    config.health_check_request_timeout_secs,
+                ),
+            };
+
+            // Start the health check manager (spawns per-endpoint monitoring tasks)
+            match crate::health_check::start_health_check_manager(
+                distributed_runtime.clone(),
+                Some(health_check_config),
+            )
+            .await
+            {
+                Ok(()) => tracing::info!(
+                    "Health check manager started (canary_wait_time: {}s, request_timeout: {}s)",
+                    config.canary_wait_time_secs,
+                    config.health_check_request_timeout_secs
+                ),
+                Err(e) => tracing::error!("Health check manager failed to start: {e}"),
+            }
+        }
+
+        anyhow::ensure!(
+            !distributed_runtime.runtime.is_shutting_down(),
+            "runtime shut down during initialization"
+        );
+        if config.system_server_enabled() {
+            // Keep sidecar probes alive through unregister/drain. Ordinary workers
+            // retain their existing endpoint-shutdown lifetime.
+            let stop = match policy {
+                system_status_server::SystemProbePolicy::Worker => {
+                    distributed_runtime.runtime.child_token()
+                }
+                system_status_server::SystemProbePolicy::RuntimeOnly => {
+                    distributed_runtime.runtime.primary_token().child_token()
+                }
+            };
+            match system_status_server::spawn_system_status_server(
+                &config.system_host,
+                config.system_port as u16,
+                stop,
+                Arc::new(distributed_runtime.clone()),
+                distributed_runtime.discovery_metadata.clone(),
+                policy,
+            )
+            .await
+            {
+                Ok((address, handle)) => {
+                    distributed_runtime
+                        .system_status_server
+                        .set(Arc::new(system_status_server::SystemStatusServerInfo::new(
+                            address,
+                            Some(handle),
+                        )))
+                        .expect("System status server info should only be set once");
+                    tracing::info!(%address, ?policy, "System HTTP listener started");
+                }
+                // Preserve ordinary workers' optional-HTTP failure behavior.
+                Err(error) if policy == system_status_server::SystemProbePolicy::Worker => {
+                    tracing::error!(%error, "System status server startup failed");
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(distributed_runtime)
+    }
+
+    pub async fn from_settings(runtime: Runtime) -> Result<Self> {
+        let config = DistributedConfig::try_from_settings()?;
+        Self::new(runtime, config).await
+    }
+
+    /// Check configured runtime dependencies, independently of model registration.
+    /// The HTTP caller bounds this operation; it never performs inference.
+    pub(crate) async fn check_dependencies(&self) -> Result<()> {
+        anyhow::ensure!(!self.runtime.is_shutting_down(), "runtime is shutting down");
+        if let Some(client) = &self.nats_client {
+            anyhow::ensure!(
+                client.client().connection_state() == async_nats::connection::State::Connected,
+                "NATS is disconnected"
+            );
+        }
+        self.discovery_client.check_connection().await?;
+        anyhow::ensure!(!self.runtime.is_shutting_down(), "runtime is shutting down");
+        Ok(())
+    }
+
+    pub fn runtime(&self) -> &Runtime {
+        &self.runtime
+    }
+
+    pub fn primary_token(&self) -> CancellationToken {
+        self.runtime.primary_token()
+    }
+
+    // TODO: Don't hand out pointers, instead have methods to use the registry in friendly ways
+    // (without being aware of async locks and so on)
+    pub fn component_registry(&self) -> &component::Registry {
+        &self.component_registry
+    }
+
+    // TODO: Don't hand out pointers, instead provide system health related services.
+    pub fn system_health(&self) -> Arc<parking_lot::Mutex<SystemHealth>> {
+        self.system_health.clone()
+    }
+
+    /// Get the local endpoint registry for in-process endpoint calls
+    pub fn local_endpoint_registry(
+        &self,
+    ) -> &crate::local_endpoint_registry::LocalEndpointRegistry {
+        &self.local_endpoint_registry
+    }
+
+    /// Get the engine route registry for registering custom /engine/* routes
+    pub fn engine_routes(&self) -> &crate::engine_routes::EngineRouteRegistry {
+        &self.engine_routes
+    }
+
+    pub fn metadata_artifacts(&self) -> &crate::metadata_registry::MetadataArtifactRegistry {
+        &self.metadata_artifacts
+    }
+
+    /// Returns this DRT instance's discovery identity.
+    ///
+    /// This identifies the DRT, not the operating-system process. Multiple DRTs in one process
+    /// receive distinct connection IDs.
+    pub fn connection_id(&self) -> u64 {
+        self.discovery_client.instance_id()
+    }
+
+    pub fn shutdown(&self) {
+        self.runtime.shutdown();
+        self.discovery_client.shutdown();
+    }
+
+    /// Create a [`Namespace`]
+    pub fn namespace(&self, name: impl Into<String>) -> Result<Namespace> {
+        Namespace::new(self.clone(), name.into())
+    }
+
+    /// Returns the discovery interface for service registration and discovery
+    pub fn discovery(&self) -> Arc<dyn Discovery> {
+        self.discovery_client.clone()
+    }
+
+    /// Register an endpoint until the last runtime-wide owner drops its lease.
+    pub async fn register_endpoint_lease(
+        &self,
+        spec: DiscoverySpec,
+    ) -> Result<EndpointRegistrationLease> {
+        self.endpoint_registrations.register(spec).await
+    }
+
+    pub async fn tcp_server(&self) -> Result<Arc<tcp::server::TcpStreamServer>> {
+        Ok(self
+            .tcp_server
+            .get_or_try_init(async move {
+                let port_value =
+                    std::env::var(tcp_response_stream::DYN_TCP_RESPONSE_STREAM_PORT).ok();
+                let port = parse_tcp_response_stream_port(port_value.as_deref())?;
+                let host = crate::utils::ip_resolver::host_override_from_env(
+                    tcp_response_stream::DYN_TCP_RESPONSE_STREAM_HOST,
+                )
+                .map_err(|error| PipelineError::Generic(error.to_string()))?;
+
+                let host_suffix = host
+                    .as_ref()
+                    .map_or(String::new(), |h| format!(" on host {h}"));
+                if port == 0 {
+                    tracing::info!(
+                        "TCP request callback server using OS-assigned port{host_suffix}"
+                    );
+                } else {
+                    tracing::info!(
+                        "TCP request callback server using fixed port {port}{host_suffix}"
+                    );
+                }
+
+                let options = tcp::server::ServerOptions {
+                    port,
+                    interface: host,
+                };
+                let server = tcp::server::TcpStreamServer::new(options).await?;
+                Ok::<_, PipelineError>(server)
+            })
+            .await?
+            .clone())
+    }
+
+    pub async fn velo_response_service(
+        &self,
+    ) -> Result<Arc<crate::pipeline::network::velo_response::VeloResponseService>> {
+        self.runtime.velo_response_service().service().await
+    }
+
+    pub async fn quic_response_server(
+        &self,
+    ) -> Result<Arc<crate::pipeline::network::quic_response::QuicResponseServer>> {
+        anyhow::ensure!(
+            self.response_plane == ResponsePlaneMode::Quic,
+            "QUIC response server requested while response plane is {}",
+            self.response_plane.name()
+        );
+        Ok(self
+            .quic_response_server
+            .get_or_try_init(async {
+                let tcp_server = self.tcp_server().await?;
+                let tcp_address = tcp_server.local_address()?;
+                // Keep the selected interface, but let the UDP stack choose a
+                // free port. A TCP ephemeral port can already be in use by an
+                // unrelated UDP socket because the two protocols allocate
+                // ports independently.
+                let address = std::net::SocketAddr::new(tcp_address.ip(), 0);
+                crate::pipeline::network::quic_response::QuicResponseServer::new(
+                    address,
+                    address,
+                    self.runtime.child_token(),
+                )
+                .map_err(anyhow::Error::from)
+            })
+            .await?
+            .clone())
+    }
+
+    pub fn quic_response_client_pool(
+        &self,
+    ) -> Result<Arc<crate::pipeline::network::quic_response::QuicResponseClientPool>> {
+        anyhow::ensure!(
+            self.response_plane == ResponsePlaneMode::Quic,
+            "QUIC response client pool requested while response plane is {}",
+            self.response_plane.name()
+        );
+        crate::pipeline::network::quic_response::process_client_pool_from_env()
+            .map_err(anyhow::Error::from)
+    }
+
+    pub fn response_plane(&self) -> ResponsePlaneMode {
+        self.response_plane
+    }
+
+    /// Get the network manager
+    ///
+    /// The network manager consolidates all network configuration and provides
+    /// unified access to request plane servers and clients.
+    pub fn network_manager(&self) -> Arc<NetworkManager> {
+        self.network_manager.clone()
+    }
+
+    /// Get the request plane server (convenience method)
+    ///
+    /// This is a shortcut for `network_manager().await?.server().await`.
+    pub async fn request_plane_server(
+        &self,
+    ) -> Result<Arc<dyn crate::pipeline::network::ingress::unified_server::RequestPlaneServer>>
+    {
+        self.network_manager().server().await
+    }
+
+    /// Get system status server information if available
+    pub fn system_status_server_info(
+        &self,
+    ) -> Option<Arc<crate::system_status_server::SystemStatusServerInfo>> {
+        self.system_status_server.get().cloned()
+    }
+
+    /// How the frontend should talk to the backend.
+    pub fn request_plane(&self) -> RequestPlaneMode {
+        self.request_plane
+    }
+
+    /// Returns the event transport kind this runtime was configured with.
+    ///
+    /// The value is resolved once at construction time by `DiscoveryBackend::resolve_event_transport_kind`:
+    /// if `DYN_EVENT_PLANE` is set explicitly that value wins; otherwise the default is ZMQ.
+    ///
+    /// Use this instead of `EventTransportKind::from_env_or_default` wherever you have
+    /// access to a `DistributedRuntime`.
+    pub fn default_event_transport_kind(&self) -> crate::discovery::EventTransportKind {
+        self.event_transport_kind
+    }
+
+    pub fn child_token(&self) -> CancellationToken {
+        self.runtime.child_token()
+    }
+
+    pub(crate) fn graceful_shutdown_tracker(&self) -> Arc<GracefulShutdownTracker> {
+        self.runtime.graceful_shutdown_tracker()
+    }
+
+    pub(crate) fn endpoint_discovery_sources(&self) -> Arc<Mutex<EndpointDiscoverySourceMap>> {
+        self.endpoint_discovery_sources.clone()
+    }
+
+    /// Register an external long-running shutdown task with this runtime's
+    /// graceful-shutdown tracker. While the returned guard is alive,
+    /// `Runtime::shutdown` will keep waiting in Phase 2 (rather than
+    /// advancing to Phase 3 / NATS+etcd teardown). Drop the guard once
+    /// the task has finished.
+    pub fn register_graceful_task(&self) -> crate::utils::GracefulTaskGuard {
+        self.runtime.graceful_shutdown_tracker().register_task()
+    }
+
+    pub(crate) fn routing_occupancy_states(&self) -> Arc<Mutex<RoutingOccupancyMap>> {
+        self.routing_occupancy_states.clone()
+    }
+
+    /// TODO: This is a temporary KV router measure for component/component.rs EventPublisher impl for
+    /// Component, to allow it to publish to NATS. KV Router is the only user.
+    ///
+    /// When NATS is not available (e.g., running in approximate mode with --no-kv-events),
+    /// this function returns Ok(()) silently since publishing is optional in that mode.
+    pub async fn kv_router_nats_publish(
+        &self,
+        subject: String,
+        payload: bytes::Bytes,
+    ) -> anyhow::Result<()> {
+        self.kv_router_nats_publish_subject(subject.into(), payload)
+            .await
+    }
+
+    pub(crate) async fn kv_router_nats_publish_subject(
+        &self,
+        subject: async_nats::Subject,
+        payload: bytes::Bytes,
+    ) -> anyhow::Result<()> {
+        let Some(nats_client) = self.nats_client.as_ref() else {
+            // NATS not available - this is expected in approximate mode (--no-kv-events)
+            tracing::trace!("Skipping NATS publish (NATS not configured): {subject}");
+            return Ok(());
+        };
+        Ok(nats_client.client().publish(subject, payload).await?)
+    }
+
+    /// TODO: This is a temporary KV router measure for component/component.rs EventSubscriber impl for
+    /// Component, to allow it to subscribe to NATS. KV Router is the only user.
+    pub(crate) async fn kv_router_nats_subscribe(
+        &self,
+        subject: String,
+    ) -> Result<async_nats::Subscriber> {
+        let Some(nats_client) = self.nats_client.as_ref() else {
+            anyhow::bail!("KV router's EventSubscriber requires NATS");
+        };
+        Ok(nats_client.client().subscribe(subject).await?)
+    }
+
+    /// TODO (karenc): This is a temporary KV router measure for worker query requests.
+    /// Allows KV Router to perform request/reply with workers. (versus the pub/sub pattern above)
+    /// KV Router is the only user, made public for use in dynamo-llm crate
+    pub async fn kv_router_nats_request(
+        &self,
+        subject: String,
+        payload: bytes::Bytes,
+        timeout: std::time::Duration,
+    ) -> anyhow::Result<async_nats::Message> {
+        let Some(nats_client) = self.nats_client.as_ref() else {
+            anyhow::bail!("KV router's request requires NATS");
+        };
+        let response =
+            tokio::time::timeout(timeout, nats_client.client().request(subject, payload))
+                .await
+                .map_err(|_| anyhow::anyhow!("Request timed out after {:?}", timeout))??;
+        Ok(response)
+    }
+
+    /// DEPRECATED: This method exists only for NATS request plane support.
+    /// Once everything uses the TCP request plane, this can be removed along with
+    /// the NATS service registration infrastructure.
+    ///
+    /// Returns a receiver that signals when the NATS service registration is complete.
+    /// The caller should use `blocking_recv()` to wait for completion.
+    pub fn register_nats_service(
+        &self,
+        component: Component,
+    ) -> tokio::sync::mpsc::Receiver<Result<(), String>> {
+        // Create a oneshot-style channel (capacity 1) to signal completion
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<(), String>>(1);
+
+        let drt = self.clone();
+        self.runtime().secondary().spawn(async move {
+            let service_name = component.service_name();
+
+            // Pre-check to save cost of creating the service, but don't hold the lock
+            if drt
+                .component_registry()
+                .inner
+                .lock()
+                .await
+                .services
+                .contains_key(&service_name)
+            {
+                // The NATS service is per component, but it is called from `serve_endpoint`, and there
+                // are often multiple endpoints for a component (e.g. `clear_kv_blocks` and `generate`).
+                tracing::trace!("Service {service_name} already exists");
+                // Signal success - service already exists
+                let _ = tx.send(Ok(())).await;
+                return;
+            }
+
+            let Some(nats_client) = drt.nats_client.as_ref() else {
+                tracing::error!("Cannot create NATS service without NATS.");
+                let _ = tx
+                    .send(Err("Cannot create NATS service without NATS".to_string()))
+                    .await;
+                return;
+            };
+            let description = None;
+            let nats_service = match crate::component::service::build_nats_service(
+                nats_client,
+                &component,
+                description,
+            )
+            .await
+            {
+                Ok(service) => service,
+                Err(err) => {
+                    tracing::error!(error = %err, component = service_name, "Failed to build NATS service");
+                    let _ = tx.send(Err(format!("Failed to build NATS service: {err}"))).await;
+                    return;
+                }
+            };
+
+            let mut guard = drt.component_registry().inner.lock().await;
+            if !guard.services.contains_key(&service_name) {
+                // Normal case
+                guard.services.insert(service_name.clone(), nats_service);
+
+                tracing::info!("Added NATS service {service_name}");
+
+                drop(guard);
+            } else {
+                drop(guard);
+                let _ = nats_service.stop().await;
+                // The NATS service is per component, but it is called from `serve_endpoint`, and there
+                // are often multiple endpoints for a component (e.g. `clear_kv_blocks` and `generate`).
+                // TODO: Is this still true?
+            }
+
+            // Signal completion - service registered successfully
+            let _ = tx.send(Ok(())).await;
+        });
+
+        rx
+    }
+}
+
+#[cfg(test)]
+mod parser_env_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn distributed_runtime_validates_velo_at_startup() {
+        if crate::test_utils::run_isolated(
+            concat!(
+                module_path!(),
+                "::distributed_runtime_validates_velo_at_startup"
+            ),
+            &[],
+        ) {
+            return;
+        }
+        let busy = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let busy_port = busy.local_addr().unwrap().port().to_string();
+        // Each case sets one variable over a valid TCP configuration.
+        let mut cases = vec![
+            (
+                "DYN_VELO_RESPONSE_TRANSPORT",
+                "invalid",
+                "DYN_VELO_RESPONSE_TRANSPORT",
+            ),
+            (
+                "DYN_VELO_RESPONSE_BATCH_MS",
+                "invalid",
+                "DYN_VELO_RESPONSE_BATCH_MS",
+            ),
+            (
+                "DYN_VELO_RESPONSE_HEARTBEAT_MS",
+                "0",
+                "DYN_VELO_RESPONSE_HEARTBEAT_MS",
+            ),
+            (
+                "DYN_VELO_RESPONSE_PORT",
+                "invalid",
+                "DYN_VELO_RESPONSE_PORT",
+            ),
+            (
+                "DYN_VELO_RESPONSE_PORT",
+                busy_port.as_str(),
+                "Failed to pre-bind TCP listener",
+            ),
+        ];
+        if !cfg!(all(target_os = "linux", feature = "velo-ucx")) {
+            cases.push(("DYN_VELO_RESPONSE_TRANSPORT", "ucx", "velo-ucx"));
+        }
+        for (name, value, message) in cases {
+            let mut vars = vec![
+                ("DYN_VELO_RESPONSE_TRANSPORT", Some("tcp")),
+                ("DYN_TCP_RESPONSE_STREAM_HOST", Some("127.0.0.1")),
+            ];
+            vars.retain(|(var, _)| *var != name);
+            vars.push((name, Some(value)));
+            temp_env::async_with_vars(vars, async {
+                let runtime = Runtime::from_current().unwrap();
+                let mut config = DistributedConfig::process_local();
+                config.response_plane = Some(ResponsePlaneMode::Velo);
+                let error = DistributedRuntime::new(runtime, config)
+                    .await
+                    .expect_err("Velo configuration must fail before serving endpoints");
+                assert!(error.to_string().contains(message), "{error:#}");
+            })
+            .await;
+        }
+    }
+
+    /// Velo has no TLS, so a runtime asked for Velo under TLS runs on tcp.
+    #[tokio::test]
+    async fn distributed_runtime_uses_tcp_for_velo_under_tls() {
+        if crate::test_utils::run_isolated(
+            concat!(
+                module_path!(),
+                "::distributed_runtime_uses_tcp_for_velo_under_tls"
+            ),
+            &[("DYN_TCP_TLS_INSECURE", "true")],
+        ) {
+            return;
+        }
+        let runtime = Runtime::from_current().unwrap();
+        let mut config = DistributedConfig::process_local();
+        config.response_plane = Some(ResponsePlaneMode::Velo);
+        let drt = DistributedRuntime::new(runtime, config).await.unwrap();
+        assert_eq!(drt.response_plane(), ResponsePlaneMode::Tcp);
+    }
+
+    #[tokio::test]
+    async fn distributed_runtime_rejects_invalid_parser_version() {
+        if crate::test_utils::run_isolated(
+            concat!(
+                module_path!(),
+                "::distributed_runtime_rejects_invalid_parser_version"
+            ),
+            &[(
+                crate::config::environment_names::llm::DYN_PARSER_VERSION,
+                "v3",
+            )],
+        ) {
+            return;
+        }
+
+        let runtime = Runtime::from_current().unwrap();
+        let error = DistributedRuntime::new(runtime, DistributedConfig::process_local())
+            .await
+            .expect_err("invalid parser configuration must fail runtime construction");
+        assert!(error.to_string().contains("DYN_PARSER_VERSION"));
+    }
+}
+
+/// Selects which discovery backend to use and, for KV store backends, which KV store.
+#[derive(Clone, Debug)]
+pub enum DiscoveryBackend {
+    /// Use Kubernetes API for service discovery (no KV store needed)
+    Kubernetes,
+    /// Use a KV store (etcd, file, or memory) for service discovery
+    KvStore(kv::Selector),
+}
+
+impl DiscoveryBackend {
+    /// Returns true if this backend requires no external services (file or in-memory).
+    ///
+    /// Local backends do not need etcd, NATS, or any other infrastructure daemon.
+    pub fn is_local(&self) -> bool {
+        matches!(
+            self,
+            DiscoveryBackend::KvStore(kv::Selector::File(_))
+                | DiscoveryBackend::KvStore(kv::Selector::Memory)
+        )
+    }
+
+    /// Resolve the event transport kind for this backend.
+    ///
+    /// This is the single authoritative mapping of `DYN_EVENT_PLANE` →
+    /// `EventTransportKind`. ZMQ is the default event plane for all backends
+    /// (`file`/`mem`/`etcd`/`kubernetes`); NATS is an explicit opt-in via
+    /// `DYN_EVENT_PLANE=nats`. The value is trimmed and matched case-insensitively.
+    ///
+    /// Call this once at startup and store the result; do not call it repeatedly.
+    ///
+    /// # Errors
+    /// Returns an error if `DYN_EVENT_PLANE` is set to anything other than
+    /// `nats`, `zmq`, or an empty value, so a typo cannot silently select ZMQ.
+    pub fn resolve_event_transport_kind(&self) -> Result<crate::discovery::EventTransportKind> {
+        use crate::config::environment_names::event_plane::DYN_EVENT_PLANE;
+        Self::event_transport_kind_from_env_result(std::env::var(DYN_EVENT_PLANE))
+    }
+
+    fn event_transport_kind_from_env_result(
+        value: std::result::Result<String, std::env::VarError>,
+    ) -> Result<crate::discovery::EventTransportKind> {
+        use crate::discovery::EventTransportKind;
+        match value {
+            // Unset or empty: ZMQ is the default for every backend.
+            Err(std::env::VarError::NotPresent) => Ok(EventTransportKind::Zmq),
+            Ok(raw) => match raw.trim().to_lowercase().as_str() {
+                "nats" => Ok(EventTransportKind::Nats),
+                "zmq" | "" => Ok(EventTransportKind::Zmq),
+                _ => Err(anyhow::anyhow!(
+                    "Invalid DYN_EVENT_PLANE value '{raw}'. Valid values: 'nats', 'zmq'"
+                )),
+            },
+            Err(std::env::VarError::NotUnicode(raw)) => Err(anyhow::anyhow!(
+                "Invalid DYN_EVENT_PLANE value '{}': not valid Unicode. \
+                 Valid values: 'nats', 'zmq'",
+                raw.to_string_lossy()
+            )),
+        }
+    }
+}
+
+#[derive(Dissolve)]
+pub struct DistributedConfig {
+    pub discovery_backend: DiscoveryBackend,
+    pub nats_config: Option<nats::ClientOptions>,
+    pub request_plane: RequestPlaneMode,
+    /// Explicit response transport. `None` reads `DYN_RESPONSE_PLANE` for
+    /// standalone Rust entry points.
+    pub response_plane: Option<ResponsePlaneMode>,
+    /// Resolved event transport kind — computed once at config time from
+    /// `DYN_EVENT_PLANE` and the discovery backend, then stored on the runtime
+    /// so callers always get the same answer regardless of which other services
+    /// happen to be reachable.
+    pub event_transport_kind: crate::discovery::EventTransportKind,
+}
+
+impl DistributedConfig {
+    /// Build distributed runtime configuration from environment defaults.
+    ///
+    /// # Panics
+    /// Panics if a discovery or transport setting is invalid.
+    pub fn from_settings() -> DistributedConfig {
+        Self::try_from_settings().unwrap_or_else(|err| panic!("{err}"))
+    }
+
+    pub fn try_from_settings() -> Result<DistributedConfig> {
+        Self::from_settings_with_overrides(None, None, None)
+    }
+
+    /// Resolve per-worker options before environment defaults, without mutating
+    /// the process environment. Safe to use after the Tokio runtime has started.
+    pub fn from_settings_with_overrides(
+        discovery_backend: Option<&str>,
+        request_plane: Option<&str>,
+        event_plane: Option<&str>,
+    ) -> Result<DistributedConfig> {
+        let request_plane = match request_plane {
+            Some(value) => value.parse()?,
+            None => RequestPlaneMode::from_env()?,
+        };
+
+        // Determine the discovery backend first — we need it to compute the NATS default below.
+        // Valid values for DYN_DISCOVERY_BACKEND: "kubernetes", "etcd" (default), "file", "mem"
+        let backend_str = discovery_backend
+            .map(str::to_owned)
+            .or_else(|| std::env::var("DYN_DISCOVERY_BACKEND").ok())
+            .unwrap_or_else(|| "etcd".to_string());
+
+        let discovery_backend = match backend_str.as_str() {
+            "kubernetes" => {
+                tracing::info!("Using Kubernetes discovery backend");
+                DiscoveryBackend::Kubernetes
+            }
+            other => {
+                let selector: kv::Selector = other.parse().map_err(|_| {
+                    anyhow::anyhow!(
+                        "Unknown DYN_DISCOVERY_BACKEND value: '{other}'. \
+                         Valid options: kubernetes, etcd, file, mem"
+                    )
+                })?;
+                DiscoveryBackend::KvStore(selector)
+            }
+        };
+
+        // Resolve event transport kind once — the single source of truth used both to
+        // decide whether to open a NATS connection and to answer
+        // `DistributedRuntime::default_event_transport_kind()` later.
+        let event_transport_kind = match event_plane {
+            Some("nats") => crate::discovery::EventTransportKind::Nats,
+            Some("zmq" | "") => crate::discovery::EventTransportKind::Zmq,
+            Some(other) => {
+                anyhow::bail!("Invalid event plane '{other}'. Valid options are: 'nats', 'zmq'")
+            }
+            None => discovery_backend.resolve_event_transport_kind()?,
+        };
+
+        // Connect to NATS only when a plane uses it. NATS_SERVER alone says where NATS is, not
+        // that this process needs it: the operator sets it in every pod when NATS is installed.
+        let nats_enabled = request_plane.is_nats()
+            || matches!(
+                event_transport_kind,
+                crate::discovery::EventTransportKind::Nats
+            );
+
+        Ok(DistributedConfig {
+            discovery_backend,
+            nats_config: if nats_enabled {
+                Some(nats::ClientOptions::default())
+            } else {
+                None
+            },
+            request_plane,
+            response_plane: None,
+            event_transport_kind,
+        })
+    }
+
+    pub fn for_cli() -> DistributedConfig {
+        Self::try_for_cli().unwrap_or_else(|err| panic!("{err}"))
+    }
+
+    pub fn try_for_cli() -> Result<DistributedConfig> {
+        let etcd_config = etcd::ClientOptions {
+            attach_lease: false,
+            ..Default::default()
+        };
+        let request_plane = RequestPlaneMode::from_env()?;
+        let discovery_backend =
+            DiscoveryBackend::KvStore(kv::Selector::Etcd(Box::new(etcd_config)));
+        let event_transport_kind = discovery_backend.resolve_event_transport_kind()?;
+        let nats_enabled = request_plane.is_nats()
+            || matches!(
+                event_transport_kind,
+                crate::discovery::EventTransportKind::Nats
+            );
+        Ok(DistributedConfig {
+            discovery_backend,
+            nats_config: if nats_enabled {
+                Some(nats::ClientOptions::default())
+            } else {
+                None
+            },
+            request_plane,
+            response_plane: None,
+            event_transport_kind,
+        })
+    }
+
+    /// A DistributedConfig that isn't distributed, for when the frontend and backend are in the
+    /// same process.
+    pub fn process_local() -> DistributedConfig {
+        DistributedConfig {
+            discovery_backend: DiscoveryBackend::KvStore(kv::Selector::Memory),
+            nats_config: None,
+            // This won't be used in process local, so we likely need a "none" option to
+            // communicate that and avoid opening the ports.
+            request_plane: RequestPlaneMode::Tcp,
+            response_plane: None,
+            event_transport_kind: crate::discovery::EventTransportKind::Zmq,
+        }
+    }
+}
+
+/// Request plane transport mode configuration
+///
+/// This determines how requests are distributed from routers to workers:
+/// - `Nats`: Use NATS for request distribution (legacy)
+/// - `Tcp`: Use raw TCP for request distribution with msgpack support (default)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RequestPlaneMode {
+    /// Use NATS for request plane
+    Nats,
+    /// Use raw TCP for request plane with msgpack support
+    #[default]
+    Tcp,
+}
+
+impl fmt::Display for RequestPlaneMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Nats => write!(f, "nats"),
+            Self::Tcp => write!(f, "tcp"),
+        }
+    }
+}
+
+impl std::str::FromStr for RequestPlaneMode {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "nats" => Ok(Self::Nats),
+            "tcp" => Ok(Self::Tcp),
+            _ => Err(anyhow::anyhow!(
+                "Invalid request plane mode: '{}'. Valid options are: 'nats', 'tcp'",
+                s
+            )),
+        }
+    }
+}
+
+impl RequestPlaneMode {
+    fn from_env() -> Result<Self> {
+        Self::from_env_result(std::env::var(
+            crate::config::environment_names::request_plane::DYN_REQUEST_PLANE,
+        ))
+    }
+
+    fn from_env_result(value: std::result::Result<String, std::env::VarError>) -> Result<Self> {
+        match value {
+            Err(std::env::VarError::NotPresent) => Ok(Self::default()),
+            Ok(s) => s.parse(),
+            Err(std::env::VarError::NotUnicode(raw)) => Err(anyhow::anyhow!(
+                "Invalid request plane mode: '{}' is not valid Unicode. \
+                 Valid options are: 'nats', 'tcp'",
+                raw.to_string_lossy()
+            )),
+        }
+    }
+
+    pub fn is_nats(&self) -> bool {
+        matches!(self, RequestPlaneMode::Nats)
+    }
+}
+
+#[cfg(test)]
+mod request_plane_env_tests {
+    use super::RequestPlaneMode;
+
+    #[test]
+    fn absent_request_plane_defaults_to_tcp() {
+        let mode = RequestPlaneMode::from_env_result(Err(std::env::VarError::NotPresent))
+            .expect("an absent DYN_REQUEST_PLANE must not be an error");
+        assert_eq!(mode, RequestPlaneMode::Tcp);
+    }
+
+    #[test]
+    fn empty_request_plane_is_an_error() {
+        RequestPlaneMode::from_env_result(Ok(String::new()))
+            .expect_err("an empty DYN_REQUEST_PLANE must not silently fall back to TCP");
+    }
+
+    #[test]
+    fn valid_request_plane_value_resolves() {
+        let mode = RequestPlaneMode::from_env_result(Ok("nats".to_string()))
+            .expect("DYN_REQUEST_PLANE=nats should resolve");
+        assert_eq!(mode, RequestPlaneMode::Nats);
+    }
+
+    #[test]
+    fn invalid_request_plane_is_an_error_naming_value_and_options() {
+        let err = RequestPlaneMode::from_env_result(Ok("nat".to_string()))
+            .expect_err("a misspelled DYN_REQUEST_PLANE must not silently fall back to TCP");
+        let message = err.to_string();
+        assert!(
+            message.contains("nat"),
+            "error should name the offending value, got: {message}"
+        );
+        assert!(
+            message.contains("'nats'") && message.contains("'tcp'"),
+            "error should list the valid options, got: {message}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_unicode_request_plane_is_an_error_not_a_default() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let raw = OsString::from_vec(b"nat\xff".to_vec());
+        let err = RequestPlaneMode::from_env_result(Err(std::env::VarError::NotUnicode(raw)))
+            .expect_err("a non-Unicode DYN_REQUEST_PLANE must not silently fall back to TCP");
+        let message = err.to_string();
+        assert!(
+            message.contains("not valid Unicode"),
+            "error should say the value was not valid Unicode, got: {message}"
+        );
+        assert!(
+            message.contains("'nats'") && message.contains("'tcp'"),
+            "error should list the valid options, got: {message}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod event_plane_env_tests {
+    use super::DiscoveryBackend;
+    use crate::discovery::EventTransportKind;
+
+    fn resolve(
+        value: std::result::Result<String, std::env::VarError>,
+    ) -> anyhow::Result<EventTransportKind> {
+        DiscoveryBackend::event_transport_kind_from_env_result(value)
+    }
+
+    #[test]
+    fn valid_event_plane_values_resolve_case_insensitively() {
+        for (value, expected) in [
+            ("nats", EventTransportKind::Nats),
+            ("NATS", EventTransportKind::Nats),
+            (" nats ", EventTransportKind::Nats),
+            ("zmq", EventTransportKind::Zmq),
+            ("Zmq", EventTransportKind::Zmq),
+        ] {
+            let kind = resolve(Ok(value.to_string()))
+                .unwrap_or_else(|err| panic!("DYN_EVENT_PLANE={value:?} should resolve: {err}"));
+            assert_eq!(kind, expected, "value {value:?}");
+        }
+    }
+
+    #[test]
+    fn invalid_event_plane_is_an_error_naming_value_and_options() {
+        for value in ["nat", "x"] {
+            let err = resolve(Ok(value.to_string()))
+                .expect_err("a misspelled DYN_EVENT_PLANE must not silently fall back to ZMQ");
+            let message = err.to_string();
+            assert!(
+                message.contains(&format!("'{value}'")),
+                "error should name the offending value, got: {message}"
+            );
+            assert!(
+                message.contains("Valid values: 'nats', 'zmq'"),
+                "error should list the valid values, got: {message}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_unicode_event_plane_is_an_error_not_a_default() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let raw = OsString::from_vec(b"nats\xff".to_vec());
+        let err = resolve(Err(std::env::VarError::NotUnicode(raw)))
+            .expect_err("a non-Unicode DYN_EVENT_PLANE must not silently fall back to ZMQ");
+        assert!(
+            err.to_string().contains("not valid Unicode"),
+            "error should say the value was not valid Unicode, got: {err}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod nats_enablement_tests {
+    use super::DistributedConfig;
+    use crate::config::environment_names::{event_plane::DYN_EVENT_PLANE, nats::NATS_SERVER};
+
+    #[test]
+    fn ambient_nats_server_does_not_enable_nats_on_tcp_and_zmq() {
+        if crate::test_utils::run_isolated(
+            concat!(
+                module_path!(),
+                "::ambient_nats_server_does_not_enable_nats_on_tcp_and_zmq"
+            ),
+            &[(NATS_SERVER, "nats://127.0.0.1:9")],
+        ) {
+            return;
+        }
+
+        temp_env::with_var_unset(DYN_EVENT_PLANE, || {
+            let config =
+                DistributedConfig::from_settings_with_overrides(Some("file"), Some("tcp"), None)
+                    .unwrap();
+            assert!(config.nats_config.is_none());
+        });
+    }
+}
+
+pub mod distributed_test_utils {
+    //! Common test helper functions for DistributedRuntime tests
+
+    /// Helper function to create a DRT instance for integration-only tests.
+    /// Uses from_current to leverage existing tokio runtime
+    /// Note: Settings are read from environment variables inside DistributedRuntime::from_settings
+    #[cfg(feature = "integration")]
+    pub async fn create_test_drt_async() -> super::DistributedRuntime {
+        use crate::transports::nats;
+
+        let rt = crate::Runtime::from_current().unwrap();
+        let config = super::DistributedConfig {
+            discovery_backend: super::DiscoveryBackend::KvStore(
+                crate::storage::kv::Selector::Memory,
+            ),
+            nats_config: Some(nats::ClientOptions::default()),
+            request_plane: crate::distributed::RequestPlaneMode::default(),
+            response_plane: None,
+            event_transport_kind: crate::discovery::EventTransportKind::Nats,
+        };
+        super::DistributedRuntime::new(rt, config).await.unwrap()
+    }
+
+    /// Helper function to create a DRT instance which points at
+    /// a (shared) file-backed KV store and ephemeral NATS transport so that
+    /// multiple DRT instances may observe the same registration state.
+    /// NOTE: This gets around the fact that create_test_drt_async() is
+    /// hardcoded to spin up a memory-backed discovery store
+    /// which means we can't share discovery state across runtimes.
+    pub async fn create_test_shared_drt_async(
+        store_path: &std::path::Path,
+    ) -> super::DistributedRuntime {
+        use crate::transports::nats;
+
+        let rt = crate::Runtime::from_current().unwrap();
+        let config = super::DistributedConfig {
+            discovery_backend: super::DiscoveryBackend::KvStore(
+                crate::storage::kv::Selector::File(store_path.to_path_buf()),
+            ),
+            nats_config: Some(nats::ClientOptions::default()),
+            request_plane: crate::distributed::RequestPlaneMode::default(),
+            response_plane: None,
+            event_transport_kind: crate::discovery::EventTransportKind::Nats,
+        };
+        super::DistributedRuntime::new(rt, config).await.unwrap()
+    }
+}
+
+#[cfg(all(test, feature = "integration"))]
+mod tests {
+    use super::RequestPlaneMode;
+    use super::distributed_test_utils::create_test_drt_async;
+
+    #[tokio::test]
+    async fn test_drt_uptime_after_delay_system_disabled() {
+        if crate::test_utils::run_isolated(
+            concat!(
+                module_path!(),
+                "::test_drt_uptime_after_delay_system_disabled"
+            ),
+            &[],
+        ) {
+            return;
+        }
+
+        use crate::config::environment_names::runtime::system as env_system;
+        // Test uptime with system status server disabled
+        temp_env::async_with_vars([(env_system::DYN_SYSTEM_PORT, None::<&str>)], async {
+            // Start a DRT
+            let drt = create_test_drt_async().await;
+
+            // Wait 50ms
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+            // Check that uptime is 50+ ms
+            let uptime = drt.system_health.lock().uptime();
+            assert!(
+                uptime >= std::time::Duration::from_millis(50),
+                "Expected uptime to be at least 50ms, but got {:?}",
+                uptime
+            );
+
+            println!(
+                "✓ DRT uptime test passed (system disabled): uptime = {:?}",
+                uptime
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_drt_uptime_after_delay_system_enabled() {
+        if crate::test_utils::run_isolated(
+            concat!(
+                module_path!(),
+                "::test_drt_uptime_after_delay_system_enabled"
+            ),
+            &[],
+        ) {
+            return;
+        }
+
+        use crate::config::environment_names::runtime::system as env_system;
+        // Test uptime with system status server enabled
+        temp_env::async_with_vars([(env_system::DYN_SYSTEM_PORT, Some("0"))], async {
+            // Start a DRT
+            let drt = create_test_drt_async().await;
+
+            // Wait 50ms
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+            // Check that uptime is 50+ ms
+            let uptime = drt.system_health.lock().uptime();
+            assert!(
+                uptime >= std::time::Duration::from_millis(50),
+                "Expected uptime to be at least 50ms, but got {:?}",
+                uptime
+            );
+
+            println!(
+                "✓ DRT uptime test passed (system enabled): uptime = {:?}",
+                uptime
+            );
+        })
+        .await;
+    }
+
+    #[test]
+    fn test_request_plane_mode_from_str() {
+        assert_eq!(
+            "nats".parse::<RequestPlaneMode>().unwrap(),
+            RequestPlaneMode::Nats
+        );
+        assert_eq!(
+            "tcp".parse::<RequestPlaneMode>().unwrap(),
+            RequestPlaneMode::Tcp
+        );
+        assert_eq!(
+            "NATS".parse::<RequestPlaneMode>().unwrap(),
+            RequestPlaneMode::Nats
+        );
+        assert_eq!(
+            "TCP".parse::<RequestPlaneMode>().unwrap(),
+            RequestPlaneMode::Tcp
+        );
+        assert!("invalid".parse::<RequestPlaneMode>().is_err());
+    }
+}
